@@ -75,6 +75,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--case", action="append", dest="case_ids")
     s.add_argument("--mode", default="live", choices=["live", "cached", "replay"])
     s.add_argument("--out", type=Path)
+    s = sub.add_parser("mcp", help="run the MCP server (stdio by default)")
+    s.add_argument("--http", action="store_true", help="serve Streamable HTTP at /mcp instead of stdio")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8765)
     s = sub.add_parser("serve", help="run the HTTP API")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8000)
@@ -102,6 +106,16 @@ def main(argv: list[str] | None = None) -> int:
         from .api import create_app
 
         uvicorn.run(create_app(), host=a.host, port=a.port)
+        return 0
+    if a.cmd == "mcp":
+        from .mcp_server import create_server, run_http
+
+        if not settings.db_path.exists():
+            sys.exit(f"Database {settings.db_path} not found. Run `cohort-builder init-demo` (or load-athena) first.")
+        if a.http:
+            run_http(a.host, a.port)
+        else:
+            create_server().run("stdio")
         return 0
     if a.cmd == "eval":
         from .evaluation import run_eval

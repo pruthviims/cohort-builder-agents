@@ -17,7 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 api = ["fastapi>=0.110", "uvicorn>=0.29"]
-dev = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110"]
+mcp = ["mcp>=2.2,<3", "uvicorn>=0.29"]
+dev = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110", "mcp>=2.2,<3", "anyio>=4"]
 
 [project.scripts]
 cohort-builder = "cohort_builder.cli:main"

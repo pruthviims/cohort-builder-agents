@@ -31,9 +31,9 @@ Only **three steps call an LLM**: the intent parser, the concept resolver and th
 ## Quickstart
 
 ```bash
-pip install -e ".[api,dev]"
+pip install -e ".[api,mcp,dev]"
 cohort-builder init-demo                  # demo vocabulary + 5,000 synthetic patients (DuckDB)
-pytest                                    # 22 tests, no API key needed
+pytest                                    # 28 tests, no API key needed
 
 export ANTHROPIC_API_KEY=sk-ant-...
 cohort-builder ask "Adults with type 2 diabetes who started metformin and had an HbA1c above 8% in the year before starting"
@@ -61,6 +61,54 @@ Start it with `cohort-builder serve`. Interactive docs are at `http://127.0.0.1:
 | POST | `/cohorts/{id}/execute` | Materialize into `results.cohort` |
 | GET / POST | `/runs/{run_id}` · `/runs/{run_id}/replay` | Run trace and manifest · exact replay |
 | GET | `/concepts/search?q=` | Vocabulary search |
+
+### MCP server
+
+The same backend is available as an MCP server, so you can build cohorts from Claude Desktop, Claude Code, a Claude connector or another agent.
+
+```bash
+pip install -e ".[mcp]"
+cohort-builder mcp                                   # stdio, for a local client
+claude mcp add cohort-builder -- cohort-builder mcp  # register it in Claude Code
+```
+
+For Claude Desktop, add this to `claude_desktop_config.json`:
+
+```json
+{"mcpServers": {"cohort-builder": {"command": "cohort-builder", "args": ["mcp"],
+  "env": {"CB_DB_PATH": "/path/to/cohort_builder.duckdb", "CB_MCP_USER": "your.name",
+          "ANTHROPIC_API_KEY": "sk-ant-..."}}}}
+```
+
+There are two ways to use it:
+
+| Mode | Tools | Who reasons | Reproducibility |
+|---|---|---|---|
+| **Reproducible pipeline** | `build_cohort`, `get_run`, `replay_run` | This server's own agents (pinned model, versioned prompts, cache/replay). Needs `ANTHROPIC_API_KEY` on the server | Full: replay and regeneration both tracked |
+| **Client-driven** | `describe_ontology`, `search_curated_concept_sets`, `search_concepts`, `get_concept`, `get_descendants`, `lookup_code`, `validate_cohort`, `save_cohort_definition` | The client's LLM, e.g. Claude in Desktop. No API key on the server | Saved definitions replay exactly. Regeneration depends on the client |
+
+In both modes, the server enforces every ontology rule. A definition with deprecated, non-standard or wrong-domain concepts, or with invalid units, is rejected no matter which LLM wrote it.
+
+Other tools: `list_cohort_definitions`, `get_cohort_definition`, `get_cohort_sql`, `execute_approved_cohort`.
+
+Resources: `ontology://domain`, `ontology://curated-concept-sets`, `ontology://unit-conversions`, `cohort://ir-schema`, `cohort://definitions/{id}`.
+
+Prompt: `build_cohort_interactively`.
+
+**Governance over MCP:**
+- **No approval tool.** An AI must not approve its own work, so approval happens only through the CLI or HTTP API (`cohort-builder approve`).
+- **Execution is gated.** `execute_approved_cohort` refuses drafts and returns suppressed counts only. No tool returns patient rows.
+- **Server-side identity.** The acting identity comes from `CB_MCP_USER`, not from tool arguments, and is recorded on every saved definition and execution.
+
+**Shared team server (Streamable HTTP):**
+
+```bash
+CB_MCP_TOKEN=<long-random-secret> CB_MCP_ALLOWED_HOSTS=cohorts.example.org:* \
+  cohort-builder mcp --http --host 0.0.0.0 --port 8765      # endpoint: /mcp
+```
+
+- **Startup checks:** the server won't bind beyond localhost unless both a token and a hostname allowlist (DNS-rebinding protection) are set.
+- **Bearer token:** this is shared-secret auth, fine for a pilot. For production, put it behind TLS and switch to OAuth through the MCP SDK's auth settings, so each user is identified individually.
 
 ## How reproducibility works
 
@@ -181,7 +229,8 @@ src/cohort_builder/
   metadata.py        audit/metadata store
   evaluation.py      golden-case evaluation
   synthetic.py       demo vocabulary, synthetic patients, Athena loader
-  cli.py, api.py     interfaces
+  cli.py, api.py     interfaces (CLI, HTTP API)
+  mcp_server.py      MCP server (stdio + Streamable HTTP)
 eval/                golden cases + gold IRs
 tests/               offline tests with a scripted fake LLM
 ```
