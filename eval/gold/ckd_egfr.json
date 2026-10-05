@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0",
+  "ontology_version": "1.0.0",
+  "vocabulary_version": "DEMO-2026-10-01",
+  "post_observation_days": 0,
+  "exclusion": [],
+  "exit": {
+    "type": "end_of_observation"
+  },
+  "assumptions": [],
+  "name": "Incident CKD with eGFR < 60 within 90 days",
+  "description": "",
+  "concept_sets": [
+    {
+      "id": "cs_ckd",
+      "name": "Chronic kidney disease",
+      "domain": "Condition",
+      "source": "resolved",
+      "items": [
+        {
+          "concept_id": 46271022,
+          "include_descendants": true,
+          "is_excluded": false
+        }
+      ]
+    },
+    {
+      "id": "cs_egfr",
+      "name": "eGFR",
+      "domain": "Measurement",
+      "source": "resolved",
+      "items": [
+        {
+          "concept_id": 2000002001,
+          "include_descendants": true,
+          "is_excluded": false
+        }
+      ]
+    }
+  ],
+  "index_event": {
+    "entity": "ConditionOccurrence",
+    "concept_set_id": "cs_ckd",
+    "first_occurrence_only": true
+  },
+  "prior_observation_days": 365,
+  "demographics": {
+    "age_min": 18,
+    "age_max": null,
+    "gender_concept_ids": []
+  },
+  "inclusion": [
+    {
+      "id": "inc_1",
+      "name": "eGFR < 60 within 90 days after diagnosis",
+      "entity": "Measurement",
+      "concept_set_id": "cs_egfr",
+      "window": {
+        "start_days": 0,
+        "end_days": 90
+      },
+      "occurrence": "at_least",
+      "count": 1,
+      "value_filter": {
+        "op": "<",
+        "value": 60.0,
+        "unit_concept_id": 2000001002
+      }
+    }
+  ]
+}

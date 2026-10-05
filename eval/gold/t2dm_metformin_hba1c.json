@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "ontology_version": "1.0.0",
+  "vocabulary_version": "DEMO-2026-10-01",
+  "name": "T2DM new metformin users with HbA1c > 8%",
+  "description": "Adults with type 2 diabetes starting metformin whose HbA1c was above 8% in the year before starting.",
+  "concept_sets": [
+    {"id": "cs_metformin", "name": "metformin", "domain": "Drug", "source": "resolved",
+     "items": [{"concept_id": 1503297, "include_descendants": true, "is_excluded": false}]},
+    {"id": "cs_t2dm", "name": "Type 2 diabetes mellitus (org standard)", "domain": "Condition", "source": "curated:t2dm@v1",
+     "items": [{"concept_id": 201826, "include_descendants": true, "is_excluded": false}]},
+    {"id": "cs_t1dm", "name": "Type 1 diabetes mellitus", "domain": "Condition", "source": "curated:type1_diabetes@v1",
+     "items": [{"concept_id": 201254, "include_descendants": true, "is_excluded": false}]},
+    {"id": "cs_hba1c", "name": "HbA1c", "domain": "Measurement", "source": "resolved",
+     "items": [{"concept_id": 3004410, "include_descendants": true, "is_excluded": false}]}
+  ],
+  "index_event": {"entity": "DrugExposure", "concept_set_id": "cs_metformin", "first_occurrence_only": true},
+  "prior_observation_days": 365,
+  "post_observation_days": 0,
+  "demographics": {"age_min": 18, "age_max": null, "gender_concept_ids": []},
+  "inclusion": [
+    {"id": "inc_t2dm", "name": "Type 2 diabetes diagnosis any time before index", "entity": "ConditionOccurrence",
+     "concept_set_id": "cs_t2dm", "window": {"start_days": null, "end_days": 0}, "occurrence": "at_least", "count": 1},
+    {"id": "inc_hba1c", "name": "HbA1c > 8% in the 365 days before index", "entity": "Measurement",
+     "concept_set_id": "cs_hba1c", "window": {"start_days": -365, "end_days": 0}, "occurrence": "at_least", "count": 1,
+     "value_filter": {"op": ">", "value": 8.0, "unit_concept_id": 8554}}
+  ],
+  "exclusion": [
+    {"id": "exc_t1dm", "name": "Type 1 diabetes any time before index", "entity": "ConditionOccurrence",
+     "concept_set_id": "cs_t1dm", "window": {"start_days": null, "end_days": 0}, "occurrence": "at_least", "count": 1}
+  ],
+  "exit": {"type": "end_of_observation"},
+  "assumptions": ["'Starting metformin' = first-ever metformin exposure (new user)."]
+}

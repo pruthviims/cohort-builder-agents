@@ -1,0 +1,10 @@
+data/*
+!data/.gitkeep
+*.duckdb
+*.duckdb.wal
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+.env
+eval_report.json

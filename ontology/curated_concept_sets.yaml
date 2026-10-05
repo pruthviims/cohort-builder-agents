@@ -1,0 +1,51 @@
+# Organization-approved concept sets. The concept resolver checks these FIRST
+# and reuses them verbatim, so the same clinical idea always resolves to the
+# same codes. Each therapeutic area contributes its own sets.
+concept_sets:
+  t2dm:
+    label: Type 2 diabetes mellitus (org standard)
+    therapeutic_area: cardiometabolic
+    domain: Condition
+    synonyms: [type 2 diabetes, t2dm, t2d, diabetes type 2, adult-onset diabetes, NIDDM]
+    version: 1
+    status: approved
+    items:
+      - {concept_id: 201826, include_descendants: true}
+  heart_failure:
+    label: Heart failure (any type)
+    therapeutic_area: cardiometabolic
+    domain: Condition
+    synonyms: [heart failure, hf, chf, congestive heart failure, cardiac failure]
+    version: 1
+    status: approved
+    items:
+      - {concept_id: 316139, include_descendants: true}
+  sglt2_inhibitors:
+    label: SGLT2 inhibitors
+    therapeutic_area: cardiometabolic
+    domain: Drug
+    synonyms: [sglt2, sglt2i, sglt-2 inhibitor, gliflozin, gliflozins]
+    version: 1
+    status: approved
+    items:
+      - {concept_id: 45775965, include_descendants: true}   # empagliflozin
+      - {concept_id: 44785829, include_descendants: true}   # dapagliflozin
+      - {concept_id: 43526465, include_descendants: true}   # canagliflozin
+  type1_diabetes:
+    label: Type 1 diabetes mellitus
+    therapeutic_area: cardiometabolic
+    domain: Condition
+    synonyms: [type 1 diabetes, t1dm, t1d, juvenile diabetes, iddm]
+    version: 1
+    status: approved
+    items:
+      - {concept_id: 201254, include_descendants: true}
+  major_depression:
+    label: Depressive disorder
+    therapeutic_area: mental_health
+    domain: Condition
+    synonyms: [depression, depressive disorder, mdd, major depression]
+    version: 1
+    status: approved
+    items:
+      - {concept_id: 440383, include_descendants: true}

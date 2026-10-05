@@ -1,0 +1,30 @@
+# Golden set: natural-language requests paired with expert-built IRs.
+# Add cases per therapeutic area; failed or edited real requests make the best new cases.
+cases:
+  - id: t2dm_metformin_hba1c
+    therapeutic_area: cardiometabolic
+    tags: [new-user, lab-value, exclusion]
+    query: >-
+      Adults with type 2 diabetes who started metformin and had an HbA1c above 8% in the year
+      before starting. Exclude anyone with type 1 diabetes before starting.
+    gold: gold/t2dm_metformin_hba1c.json
+  - id: hfref_sglt2
+    therapeutic_area: cardiometabolic
+    tags: [drug-class, lab-value]
+    query: >-
+      Patients with heart failure who started an SGLT2 inhibitor, with an ejection fraction
+      below 40% in the year before starting.
+    gold: gold/hfref_sglt2.json
+  - id: ckd_egfr
+    therapeutic_area: renal
+    tags: [diagnosis-index, lab-value, post-index-window]
+    query: >-
+      Adults newly diagnosed with chronic kidney disease who have an eGFR below 60 within
+      90 days after the diagnosis.
+    gold: gold/ckd_egfr.json
+  - id: sertraline_depression
+    therapeutic_area: mental_health
+    tags: [new-user, short-window]
+    query: >-
+      New users of sertraline with a depression diagnosis in the 30 days before their first prescription.
+    gold: gold/sertraline_depression.json

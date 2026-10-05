@@ -1,0 +1,74 @@
+# Semantic ontology: the domain model agents are allowed to reason with.
+# Agents can only express cohorts using the entities, attributes and operators
+# declared here. Bump `version` (semver) on every change: it is recorded in
+# every run manifest and cohort definition.
+version: 1.0.0
+
+entities:
+  ConditionOccurrence:
+    description: A diagnosis or clinical finding recorded for a person.
+    domain_id: Condition
+    has_value: false
+    has_duration: true
+  DrugExposure:
+    description: A drug prescribed, dispensed or administered. Use ingredients (e.g. metformin) with descendants to cover all products.
+    domain_id: Drug
+    has_value: false
+    has_duration: true
+  Measurement:
+    description: A lab test or vital sign with a numeric value and unit (e.g. HbA1c, eGFR, LVEF).
+    domain_id: Measurement
+    has_value: true
+    has_duration: false
+  ProcedureOccurrence:
+    description: A procedure performed on a person.
+    domain_id: Procedure
+    has_value: false
+    has_duration: false
+  VisitOccurrence:
+    description: An encounter (inpatient, outpatient, emergency).
+    domain_id: Visit
+    has_value: false
+    has_duration: true
+
+# Attributes the IR may filter on, with allowed operators.
+attributes:
+  Measurement.value:
+    data_type: numeric
+    operators: [">", ">=", "<", "<=", "=", "between"]
+    requires_unit: true
+  Person.age_at_index:
+    data_type: integer
+    operators: [">=", "<=", "between"]
+  Person.gender:
+    data_type: concept
+    allowed_concepts:
+      8507: male
+      8532: female
+
+# Temporal semantics. Windows are in days relative to the index date
+# (negative = before index). null start/end = bounded by the observation period.
+temporal:
+  reference: index_date
+  window_fields: [start_days, end_days]
+  occurrence_operators: [at_least, at_most, exactly]
+  examples:
+    "any time before index": {start_days: null, end_days: 0}
+    "in the year before index": {start_days: -365, end_days: 0}
+    "within 90 days after index": {start_days: 0, end_days: 90}
+    "on the index date": {start_days: 0, end_days: 0}
+
+# Rules of cohort construction (enforced by the validator).
+cohort_rules:
+  index_event_required: true
+  index_must_fall_in_observation_period: true
+  default_prior_observation_days: 365
+  max_inclusion_criteria: 15
+  exit_types: [end_of_observation, fixed_days]
+  min_cell_count: 10          # counts below this are suppressed in outputs
+  attrition_warning_ratio: 0.995  # warn if a single rule removes more than this share
+
+# Curated concept sets are checked by the concept resolver before raw vocabulary search.
+curated_concept_sets_file: curated_concept_sets.yaml
+mappings_file: mappings.yaml
+unit_conversions_file: unit_conversions.yaml

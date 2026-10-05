@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0",
+  "ontology_version": "1.0.0",
+  "vocabulary_version": "DEMO-2026-10-01",
+  "post_observation_days": 0,
+  "exclusion": [],
+  "exit": {
+    "type": "end_of_observation"
+  },
+  "assumptions": [],
+  "name": "New sertraline users with recent depression",
+  "description": "",
+  "concept_sets": [
+    {
+      "id": "cs_sertraline",
+      "name": "sertraline",
+      "domain": "Drug",
+      "source": "resolved",
+      "items": [
+        {
+          "concept_id": 739138,
+          "include_descendants": true,
+          "is_excluded": false
+        }
+      ]
+    },
+    {
+      "id": "cs_depression",
+      "name": "Depressive disorder",
+      "domain": "Condition",
+      "source": "curated:major_depression@v1",
+      "items": [
+        {
+          "concept_id": 440383,
+          "include_descendants": true,
+          "is_excluded": false
+        }
+      ]
+    }
+  ],
+  "index_event": {
+    "entity": "DrugExposure",
+    "concept_set_id": "cs_sertraline",
+    "first_occurrence_only": true
+  },
+  "prior_observation_days": 365,
+  "demographics": {
+    "age_min": null,
+    "age_max": null,
+    "gender_concept_ids": []
+  },
+  "inclusion": [
+    {
+      "id": "inc_1",
+      "name": "Depression in 30 days before index",
+      "entity": "ConditionOccurrence",
+      "concept_set_id": "cs_depression",
+      "window": {
+        "start_days": -30,
+        "end_days": 0
+      },
+      "occurrence": "at_least",
+      "count": 1
+    }
+  ]
+}

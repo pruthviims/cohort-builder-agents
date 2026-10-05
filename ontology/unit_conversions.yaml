@@ -1,0 +1,33 @@
+# Analyte-specific unit conversions: canonical = from_value * factor + offset.
+# Keyed by a measurement concept (descendants inherit the rule).
+# The compiler normalizes values to the canonical unit before applying filters,
+# so "HbA1c > 8%" also catches results recorded in mmol/mol.
+units:
+  8554: {name: percent, symbol: "%"}
+  8840: {name: milligram per deciliter, symbol: mg/dL}
+  8753: {name: millimole per liter, symbol: mmol/L}
+  2000001001: {name: millimole per mole, symbol: mmol/mol}
+  2000001002: {name: milliliter per minute per 1.73 square meter, symbol: mL/min/1.73m2}
+  2000001003: {name: micromole per liter, symbol: umol/L}
+# Unit concept IDs >= 2,000,000,000 are demo/local concepts (OMOP's reserved
+# local range). Replace them with the Athena IDs when loading real vocabularies.
+
+analytes:
+  3004410:   # Hemoglobin A1c
+    name: HbA1c
+    canonical_unit: 8554
+    conversions:
+      - {from_unit: 2000001001, factor: 0.09148, offset: 2.152}   # IFCC mmol/mol -> NGSP %
+  3016723:   # Creatinine in serum/plasma
+    name: Serum creatinine
+    canonical_unit: 8840
+    conversions:
+      - {from_unit: 2000001003, factor: 0.0113, offset: 0}         # umol/L -> mg/dL
+  2000002001:  # eGFR (demo concept)
+    name: eGFR
+    canonical_unit: 2000001002
+    conversions: []
+  2000002002:  # LVEF (demo concept)
+    name: Left ventricular ejection fraction
+    canonical_unit: 8554
+    conversions: []
