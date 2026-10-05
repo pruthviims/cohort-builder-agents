@@ -61,18 +61,40 @@ class Explainer:
         src = f"; {cs.source}" if cs.source != "resolved" else ""
         return f"\"{cs.name}\" ({', '.join(parts)}{src})"
 
+    def _claims(self, entity: str, claim_status, dx_position) -> str:
+        parts = []
+        status = claim_status
+        if status is None and self.ont.supports_entity(entity) and "status_col" in self.ont.table_mapping(entity):
+            status = self.ont.default_claim_status()
+        if status:
+            parts.append(" or ".join(sorted(set(status))) + " claims only")
+        if dx_position == "primary":
+            parts.append("primary diagnosis only")
+        return f" [{'; '.join(parts)}]" if parts else ""
+
+    @staticmethod
+    def _noun(entity: str, claim_status) -> str:
+        if entity == "DrugExposure" and claim_status and "paid" not in claim_status:
+            return "pharmacy claim for"  # a rejected / reversed claim is not a drug exposure
+        return ENTITY_NOUN[entity]
+
     def _criterion(self, ir: CohortDefinition, c: Criterion) -> str:
         occ = {"at_least": "at least", "at_most": "at most", "exactly": "exactly"}[c.occurrence]
         times = "time" if c.count == 1 else "times"
-        return (f"{occ} {c.count} {times}: {ENTITY_NOUN[c.entity]} {self._concepts(ir, c.concept_set_id)}"
-                f"{self._value(c.value_filter)}, {_window(c.window)}")
+        span = f", with the first and last at least {c.min_span_days} days apart" if c.min_span_days else ""
+        return (f"{occ} {c.count} {times}: {self._noun(c.entity, c.claim_status)} {self._concepts(ir, c.concept_set_id)}"
+                f"{self._value(c.value_filter)}{self._claims(c.entity, c.claim_status, c.dx_position)}, "
+                f"{_window(c.window)}{span}")
 
     def explain(self, ir: CohortDefinition) -> str:
         ie = ir.index_event
         lines = [f"### {ir.name}", ""]
         first = "the first-ever" if ie.first_occurrence_only else "any"
-        lines.append(f"**Entry (index date):** {first} {ENTITY_NOUN[ie.entity]} "
-                     f"{self._concepts(ir, ie.concept_set_id)}{self._value(ie.value_filter)}.")
+        lines.append(f"**Entry (index date):** {first} {self._noun(ie.entity, ie.claim_status)} "
+                     f"{self._concepts(ir, ie.concept_set_id)}{self._value(ie.value_filter)}"
+                     f"{self._claims(ie.entity, ie.claim_status, ie.dx_position)}.")
+        lines.append(f"**Data source:** {self.ont.dataset_name} (observation: "
+                     f"{self.ont.capabilities.get('observation', 'observation_period').replace('_', ' ')}).")
         req = []
         if ir.prior_observation_days:
             req.append(f"{ir.prior_observation_days} days of observation before index")

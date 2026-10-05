@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from ..ir import Entity
+from ..ir import ClaimStatus, Entity
 from . import AgentContext
 
 
@@ -32,6 +32,15 @@ class IntentCriterion(BaseModel):
     occurrence: Literal["at_least", "at_most", "exactly"] = "at_least"
     count: int = 1
     value: ValueSpec | None = None
+    claim_status: list[ClaimStatus] | None = Field(
+        default=None, description="Claims data, drug criteria only: which adjudication outcomes count. "
+                                  "Null = dataset default (normally paid claims)")
+    dx_position: Literal["primary", "any"] | None = Field(
+        default=None, description="Claims data, diagnosis criteria only: 'primary' if the user asks for a "
+                                  "primary / principal diagnosis")
+    min_span_days: int | None = Field(
+        default=None, description="With at_least N (N >= 2): first and last qualifying events must be at least "
+                                  "this many days apart, e.g. '2 claims at least 30 days apart'")
 
 
 class CohortIntent(BaseModel):
@@ -41,6 +50,9 @@ class CohortIntent(BaseModel):
     index_mention_key: str = Field(description="Mention whose event defines the index date")
     index_first_occurrence_only: bool = True
     index_value: ValueSpec | None = None
+    index_claim_status: list[ClaimStatus] | None = Field(
+        default=None, description="Claims data, drug index only. Null = dataset default (normally paid)")
+    index_dx_position: Literal["primary", "any"] | None = None
     prior_observation_days: int = 365
     post_observation_days: int = 0
     age_min: int | None = None

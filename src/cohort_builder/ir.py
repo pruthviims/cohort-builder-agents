@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, model_validator
 from . import IR_SCHEMA_VERSION
 
 Entity = Literal["ConditionOccurrence", "DrugExposure", "Measurement", "ProcedureOccurrence", "VisitOccurrence"]
+ClaimStatus = Literal["paid", "rejected", "reversed"]
 Domain = Literal["Condition", "Drug", "Measurement", "Procedure", "Visit"]
 
 
@@ -66,6 +67,13 @@ class Criterion(BaseModel):
     occurrence: Literal["at_least", "at_most", "exactly"] = "at_least"
     count: int = Field(default=1, ge=0)
     value_filter: ValueFilter | None = None
+    # claims attributes (only on datasets whose profile supports them)
+    claim_status: list[ClaimStatus] | None = Field(
+        default=None, description="DrugExposure on claims data: which adjudication outcomes count")
+    dx_position: Literal["primary", "any"] | None = Field(
+        default=None, description="ConditionOccurrence on claims data: primary = first-listed diagnosis")
+    min_span_days: int | None = Field(
+        default=None, ge=1, description="With at_least N: qualifying events must span >= this many days")
 
 
 class IndexEvent(BaseModel):
@@ -73,6 +81,8 @@ class IndexEvent(BaseModel):
     concept_set_id: str
     first_occurrence_only: bool = True
     value_filter: ValueFilter | None = None
+    claim_status: list[ClaimStatus] | None = None
+    dx_position: Literal["primary", "any"] | None = None
 
 
 class Demographics(BaseModel):
@@ -133,7 +143,18 @@ class CohortDefinition(BaseModel):
                 "entity": c.entity, "concepts": items(c.concept_set_id), "window": c.window.model_dump(),
                 "occurrence": c.occurrence, "count": c.count,
                 "value": c.value_filter.model_dump(exclude={"original_text"}) if c.value_filter else None,
+                **claims(c),
             }
+
+        def claims(x) -> dict:
+            out = {}
+            if x.claim_status is not None:
+                out["claim_status"] = sorted(set(x.claim_status))
+            if x.dx_position is not None:
+                out["dx_position"] = x.dx_position
+            if getattr(x, "min_span_days", None) is not None:
+                out["min_span_days"] = x.min_span_days
+            return out
 
         def key(d: dict) -> str:
             return json.dumps(d, sort_keys=True)
@@ -144,6 +165,7 @@ class CohortDefinition(BaseModel):
                 "first_only": self.index_event.first_occurrence_only,
                 "value": self.index_event.value_filter.model_dump(exclude={"original_text"})
                 if self.index_event.value_filter else None,
+                **claims(self.index_event),
             },
             "prior_obs": self.prior_observation_days,
             "post_obs": self.post_observation_days,

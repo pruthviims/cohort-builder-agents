@@ -64,6 +64,16 @@ def _value_filter(spec: ValueSpec, cs: ResolvedConceptSet, ont: Ontology, vocab:
     return ValueFilter(op=spec.op, value=value, value_high=high, unit_concept_id=unit, original_text=original)
 
 
+def _claim_status(entity: str, requested: list[str] | None, ont: Ontology) -> list[str] | None:
+    """Make the dataset's default claim status explicit in the IR (e.g. paid claims only)."""
+    if requested is not None:
+        return sorted(set(requested))
+    if ont.supports_entity(entity) and "status_col" in ont.table_mapping(entity):
+        default = ont.default_claim_status()
+        return sorted(default) if default else None
+    return None
+
+
 def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: Ontology, vocab: Vocabulary,
             ) -> tuple[CohortDefinition | None, list[Issue]]:
     issues: list[Issue] = []
@@ -103,9 +113,12 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
             continue
         target = inclusion if c.role == "inclusion" else exclusion
         prefix = "inc" if c.role == "inclusion" else "exc"
-        target.append(Criterion(id=f"{prefix}_{len(target) + 1}", name=c.name, entity=mentions[c.mention_key].entity,
+        entity = mentions[c.mention_key].entity
+        target.append(Criterion(id=f"{prefix}_{len(target) + 1}", name=c.name, entity=entity,
                                 concept_set_id=cs.id, window=window, occurrence=c.occurrence, count=c.count,
-                                value_filter=vf))
+                                value_filter=vf, claim_status=_claim_status(entity, c.claim_status, ont),
+                                dx_position=c.dx_position if c.dx_position == "primary" else None,
+                                min_span_days=c.min_span_days))
 
     if idx_cs is None or any(i.severity == "error" for i in issues):
         return None, issues
@@ -118,7 +131,11 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
         description=intent.description,
         concept_sets=sorted((cs for cs in concept_sets.values() if cs.id in used), key=lambda s: s.id),
         index_event=IndexEvent(entity=mentions[intent.index_mention_key].entity, concept_set_id=idx_cs.id,
-                               first_occurrence_only=intent.index_first_occurrence_only, value_filter=index_vf),
+                               first_occurrence_only=intent.index_first_occurrence_only, value_filter=index_vf,
+                               claim_status=_claim_status(mentions[intent.index_mention_key].entity,
+                                                          intent.index_claim_status, ont),
+                               dx_position=intent.index_dx_position if intent.index_dx_position == "primary"
+                               else None),
         prior_observation_days=intent.prior_observation_days,
         post_observation_days=intent.post_observation_days,
         demographics=Demographics(age_min=intent.age_min, age_max=intent.age_max,

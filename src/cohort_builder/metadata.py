@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS meta.cohort_definition (
 CREATE TABLE IF NOT EXISTS meta.cohort_generation (
   generation_id VARCHAR PRIMARY KEY, cohort_definition_id BIGINT, data_snapshot VARCHAR,
   compiler_version VARCHAR, sql_hash VARCHAR, person_count BIGINT, executed_by VARCHAR, executed_at TIMESTAMP);
+ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS dataset VARCHAR;
+ALTER TABLE meta.cohort_generation ADD COLUMN IF NOT EXISTS dataset VARCHAR;
 CREATE TABLE IF NOT EXISTS meta.review (
   review_id VARCHAR PRIMARY KEY, cohort_definition_id BIGINT, reviewer VARCHAR, decision VARCHAR,
   comments VARCHAR, created_at TIMESTAMP);
@@ -123,14 +125,16 @@ class MetadataStore:
 
     # ---- definitions -----------------------------------------------------
     def save_definition(self, ir, status: str, created_by: str, run_id: str | None = None,
-                        parent_id: int | None = None, issues: list | None = None) -> int:
+                        parent_id: int | None = None, issues: list | None = None, dataset: str | None = None) -> int:
         """Definitions are immutable; an edit is a new row with parent_definition_id."""
         def_id = self.con.execute("SELECT nextval('meta.cohort_definition_seq')").fetchone()[0]
         self.con.execute(
-            "INSERT INTO meta.cohort_definition VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?)",
+            "INSERT INTO meta.cohort_definition (cohort_definition_id, name, ir_json, content_hash, semantic_hash, "
+            "schema_version, ontology_version, vocabulary_version, status, created_by, created_at, "
+            "parent_definition_id, run_id, issues_json, dataset) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [def_id, ir.name, ir.canonical_json(), ir.content_hash(), ir.semantic_hash(), ir.schema_version,
              ir.ontology_version, ir.vocabulary_version, status, created_by, now(), parent_id, run_id,
-             dumps(issues or [])])
+             dumps(issues or []), dataset])
         return int(def_id)
 
     def get_definition(self, def_id: int) -> dict | None:
@@ -145,7 +149,7 @@ class MetadataStore:
 
     def list_definitions(self, limit: int = 50) -> list[dict]:
         return _rows(self.con.execute(
-            "SELECT cohort_definition_id, name, status, semantic_hash, created_by, created_at "
+            "SELECT cohort_definition_id, name, status, dataset, semantic_hash, created_by, created_at "
             "FROM meta.cohort_definition ORDER BY cohort_definition_id DESC LIMIT ?", [limit]))
 
     def review(self, def_id: int, reviewer: str, decision: str, comments: str = "") -> None:
@@ -161,10 +165,12 @@ class MetadataStore:
                              [def_id])
 
     def record_generation(self, generation_id: str, def_id: int, data_snapshot: str, compiler_version: str,
-                          sql_hash: str, person_count: int, executed_by: str) -> None:
-        self.con.execute("INSERT INTO meta.cohort_generation VALUES (?,?,?,?,?,?,?,?)",
-                         [generation_id, def_id, data_snapshot, compiler_version, sql_hash, person_count,
-                          executed_by, now()])
+                          sql_hash: str, person_count: int, executed_by: str, dataset: str | None = None) -> None:
+        self.con.execute(
+            "INSERT INTO meta.cohort_generation (generation_id, cohort_definition_id, data_snapshot, "
+            "compiler_version, sql_hash, person_count, executed_by, executed_at, dataset) VALUES (?,?,?,?,?,?,?,?,?)",
+            [generation_id, def_id, data_snapshot, compiler_version, sql_hash, person_count, executed_by, now(),
+             dataset])
 
     # ---- reads -----------------------------------------------------------
     def get_run(self, run_id: str) -> dict | None:
@@ -183,9 +189,12 @@ class MetadataStore:
             "SELECT tool_name, args_json, result_hash FROM meta.tool_call WHERE run_id=? ORDER BY created_at",
             [run_id]))
 
-    def data_snapshot(self) -> str:
+    def data_snapshot(self, snapshot_sql: str | None = None) -> str:
+        """Identifies the data release; the SQL comes from the active dataset profile."""
+        sql = snapshot_sql or ("SELECT cdm_source_name || ' @ ' || CAST(cdm_release_date AS VARCHAR) "
+                               "FROM cdm.cdm_source LIMIT 1")
         try:
-            row = self.con.execute("SELECT cdm_source_name, cdm_release_date FROM cdm.cdm_source LIMIT 1").fetchone()
-            return f"{row[0]} @ {row[1]}" if row else "unknown"
+            row = self.con.execute(sql).fetchone()
+            return str(row[0]) if row and row[0] is not None else "unknown"
         except duckdb.Error:
             return "unknown"

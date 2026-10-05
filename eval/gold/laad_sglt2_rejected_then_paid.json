@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.1",
+  "ontology_version": "1.1.0",
+  "vocabulary_version": "DEMO-2026-10-01",
+  "description": "",
+  "post_observation_days": 0,
+  "prior_observation_days": 365,
+  "exclusion": [],
+  "demographics": {
+    "age_min": null,
+    "age_max": null,
+    "gender_concept_ids": []
+  },
+  "exit": {
+    "type": "end_of_observation"
+  },
+  "assumptions": [],
+  "name": "SGLT2i rejection followed by paid claim within 90 days",
+  "concept_sets": [
+    {
+      "id": "cs_sglt2",
+      "name": "SGLT2 inhibitors",
+      "domain": "Drug",
+      "source": "curated:sglt2_inhibitors@v1",
+      "items": [
+        {
+          "concept_id": 45775965,
+          "include_descendants": true,
+          "is_excluded": false
+        },
+        {
+          "concept_id": 44785829,
+          "include_descendants": true,
+          "is_excluded": false
+        },
+        {
+          "concept_id": 43526465,
+          "include_descendants": true,
+          "is_excluded": false
+        }
+      ]
+    }
+  ],
+  "index_event": {
+    "entity": "DrugExposure",
+    "concept_set_id": "cs_sglt2",
+    "first_occurrence_only": true,
+    "claim_status": [
+      "rejected"
+    ]
+  },
+  "inclusion": [
+    {
+      "id": "inc_1",
+      "name": "Paid SGLT2i claim within 90 days after rejection",
+      "entity": "DrugExposure",
+      "concept_set_id": "cs_sglt2",
+      "window": {
+        "start_days": 0,
+        "end_days": 90
+      },
+      "occurrence": "at_least",
+      "count": 1,
+      "claim_status": [
+        "paid"
+      ]
+    }
+  ]
+}

@@ -32,8 +32,8 @@ Only **three steps call an LLM**: the intent parser, the concept resolver and th
 
 ```bash
 pip install -e ".[api,mcp,dev]"
-cohort-builder init-demo                  # demo vocabulary + 5,000 synthetic patients (DuckDB)
-pytest                                    # 28 tests, no API key needed
+cohort-builder init-demo                  # demo vocabulary + synthetic OMOP patients and LAAD-style claims (DuckDB)
+pytest                                    # 40 tests, no API key needed
 
 export ANTHROPIC_API_KEY=sk-ant-...
 cohort-builder ask "Adults with type 2 diabetes who started metformin and had an HbA1c above 8% in the year before starting"
@@ -159,11 +159,37 @@ All of it is stored in the `meta` schema: `agent_run`, `agent_step`, `llm_call`,
 | File | Contents |
 |---|---|
 | `domain.yaml` | Entities, filterable attributes and operators, temporal semantics, cohort construction rules (semver `version`) |
-| `mappings.yaml` | Entity → physical OMOP table and column mapping (change this for a non-OMOP warehouse) |
+| `datasets/*.yaml` | One **dataset profile** per data source: what it can answer, where each entity physically lives, how "observable" is defined, and any semantic views to install (`omop_demo`, `iqvia_laad`) |
 | `curated_concept_sets.yaml` | Approved concept sets per therapeutic area, with synonyms |
 | `unit_conversions.yaml` | Analyte-specific canonical units and conversions |
 
 The ontology's content hash goes into every manifest. If you change the ontology, bump `version`.
+
+### Data sources: OMOP is optional
+
+The agents, IR and compiler only know the ontology. A dataset profile binds that ontology to a physical source. Pick one with `--dataset` or `CB_DATASET`:
+
+```bash
+cohort-builder datasets                                    # list profiles and what each can answer
+cohort-builder --dataset iqvia_laad ask "New users of SGLT2 inhibitors with T2D on 2+ claims 30+ days apart"
+```
+
+**`iqvia_laad`** is a profile for IQVIA LAAD-style open US claims. It works on the vendor's native tables, so no OMOP conversion is needed. A layer of semantic views (`sem` schema) does the translation:
+
+- **Codes:** raw codes are mapped to standard concepts through the OMOP *vocabularies*. That covers NDC → RxNorm, dot-less ICD-10-CM → SNOMED, and CPT. Wide `dx1..dxN` columns are unpivoted, keeping each code's position on the claim.
+- **Claim status:** each pharmacy claim is classified as **paid, rejected or reversed**. Reversal transactions are dropped. Drug criteria count paid claims unless the request is about rejections.
+- **Observation without enrollment:** open data has no enrollment table, so observation is inferred from **claim activity**. A period runs from first to last activity and splits on gaps longer than 365 days (configurable). The validator warns that exclusions are weaker evidence on this basis.
+- **New cohort rules:**
+  - `claim_status` (e.g. "first *rejected* claim, then *paid* within 90 days")
+  - `dx_position` (primary diagnosis)
+  - `min_span_days` (the claims case definition "≥2 claims ≥30 days apart")
+- **What LAAD can't answer:** there are no lab values and no visits. A request that needs them (e.g. HbA1c > 8%) is stopped immediately with a clear message, instead of quietly returning nobody.
+
+> **The `laad` table and column names are placeholders.** Replace them with the names from your IQVIA data dictionary in `ontology/datasets/iqvia_laad.yaml`. Only that file changes. Verify the transaction-type, reject-code and reversal conventions against your delivery too.
+
+**One definition, several sources.** The same cohort logic can be executed on several sources. Execution re-checks what the active source can answer, and records which dataset each run used.
+
+To add another source (Optum, Komodo, your EHR), copy a profile and edit its capabilities, mapping and views.
 
 ### Adding a therapeutic area
 
@@ -181,7 +207,7 @@ Oncology (lines of therapy, staging, biomarkers) needs new entities and IR crite
 - **Vocabulary:** download the vocabularies from [OHDSI Athena](https://athena.ohdsi.org) and run `cohort-builder load-athena /path/to/athena`. This replaces the demo vocabulary.
   - Concept and unit IDs at or above 2,000,000,000 in the demo files are local placeholders (for example eGFR, LVEF and mmol/mol). Replace them with the real Athena IDs in `unit_conversions.yaml` and `curated_concept_sets.yaml`.
   - The other top-level IDs follow standard OMOP but should still be verified against your vocabulary release.
-- **CDM:** the executor runs on DuckDB. You can load your CDM into the `cdm` schema, or point `mappings.yaml` at your tables.
+- **CDM:** the executor runs on DuckDB. You can load your CDM into the `cdm` schema, or point a dataset profile (`ontology/datasets/`) at your tables.
   - The compiled SQL sticks to portable constructs (`date + int`, `COUNT(*) FILTER`, window functions), so `cohort-builder compile <id>` output is written to run on PostgreSQL.
   - Executing directly against Postgres, Databricks or Snowflake needs a small executor adapter. That has not been tested yet.
 - **Search:** concept search is lexical (exact, synonym, code and Jaro-Winkler). An embedding searcher, such as pgvector, can be plugged in through `vocab.ConceptSearcher`.
@@ -200,13 +226,14 @@ The eval harness measures, for each golden case:
 - **Structure match:** whether windows, thresholds and occurrence counts match the gold definition.
 - **Patient-level Jaccard:** overlap between the generated cohort and the gold cohort on the same data.
 
-The golden set covers cardiometabolic, renal and mental-health cases. The `eval` GitHub workflow runs it against the live API when you trigger it.
+The golden sets cover cardiometabolic, renal, mental-health and market-access (claim rejection) cases. LAAD cases live in `eval/golden_cases_laad.yaml` (`cohort-builder --dataset iqvia_laad eval --cases eval/golden_cases_laad.yaml`). The `eval` GitHub workflow runs it against the live API when you trigger it.
 
 ## Configuration
 
 | Variable | Default |
 |---|---|
 | `ANTHROPIC_API_KEY` | (required for `ask` in live/cached mode) |
+| `CB_DATASET` | `omop_demo` (or `iqvia_laad`) |
 | `CB_MODEL` | `claude-sonnet-5-5` |
 | `CB_TEMPERATURE` | `0` (set `none` to omit the parameter for models that do not accept it) |
 | `CB_LLM_MODE` | `cached` |
@@ -216,7 +243,7 @@ The golden set covers cardiometabolic, renal and mental-health cases. The `eval`
 ## Layout
 
 ```
-ontology/            semantic ontology (YAML, versioned)
+ontology/            semantic ontology (YAML, versioned) + datasets/ profiles
 prompts/             versioned agent prompts
 src/cohort_builder/
   ir.py              cohort definition IR + canonical/semantic hashing
@@ -228,7 +255,8 @@ src/cohort_builder/
   orchestrator.py    fixed agent graph, review gate, manifests, replay
   metadata.py        audit/metadata store
   evaluation.py      golden-case evaluation
-  synthetic.py       demo vocabulary, synthetic patients, Athena loader
+  synthetic.py       demo vocabulary, synthetic OMOP patients, Athena loader
+  synthetic_laad.py  synthetic LAAD-style claims (native vendor-shaped tables)
   cli.py, api.py     interfaces (CLI, HTTP API)
   mcp_server.py      MCP server (stdio + Streamable HTTP)
 eval/                golden cases + gold IRs

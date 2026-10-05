@@ -60,7 +60,9 @@ class CohortBuilder:
         self.settings = settings or Settings.from_env()
         self.con = con or connect(self.settings.db_path)
         init_schemas(self.con)
-        self.ontology = Ontology.load(self.settings.ontology_dir)
+        self.ontology = Ontology.load(self.settings.ontology_dir, self.settings.dataset)
+        for stmt in self.ontology.setup_statements():  # install the dataset's semantic views
+            self.con.execute(stmt)
         self.vocab = Vocabulary(self.con)
         self.store = MetadataStore(self.con)
         self.llm = LLMClient(self.settings, self.store, backend)
@@ -80,10 +82,14 @@ class CohortBuilder:
             "temperature": self.settings.temperature,
             "prompts": {n: {"version": p.version, "hash": p.hash} for n, p in self._prompts().items()},
             "ontology": {"version": self.ontology.version, "hash": self.ontology.content_hash},
+            "dataset": {"name": self.ontology.dataset_name, "version": str(self.ontology.dataset.get("version", ""))},
             "vocabulary_version": self.vocab.version(),
             "compiler_version": COMPILER_VERSION,
-            "data_snapshot": self.store.data_snapshot(),
+            "data_snapshot": self.data_snapshot(),
         }
+
+    def data_snapshot(self) -> str:
+        return self.store.data_snapshot(self.ontology.dataset.get("snapshot_sql"))
 
     def _record_versions(self) -> None:
         v = self.component_versions()
@@ -91,6 +97,7 @@ class CohortBuilder:
         for n, p in v["prompts"].items():
             self.store.record_component("prompt", n, p["version"], p["hash"])
         self.store.record_component("ontology", "domain", self.ontology.version, self.ontology.content_hash)
+        self.store.record_component("dataset", self.ontology.dataset_name, v["dataset"]["version"])
         self.store.record_component("vocabulary", "omop", v["vocabulary_version"])
         self.store.record_component("compiler", "sql_compiler", COMPILER_VERSION)
 
@@ -158,6 +165,10 @@ class CohortBuilder:
                 result.issues = [i.as_dict() for i in issues]
                 result.attrition = attrition.suppressed(self.executor.min_cell) if attrition else []
                 errors = [i for i in issues if i.severity == "error"]
+                if any(i.stage == "dataset" for i in errors):
+                    # the data source cannot answer this request; rephrasing will not help
+                    result.status = "needs_review"
+                    break
                 if errors:
                     feedback, concept_feedback = self._feedback(errors)
                     result.status = "needs_review"
@@ -196,7 +207,7 @@ class CohortBuilder:
             result.ir = ir
             result.cohort_definition_id = self.store.save_definition(
                 ir, result.status, user_id, run_id=run_id,
-                issues=[] if result.status == "draft" else result.issues)
+                issues=[] if result.status == "draft" else result.issues, dataset=self.ontology.dataset_name)
         result.manifest = self._manifest(run_id, query, result, attempt)
         self.store.finish_run(run_id, result.status, attempt, result.cohort_definition_id, result.manifest)
         return result
@@ -235,7 +246,8 @@ class CohortBuilder:
         issues, _ = validate(ir, self.ontology, self.vocab, self.executor)
         errors = [i.as_dict() for i in issues if i.severity == "error"]
         status = "needs_review" if errors else "draft"
-        def_id = self.store.save_definition(ir, status, user_id, parent_id=parent_id, issues=errors)
+        def_id = self.store.save_definition(ir, status, user_id, parent_id=parent_id, issues=errors,
+                                            dataset=self.ontology.dataset_name)
         return def_id, [i.as_dict() for i in issues]
 
     def load_definition(self, def_id: int) -> tuple[dict, CohortDefinition]:
@@ -258,11 +270,18 @@ class CohortBuilder:
         row, ir = self.load_definition(def_id)
         if row["status"] != "approved" and not (allow_draft and row["status"] == "draft"):
             raise PermissionError(f"definition {def_id} is {row['status']}; approve it before execution")
+        if row.get("dataset") != self.ontology.dataset_name:
+            # same logic on another data source: re-check what this source can answer
+            issues, _ = validate(ir, self.ontology, self.vocab)
+            errors = [i.message for i in issues if i.severity == "error"]
+            if errors:
+                raise ValueError(f"definition {def_id} (built on {row.get('dataset')!r}) cannot run on dataset "
+                                 f"{self.ontology.dataset_name!r}: " + "; ".join(errors))
         compiled = self.compiler.compile(ir)
         generation_id, attrition = self.executor.generate(compiled, def_id)
-        self.store.record_generation(generation_id, def_id, self.store.data_snapshot(), compiled.compiler_version,
-                                     compiled.sql_hash, attrition.final_count, user_id)
-        return {"generation_id": generation_id, "cohort_definition_id": def_id,
+        self.store.record_generation(generation_id, def_id, self.data_snapshot(), compiled.compiler_version,
+                                     compiled.sql_hash, attrition.final_count, user_id, self.ontology.dataset_name)
+        return {"generation_id": generation_id, "cohort_definition_id": def_id, "dataset": self.ontology.dataset_name,
                 "person_count": attrition.final_count, "sql_hash": compiled.sql_hash,
                 "attrition": attrition.suppressed(self.executor.min_cell)}
 

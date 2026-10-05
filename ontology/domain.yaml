@@ -2,7 +2,7 @@
 # Agents can only express cohorts using the entities, attributes and operators
 # declared here. Bump `version` (semver) on every change: it is recorded in
 # every run manifest and cohort definition.
-version: 1.0.0
+version: 1.1.0
 
 entities:
   ConditionOccurrence:
@@ -40,6 +40,21 @@ attributes:
   Person.age_at_index:
     data_type: integer
     operators: [">=", "<=", "between"]
+  DrugExposure.claim_status:
+    # claims datasets only (capability: claim_status)
+    data_type: enum
+    values: [paid, rejected, reversed]
+    description: Adjudication outcome of a pharmacy claim. Default is the dataset's default_claim_status.
+  ConditionOccurrence.dx_position:
+    # claims datasets only (capability: dx_position)
+    data_type: enum
+    values: [primary, any]
+    description: primary = first-listed diagnosis on the claim; any = any position.
+  Criterion.min_span_days:
+    data_type: integer
+    description: >-
+      With occurrence at_least N, the qualifying events must span at least this many days
+      (first to last). "2 claims at least 30 days apart" = at_least 2 with min_span_days 30.
   Person.gender:
     data_type: concept
     allowed_concepts:
@@ -70,5 +85,9 @@ cohort_rules:
 
 # Curated concept sets are checked by the concept resolver before raw vocabulary search.
 curated_concept_sets_file: curated_concept_sets.yaml
-mappings_file: mappings.yaml
 unit_conversions_file: unit_conversions.yaml
+
+# Each data source gets a profile (capabilities + physical mapping + semantic views).
+# Select one with CB_DATASET; the same cohort logic can run on several profiles.
+datasets_dir: datasets
+default_dataset: omop_demo

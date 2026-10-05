@@ -62,6 +62,27 @@ CONCEPTS: list[tuple] = [
     (2000004005, "Chronic kidney disease, stage 3", "Condition", "ICD10CM", "4-char nonbill code", None, "N18.3", [], []),
     (2000004006, "Major depressive disorder, single episode, unspecified", "Condition", "ICD10CM", "4-char billing code",
      None, "F32.9", [], []),
+    (2000004007, "Type 2 diabetes mellitus with diabetic chronic kidney disease", "Condition", "ICD10CM",
+     "5-char billing code", None, "E11.22", [], []),
+    (2000004008, "Type 1 diabetes mellitus without complications", "Condition", "ICD10CM", "5-char billing code",
+     None, "E10.9", [], []),
+    (2000004009, "Chronic systolic (congestive) heart failure", "Condition", "ICD10CM", "5-char billing code", None,
+     "I50.22", [], []),
+    (2000004010, "Major depressive disorder, recurrent, moderate", "Condition", "ICD10CM", "5-char billing code",
+     None, "F33.1", [], []),
+    # --- NDC package codes (non-standard, map to RxNorm clinical drugs). Synthetic codes (99999 labeler). ---
+    (2000009001, "metformin 500 MG Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999010101", [], []),
+    (2000009002, "metformin 1000 MG ER Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999010201", [], []),
+    (2000009003, "empagliflozin/metformin Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999010301", [], []),
+    (2000009004, "empagliflozin 10 MG Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999020101", [], []),
+    (2000009005, "dapagliflozin 10 MG Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999020201", [], []),
+    (2000009006, "canagliflozin 100 MG Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999020301", [], []),
+    (2000009007, "lisinopril 10 MG Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999030101", [], []),
+    (2000009008, "sertraline 50 MG Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999040101", [], []),
+    (2000009009, "atorvastatin 20 MG Oral Tablet [synthetic NDC]", "Drug", "NDC", "11-digit NDC", None, "99999050101", [], []),
+    # --- CPT-4 procedure codes (non-standard here, mapped to the demo procedure concepts) ---
+    (2000008001, "Echocardiography, transthoracic, complete", "Procedure", "CPT4", "CPT4", None, "93306", [], []),
+    (2000008002, "Coronary artery bypass, single arterial graft", "Procedure", "CPT4", "CPT4", None, "33533", [], []),
     # --- Drug classes (ATC, classification) ---
     (2000006001, "Biguanides", "Drug", "ATC", "ATC 4th", "C", "A10BA", [], []),
     (2000006002, "Sodium-glucose co-transporter 2 (SGLT2) inhibitors", "Drug", "ATC", "ATC 4th", "C", "A10BK", [],
@@ -122,6 +143,15 @@ MAPS_TO = {
     2000004004: 320128,
     2000004005: 46271022,
     2000004006: 2000003005,
+    2000004007: 2000003001,
+    2000004008: 201254,
+    2000004009: 2000003003,
+    2000004010: 2000003005,
+    **{2000009000 + i: product for i, product in enumerate(
+        [2000005001, 2000005002, 2000005003, 2000005004, 2000005005, 2000005006, 2000005007, 2000005008,
+         2000005009], start=1)},
+    2000008001: 2000007001,
+    2000008002: 2000007002,
 }
 DEPRECATED = {2000003099}
 
@@ -345,14 +375,20 @@ def generate_patients(con: duckdb.DuckDBPyConnection, n_persons: int = 5000, see
                 [DEMO_VOCAB_VERSION])
 
 
-def build_demo_database(con: duckdb.DuckDBPyConnection, n_persons: int = 5000, seed: int = 42) -> dict:
+def build_demo_database(con: duckdb.DuckDBPyConnection, n_persons: int = 5000, seed: int = 42,
+                        laad_patients: int | None = None) -> dict:
+    """Demo vocabulary + both demo sources: OMOP EHR-style patients and LAAD-style claims."""
+    from .synthetic_laad import generate_laad
+
     init_schemas(con)
     load_demo_vocabulary(con)
     generate_patients(con, n_persons=n_persons, seed=seed)
+    laad_counts = generate_laad(con, n_patients=laad_patients or n_persons, seed=seed + 1)
     counts = {t: con.execute(f"SELECT count(*) FROM cdm.{t}").fetchone()[0]
               for t in ("person", "condition_occurrence", "drug_exposure", "measurement", "procedure_occurrence",
                         "visit_occurrence")}
     counts["concepts"] = con.execute("SELECT count(*) FROM vocab.concept").fetchone()[0]
+    counts.update(laad_counts)
     return counts
 
 

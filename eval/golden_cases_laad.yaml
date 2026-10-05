@@ -1,0 +1,24 @@
+# Golden set for the IQVIA LAAD-style claims profile. Run with:
+#   cohort-builder --dataset iqvia_laad eval --cases eval/golden_cases_laad.yaml
+cases:
+  - id: laad_sglt2_t2d
+    therapeutic_area: cardiometabolic
+    tags: [claims, new-user, claim-count-algorithm]
+    query: >-
+      New users of SGLT2 inhibitors (first paid claim) with type 2 diabetes on at least 2 medical claims
+      at least 30 days apart in the year before starting.
+    gold: gold/laad_sglt2_t2d.json
+  - id: laad_sglt2_rejected_then_paid
+    therapeutic_area: market_access
+    tags: [claims, adjudication, rejection]
+    query: >-
+      Patients with a rejected pharmacy claim for an SGLT2 inhibitor, indexed on their first rejection,
+      who then had a paid SGLT2 inhibitor claim within 90 days after the rejection.
+    gold: gold/laad_sglt2_rejected_then_paid.json
+  - id: laad_sertraline_primary_depression
+    therapeutic_area: mental_health
+    tags: [claims, new-user, dx-position]
+    query: >-
+      New users of sertraline with a primary diagnosis of depression in the 30 days before their first
+      paid prescription.
+    gold: gold/laad_sertraline_primary_depression.json

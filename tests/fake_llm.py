@@ -155,3 +155,40 @@ SERT_INTENT = {
 
 GOLDEN_INTENTS = {T2DM_QUERY: [T2DM_INTENT], HF_QUERY: [HF_INTENT], CKD_QUERY: [CKD_INTENT],
                   SERT_QUERY: [SERT_INTENT]}
+
+
+# ---- IQVIA LAAD-style claims cases -------------------------------------------------
+LAAD_SGLT2_QUERY = ("New users of SGLT2 inhibitors (first paid claim) with type 2 diabetes on at least 2 medical claims "
+                    "at least 30 days apart in the year before starting.")
+LAAD_SGLT2_INTENT = {
+    "name": "New SGLT2i users with T2D on 2+ claims 30+ days apart", "description": "",
+    "mentions": [{"key": "sglt2", "text": "SGLT2 inhibitors", "entity": "DrugExposure", "notes": "drug class"},
+                 {"key": "t2dm", "text": "type 2 diabetes", "entity": "ConditionOccurrence"}],
+    "index_mention_key": "sglt2", "prior_observation_days": 365,
+    "criteria": [{**_crit("inclusion", "T2D on 2+ claims 30+ days apart in prior year", "t2dm", -365, 0),
+                  "count": 2, "min_span_days": 30}],
+}
+
+LAAD_REJECT_QUERY = ("Patients with a rejected pharmacy claim for an SGLT2 inhibitor, indexed on their first rejection, "
+                     "who then had a paid SGLT2 inhibitor claim within 90 days after the rejection.")
+LAAD_REJECT_INTENT = {
+    "name": "SGLT2i rejection followed by paid claim within 90 days", "description": "",
+    "mentions": [{"key": "sglt2", "text": "SGLT2 inhibitors", "entity": "DrugExposure"}],
+    "index_mention_key": "sglt2", "index_claim_status": ["rejected"], "prior_observation_days": 365,
+    "criteria": [{**_crit("inclusion", "Paid SGLT2i claim within 90 days after rejection", "sglt2", 0, 90),
+                  "claim_status": ["paid"]}],
+}
+
+LAAD_SERT_QUERY = ("New users of sertraline with a primary diagnosis of depression in the 30 days before their first "
+                   "paid prescription.")
+LAAD_SERT_INTENT = {
+    "name": "New sertraline users with primary depression diagnosis", "description": "",
+    "mentions": [{"key": "sertraline", "text": "sertraline", "entity": "DrugExposure"},
+                 {"key": "depression", "text": "depression", "entity": "ConditionOccurrence"}],
+    "index_mention_key": "sertraline", "prior_observation_days": 365,
+    "criteria": [{**_crit("inclusion", "Primary depression diagnosis in prior 30 days", "depression", -30, 0),
+                  "dx_position": "primary"}],
+}
+
+LAAD_INTENTS = {LAAD_SGLT2_QUERY: [LAAD_SGLT2_INTENT], LAAD_REJECT_QUERY: [LAAD_REJECT_INTENT],
+                LAAD_SERT_QUERY: [LAAD_SERT_INTENT], T2DM_QUERY: [T2DM_INTENT]}

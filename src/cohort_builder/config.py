@@ -21,6 +21,7 @@ class Settings:
     db_path: Path = field(default_factory=lambda: REPO_ROOT / "data" / "cohort_builder.duckdb")
     ontology_dir: Path = REPO_ROOT / "ontology"
     prompts_dir: Path = REPO_ROOT / "prompts"
+    dataset: str | None = None  # dataset profile in ontology/datasets/ (None = ontology default)
     model: str = "claude-sonnet-5-5"
     temperature: float | None = 0.0
     max_tokens: int = 4096
@@ -31,7 +32,7 @@ class Settings:
     max_retries: int = 2
     max_resolver_turns: int = 8
     prompt_versions: dict[str, str] = field(
-        default_factory=lambda: {"intent_parser": "v1", "concept_resolver": "v1", "critic": "v1"}
+        default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2"}
     )
 
     @classmethod
@@ -42,6 +43,7 @@ class Settings:
             db_path=Path(env.get("CB_DB_PATH", base.db_path)),
             ontology_dir=Path(env.get("CB_ONTOLOGY_DIR", base.ontology_dir)),
             prompts_dir=Path(env.get("CB_PROMPTS_DIR", base.prompts_dir)),
+            dataset=env.get("CB_DATASET") or None,
             model=env.get("CB_MODEL", base.model),
             temperature=_temperature(env.get("CB_TEMPERATURE")),
             max_tokens=int(env.get("CB_MAX_TOKENS", base.max_tokens)),

@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.1",
+  "ontology_version": "1.1.0",
+  "vocabulary_version": "DEMO-2026-10-01",
+  "description": "",
+  "post_observation_days": 0,
+  "prior_observation_days": 365,
+  "exclusion": [],
+  "demographics": {
+    "age_min": null,
+    "age_max": null,
+    "gender_concept_ids": []
+  },
+  "exit": {
+    "type": "end_of_observation"
+  },
+  "assumptions": [],
+  "name": "New sertraline users with primary depression diagnosis",
+  "concept_sets": [
+    {
+      "id": "cs_sertraline",
+      "name": "sertraline",
+      "domain": "Drug",
+      "source": "resolved",
+      "items": [
+        {
+          "concept_id": 739138,
+          "include_descendants": true,
+          "is_excluded": false
+        }
+      ]
+    },
+    {
+      "id": "cs_depression",
+      "name": "Depressive disorder",
+      "domain": "Condition",
+      "source": "curated:major_depression@v1",
+      "items": [
+        {
+          "concept_id": 440383,
+          "include_descendants": true,
+          "is_excluded": false
+        }
+      ]
+    }
+  ],
+  "index_event": {
+    "entity": "DrugExposure",
+    "concept_set_id": "cs_sertraline",
+    "first_occurrence_only": true,
+    "claim_status": [
+      "paid"
+    ]
+  },
+  "inclusion": [
+    {
+      "id": "inc_1",
+      "name": "Primary depression diagnosis in prior 30 days",
+      "entity": "ConditionOccurrence",
+      "concept_set_id": "cs_depression",
+      "window": {
+        "start_days": -30,
+        "end_days": 0
+      },
+      "occurrence": "at_least",
+      "count": 1,
+      "dx_position": "primary"
+    }
+  ]
+}

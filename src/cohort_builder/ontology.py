@@ -19,19 +19,24 @@ class Ontology:
     version: str
     content_hash: str
     domain: dict[str, Any]
-    mappings: dict[str, Any]
+    dataset: dict[str, Any]          # active dataset profile (capabilities, mapping, semantic views)
     curated: dict[str, Any]
     units: dict[int, dict[str, Any]]
     analytes: dict[int, dict[str, Any]]
 
     @classmethod
-    def load(cls, ontology_dir: Path) -> "Ontology":
+    def load(cls, ontology_dir: Path, dataset: str | None = None) -> "Ontology":
         ontology_dir = Path(ontology_dir)
         domain_path = ontology_dir / "domain.yaml"
         domain = yaml.safe_load(domain_path.read_text())
+        dataset = dataset or domain["default_dataset"]
+        dataset_path = ontology_dir / domain["datasets_dir"] / f"{dataset}.yaml"
+        if not dataset_path.exists():
+            available = sorted(p.stem for p in (ontology_dir / domain["datasets_dir"]).glob("*.yaml"))
+            raise ValueError(f"unknown dataset {dataset!r}; available: {available}")
         files = [
             domain_path,
-            ontology_dir / domain["mappings_file"],
+            dataset_path,
             ontology_dir / domain["curated_concept_sets_file"],
             ontology_dir / domain["unit_conversions_file"],
         ]
@@ -39,18 +44,49 @@ class Ontology:
         for f in files:
             digest.update(f.name.encode())
             digest.update(f.read_bytes())
-        mappings = yaml.safe_load(files[1].read_text())
+        profile = yaml.safe_load(dataset_path.read_text())
         curated = yaml.safe_load(files[2].read_text())["concept_sets"]
         units_doc = yaml.safe_load(files[3].read_text())
         return cls(
             version=str(domain["version"]),
             content_hash="sha256:" + digest.hexdigest(),
             domain=domain,
-            mappings=mappings,
+            dataset=profile,
             curated=curated,
             units={int(k): v for k, v in units_doc["units"].items()},
             analytes={int(k): v for k, v in units_doc["analytes"].items()},
         )
+
+    # ---- dataset profile ---------------------------------------------------
+    @property
+    def dataset_name(self) -> str:
+        return self.dataset["name"]
+
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        return self.dataset["capabilities"]
+
+    @property
+    def mappings(self) -> dict[str, Any]:
+        return self.dataset["mapping"]
+
+    def supports_entity(self, entity: str) -> bool:
+        return entity in self.capabilities["entities"]
+
+    def supports_attribute(self, attribute: str) -> bool:
+        return attribute in self.capabilities.get("attributes", [])
+
+    def default_claim_status(self) -> list[str] | None:
+        return self.capabilities.get("default_claim_status")
+
+    def setup_statements(self) -> list[str]:
+        params = self.dataset.get("params", {})
+        out = []
+        for stmt in self.dataset.get("setup_sql", []):
+            for k, v in params.items():
+                stmt = stmt.replace("{" + k + "}", str(v))
+            out.append(stmt)
+        return out
 
     # ---- entities & rules -------------------------------------------------
     @property
@@ -70,8 +106,11 @@ class Ontology:
     def table_mapping(self, entity: str) -> dict[str, Any]:
         return self.mappings["entities"][entity]
 
-    def schema(self, name: str) -> str:
-        return self.mappings["schemas"][name]
+    def vocab_schema(self) -> str:
+        return self.mappings.get("vocab_schema", "vocab")
+
+    def claim_status_values(self) -> list[str]:
+        return self.domain["attributes"]["DrugExposure.claim_status"]["values"]
 
     def value_operators(self) -> list[str]:
         return self.domain["attributes"]["Measurement.value"]["operators"]
@@ -140,6 +179,22 @@ class Ontology:
                     if k in ("default_prior_observation_days", "exit_types", "max_inclusion_criteria")
                 },
                 "units": {uid: u["symbol"] for uid, u in sorted(self.units.items())},
+                "dataset": self.dataset_summary(),
             },
             sort_keys=True,
         )
+
+    def dataset_summary(self) -> dict[str, Any]:
+        caps = self.capabilities
+        return {
+            "name": self.dataset_name,
+            "version": str(self.dataset.get("version", "")),
+            "description": self.dataset.get("description", ""),
+            "data_type": self.dataset.get("data_type"),
+            "available_entities": caps["entities"],
+            "unavailable_entities": sorted(set(self.entities) - set(caps["entities"])),
+            "available_attributes": caps.get("attributes", []),
+            "observation": caps.get("observation"),
+            "default_claim_status": caps.get("default_claim_status"),
+            "notes": caps.get("notes", []),
+        }

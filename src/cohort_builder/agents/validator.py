@@ -58,16 +58,45 @@ def validate(ir: CohortDefinition, ont: Ontology, vocab: Vocabulary, executor: E
         if vf.unit_concept_id not in ont.units:
             err("intent", f"{where}: unit {vf.unit_concept_id} not declared in ontology")
 
+    ds = ont.dataset_name
+
+    def check_dataset(entity: str, x, where: str) -> None:
+        """Can the active dataset answer this? (stage 'dataset' = not fixable by rephrasing)"""
+        if not ont.supports_entity(entity):
+            err("dataset", f"{where}: {entity} data ({ont.entity_domain(entity).lower()} records"
+                           f"{', e.g. lab values' if ont.entity_has_value(entity) else ''}) is not available in "
+                           f"dataset {ds!r}; available: {', '.join(ont.capabilities['entities'])}")
+            return
+        if x.claim_status is not None and entity != "DrugExposure":
+            err("intent", f"{where}: claim_status only applies to drug (pharmacy claim) criteria")
+        elif x.claim_status is not None:
+            if not ont.supports_attribute("claim_status") or "status_col" not in ont.table_mapping(entity):
+                err("dataset", f"{where}: claim status filters are not available for {entity} in dataset {ds!r}")
+            elif not x.claim_status:
+                err("intent", f"{where}: claim_status must list at least one status")
+        if x.dx_position not in (None, "any") and entity != "ConditionOccurrence":
+            err("intent", f"{where}: dx_position only applies to diagnosis criteria")
+        elif x.dx_position not in (None, "any"):
+            if not ont.supports_attribute("dx_position") or "position_col" not in ont.table_mapping(entity):
+                err("dataset", f"{where}: diagnosis position is not available for {entity} in dataset {ds!r}")
+
     check_ref(ir.index_event.entity, ir.index_event.concept_set_id, "index event")
     check_value(ir.index_event.entity, ir.index_event.value_filter, "index event")
+    check_dataset(ir.index_event.entity, ir.index_event, "index event")
     crits: list[tuple[str, Criterion]] = [("inclusion", c) for c in ir.inclusion] + \
                                          [("exclusion", c) for c in ir.exclusion]
     for role, c in crits:
         where = f"{role} {c.name!r}"
         check_ref(c.entity, c.concept_set_id, where)
         check_value(c.entity, c.value_filter, where)
+        check_dataset(c.entity, c, where)
         if role == "exclusion" and c.occurrence != "at_least":
             warn("intent", f"{where}: exclusion with occurrence {c.occurrence} is unusual")
+        if c.min_span_days is not None and (c.occurrence != "at_least" or c.count < 2):
+            err("intent", f"{where}: min_span_days needs occurrence at_least with count >= 2")
+    if ir.exclusion and ont.capabilities.get("observation") == "activity_based":
+        warn("data", f"dataset {ds!r} has no enrollment data: observation is inferred from claim activity, so "
+                     "exclusions ('no prior X') are weaker evidence than in closed claims or EHR data")
     if len(ir.inclusion) > ont.rules["max_inclusion_criteria"]:
         err("intent", f"more than {ont.rules['max_inclusion_criteria']} inclusion criteria")
     used = {ir.index_event.concept_set_id} | {c.concept_set_id for _, c in crits}

@@ -30,10 +30,12 @@ def _builder(settings: Settings):
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="cohort-builder", description=__doc__)
+    p.add_argument("--dataset", help="dataset profile from ontology/datasets/ (default: CB_DATASET or omop_demo)")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("datasets", help="list dataset profiles and what each can answer")
 
     s = sub.add_parser("init-demo", help="create the demo vocabulary and synthetic patients")
-    s.add_argument("--persons", type=int, default=5000)
+    s.add_argument("--persons", type=int, default=5000, help="patients per demo source (OMOP and LAAD-style)")
     s.add_argument("--seed", type=int, default=42)
     s = sub.add_parser("load-athena", help="load an OHDSI Athena vocabulary download")
     s.add_argument("directory", type=Path)
@@ -85,6 +87,22 @@ def main(argv: list[str] | None = None) -> int:
 
     a = p.parse_args(argv)
     settings = Settings.from_env()
+    if a.dataset:
+        settings = dataclasses.replace(settings, dataset=a.dataset)
+
+    if a.cmd == "datasets":
+        import yaml
+
+        from .ontology import Ontology
+
+        base = Ontology.load(settings.ontology_dir)
+        for path in sorted((settings.ontology_dir / base.domain["datasets_dir"]).glob("*.yaml")):
+            prof = yaml.safe_load(path.read_text())
+            caps = prof["capabilities"]
+            print(f"{prof['name']} (v{prof.get('version')}, {prof.get('data_type')}): {prof.get('description', '')}")
+            print(f"    entities: {', '.join(caps['entities'])}")
+            print(f"    attributes: {', '.join(caps.get('attributes', [])) or '-'}; observation: {caps.get('observation')}")
+        return 0
 
     if a.cmd == "init-demo":
         from .synthetic import build_demo_database

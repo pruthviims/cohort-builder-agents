@@ -1,0 +1,144 @@
+# Dataset profile: IQVIA LAAD-style US claims (open-source pharmacy transactions + medical claims).
+#
+# IMPORTANT: the native table and column names in the `laad` schema below are
+# PLACEHOLDERS for a LAAD-like layout. Replace them with the names in your IQVIA
+# data dictionary / delivery (only this file changes; agents, IR and compiler do not).
+#
+# How LAAD differs from EHR / closed claims, and how this profile handles it:
+# - No enrollment table (open data): observability is approximated from claim
+#   ACTIVITY. Periods run from first to last activity and split on gaps longer
+#   than `max_activity_gap_days`. Absence of claims is weaker evidence than in
+#   closed claims, so the validator warns on exclusion criteria.
+# - Pharmacy transactions carry adjudication status. Each claim is classified as
+#   paid, rejected or reversed (a paid claim later reversed); reversal
+#   transactions themselves are dropped. Drug criteria default to paid claims.
+# - Codes are raw source codes (NDC, ICD-10-CM without dots, CPT/HCPCS, wide
+#   dx1..dxN columns). Semantic views unpivot them and map them to standard
+#   concepts through the OMOP vocabularies, so the rest of the system is unchanged.
+# - No lab values and no visit table.
+name: iqvia_laad
+version: 1.0.0
+description: IQVIA LAAD-style open US claims (synthetic). Pharmacy claims with adjudication status, medical claims with diagnoses and procedures. No enrollment, no lab values.
+data_type: claims_open
+
+params:
+  max_activity_gap_days: 365
+
+capabilities:
+  entities: [ConditionOccurrence, DrugExposure, ProcedureOccurrence]
+  attributes: [claim_status, dx_position]
+  observation: activity_based
+  default_claim_status: [paid]
+  notes:
+    - No lab or vital-sign values (Measurement is unavailable).
+    - No visit / encounter table.
+    - Observation is approximated from claim activity, not insurance enrollment.
+    - Pharmacy claims can be paid, rejected or reversed; drug criteria count paid claims unless stated otherwise.
+    - Diagnoses have a position on the claim (1 = primary).
+
+snapshot_sql: >-
+  SELECT 'LAAD-style synthetic, data through ' || CAST(max(svc_dt) AS VARCHAR) FROM laad.rx_claims
+
+mapping:
+  vocab_schema: vocab
+  person:
+    table: sem.person
+    person_key: person_id
+    gender_col: gender_concept_id
+    year_of_birth_col: year_of_birth
+  observation_period:
+    table: sem.observation_period
+    start_col: observation_period_start_date
+    end_col: observation_period_end_date
+  entities:
+    ConditionOccurrence:
+      table: sem.condition_occurrence
+      concept_col: condition_concept_id
+      start_col: condition_start_date
+      end_col: condition_end_date
+      position_col: dx_position
+    DrugExposure:
+      table: sem.drug_exposure
+      concept_col: drug_concept_id
+      start_col: drug_exposure_start_date
+      end_col: drug_exposure_end_date
+      status_col: claim_status
+    ProcedureOccurrence:
+      table: sem.procedure_occurrence
+      concept_col: procedure_concept_id
+      start_col: procedure_date
+      end_col: procedure_date
+
+# Semantic layer, installed when the profile is activated. {param} placeholders come from `params`.
+setup_sql:
+  - CREATE SCHEMA IF NOT EXISTS sem
+  # source code -> standard concept lookup (materialized once; re-run after loading a new vocabulary)
+  - >-
+    CREATE OR REPLACE TABLE sem.source_code_map AS
+    SELECT s.vocabulary_id, upper(replace(s.concept_code, '.', '')) AS code, r.concept_id_2 AS concept_id
+    FROM vocab.concept s
+    JOIN vocab.concept_relationship r ON r.concept_id_1 = s.concept_id
+     AND r.relationship_id = 'Maps to' AND r.invalid_reason IS NULL
+    WHERE s.vocabulary_id IN ('NDC', 'ICD10CM', 'CPT4', 'HCPCS')
+  - >-
+    CREATE OR REPLACE VIEW sem.person AS
+    SELECT patient_id AS person_id,
+           CASE gender WHEN 'M' THEN 8507 WHEN 'F' THEN 8532 ELSE 0 END AS gender_concept_id,
+           birth_year AS year_of_birth
+    FROM laad.patient
+  - >-
+    CREATE OR REPLACE VIEW sem.drug_exposure AS
+    WITH reversed AS (
+      SELECT DISTINCT orig_claim_id FROM laad.rx_claims WHERE txn_type = 'REVERSAL')
+    SELECT r.claim_id, r.patient_id AS person_id,
+           coalesce(m.concept_id, 0) AS drug_concept_id,
+           r.svc_dt AS drug_exposure_start_date,
+           r.svc_dt + (greatest(coalesce(r.days_supply, 1), 1) - 1) AS drug_exposure_end_date,
+           r.days_supply,
+           CASE WHEN r.txn_type = 'REJECTED' THEN 'rejected'
+                WHEN r.claim_id IN (SELECT orig_claim_id FROM reversed) THEN 'reversed'
+                ELSE 'paid' END AS claim_status,
+           r.reject_code, r.ndc AS source_value
+    FROM laad.rx_claims r
+    LEFT JOIN sem.source_code_map m ON m.vocabulary_id = 'NDC' AND m.code = upper(r.ndc)
+    WHERE r.txn_type <> 'REVERSAL'
+  - >-
+    CREATE OR REPLACE VIEW sem.condition_occurrence AS
+    WITH dx AS (
+      SELECT claim_id, patient_id, svc_dt, 1 AS dx_position, dx1 AS code FROM laad.dx_claims
+      UNION ALL SELECT claim_id, patient_id, svc_dt, 2, dx2 FROM laad.dx_claims
+      UNION ALL SELECT claim_id, patient_id, svc_dt, 3, dx3 FROM laad.dx_claims
+      UNION ALL SELECT claim_id, patient_id, svc_dt, 4, dx4 FROM laad.dx_claims)
+    SELECT dx.claim_id, dx.patient_id AS person_id, coalesce(m.concept_id, 0) AS condition_concept_id,
+           dx.svc_dt AS condition_start_date, dx.svc_dt AS condition_end_date,
+           dx.dx_position, dx.code AS source_value
+    FROM dx
+    LEFT JOIN sem.source_code_map m ON m.vocabulary_id = 'ICD10CM' AND m.code = upper(replace(dx.code, '.', ''))
+    WHERE dx.code IS NOT NULL AND dx.code <> ''
+  - >-
+    CREATE OR REPLACE VIEW sem.procedure_occurrence AS
+    SELECT p.claim_id, p.patient_id AS person_id, coalesce(m.concept_id, 0) AS procedure_concept_id,
+           p.svc_dt AS procedure_date, p.px_code AS source_value
+    FROM laad.px_claims p
+    LEFT JOIN sem.source_code_map m
+      ON m.vocabulary_id = CASE p.px_code_type WHEN 'CPT' THEN 'CPT4' ELSE p.px_code_type END
+     AND m.code = upper(p.px_code)
+  # activity-based observation periods: any transaction counts as activity
+  - >-
+    CREATE OR REPLACE VIEW sem.observation_period AS
+    WITH act AS (
+      SELECT patient_id, svc_dt FROM laad.rx_claims
+      UNION SELECT patient_id, svc_dt FROM laad.dx_claims
+      UNION SELECT patient_id, svc_dt FROM laad.px_claims),
+    gaps AS (
+      SELECT patient_id, svc_dt,
+             CASE WHEN svc_dt - lag(svc_dt) OVER (PARTITION BY patient_id ORDER BY svc_dt)
+                       > {max_activity_gap_days} THEN 1 ELSE 0 END AS new_segment
+      FROM act),
+    seg AS (
+      SELECT patient_id, svc_dt,
+             sum(new_segment) OVER (PARTITION BY patient_id ORDER BY svc_dt ROWS UNBOUNDED PRECEDING) AS segment
+      FROM gaps)
+    SELECT patient_id AS person_id, min(svc_dt) AS observation_period_start_date,
+           max(svc_dt) AS observation_period_end_date, segment
+    FROM seg GROUP BY patient_id, segment

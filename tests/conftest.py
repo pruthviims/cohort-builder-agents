@@ -13,7 +13,7 @@ from cohort_builder.config import REPO_ROOT, Settings  # noqa: E402
 from cohort_builder.db import connect  # noqa: E402
 from cohort_builder.orchestrator import CohortBuilder  # noqa: E402
 from cohort_builder.synthetic import build_demo_database  # noqa: E402
-from fake_llm import GOLDEN_INTENTS, FakeLLM  # noqa: E402
+from fake_llm import GOLDEN_INTENTS, LAAD_INTENTS, FakeLLM  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -40,6 +40,18 @@ def fake_llm() -> FakeLLM:
 @pytest.fixture
 def builder(settings, fake_llm) -> CohortBuilder:
     b = CohortBuilder(settings, backend=fake_llm)
+    yield b
+    b.con.close()
+
+
+@pytest.fixture
+def laad_llm() -> FakeLLM:
+    return FakeLLM(dict(LAAD_INTENTS))
+
+
+@pytest.fixture
+def laad_builder(settings, laad_llm) -> CohortBuilder:
+    b = CohortBuilder(dataclasses.replace(settings, dataset="iqvia_laad"), backend=laad_llm)
     yield b
     b.con.close()
 

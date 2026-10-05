@@ -45,8 +45,7 @@ def _id_list(ids: list[int]) -> str:
 class Compiler:
     def __init__(self, ontology: Ontology):
         self.ont = ontology
-        self.cdm = ontology.schema("cdm")
-        self.vocab = ontology.schema("vocab")
+        self.vocab = ontology.vocab_schema()
 
     # ---- pieces -------------------------------------------------------------
     def _concept_set_sql(self, cs: ConceptSet) -> str:
@@ -97,7 +96,29 @@ class Compiler:
             cond = f"{expr} {vf.op} {_num(vf.value)}"
         return join, cond
 
-    def _criterion_count_sql(self, c: Criterion, has_unit_norm: bool) -> str:
+    def _claims_conditions(self, entity: str, claim_status: list[str] | None, dx_position: str | None) -> str:
+        """Claims filters (adjudication status, diagnosis position) from the dataset mapping."""
+        m = self.ont.table_mapping(entity)
+        conds = []
+        status = claim_status
+        if status is None and "status_col" in m:
+            status = self.ont.default_claim_status()  # dataset default, e.g. paid claims only
+        if status is not None:
+            if "status_col" not in m:
+                raise ValueError(f"dataset {self.ont.dataset_name} has no claim status for {entity}")
+            allowed = set(self.ont.claim_status_values())
+            vals = sorted(set(status))
+            if not set(vals) <= allowed:
+                raise ValueError(f"invalid claim_status {vals}")
+            conds.append(f"e.{m['status_col']} IN ({', '.join(repr(v) for v in vals)})")
+        if dx_position == "primary":
+            if "position_col" not in m:
+                raise ValueError(f"dataset {self.ont.dataset_name} has no diagnosis position for {entity}")
+            conds.append(f"e.{m['position_col']} = 1")
+        return "".join(f" AND {c}" for c in conds)
+
+    def _criterion_sql(self, c: Criterion, has_unit_norm: bool) -> str:
+        """Boolean SQL: does the person meet the criterion's occurrence rule?"""
         m = self.ont.table_mapping(c.entity)
         start = f"e.{m['start_col']}"
         lo = f"b.index_date + ({c.window.start_days})" if c.window.start_days is not None else "b.op_start"
@@ -106,15 +127,19 @@ class Compiler:
         if c.value_filter:
             join, cond = self._value_sql(c.value_filter, has_unit_norm)
             cond = f"\n        AND {cond}"
-        return (f"(SELECT COUNT(*) FROM {self.cdm}.{m['table']} e\n"
-                f"      JOIN cs_expanded c ON c.cs_id = {_lit(c.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
-                f"{join}\n"
-                f"      WHERE e.person_id = b.person_id AND {start} >= {lo} AND {start} <= {hi}{cond})")
-
-    @staticmethod
-    def _occurrence(count_sql: str, c: Criterion) -> str:
+        cond += self._claims_conditions(c.entity, c.claim_status, c.dx_position)
+        frm = (f"FROM {m['table']} e\n"
+               f"      JOIN cs_expanded c ON c.cs_id = {_lit(c.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
+               f"{join}\n"
+               f"      WHERE e.person_id = b.person_id AND {start} >= {lo} AND {start} <= {hi}{cond}")
+        if c.min_span_days is not None:
+            if c.occurrence != "at_least":
+                raise ValueError("min_span_days requires occurrence at_least")
+            # at least N qualifying events whose first and last dates are >= min_span_days apart
+            return (f"((SELECT CASE WHEN COUNT(*) >= {int(c.count)} AND MAX({start}) - MIN({start}) >= "
+                    f"{int(c.min_span_days)} THEN 1 ELSE 0 END {frm}) = 1)")
         op = {"at_least": ">=", "at_most": "<=", "exactly": "="}[c.occurrence]
-        return f"({count_sql} {op} {int(c.count)})"
+        return f"((SELECT COUNT(*) {frm}) {op} {int(c.count)})"
 
     # ---- main ---------------------------------------------------------------
     def compile(self, ir: CohortDefinition) -> CompiledCohort:
@@ -128,15 +153,18 @@ class Compiler:
 
         ie = ir.index_event
         m = self.ont.table_mapping(ie.entity)
-        join, cond = ("", "")
+        join, conds = "", []
         if ie.value_filter:
-            join, cond = self._value_sql(ie.value_filter, unit_norm is not None)
-            cond = f"\n  WHERE {cond}"
+            join, vcond = self._value_sql(ie.value_filter, unit_norm is not None)
+            conds.append(vcond)
+        claims = self._claims_conditions(ie.entity, ie.claim_status, ie.dx_position)
+        conds += [c for c in claims.split(" AND ") if c]
+        cond = ("\n  WHERE " + " AND ".join(conds)) if conds else ""
         ctes.append(
             f"index_candidates AS (\n"
             f"  SELECT e.person_id, e.{m['start_col']} AS index_date,\n"
             f"         ROW_NUMBER() OVER (PARTITION BY e.person_id ORDER BY e.{m['start_col']}, e.{m['concept_col']}) AS rn\n"
-            f"  FROM {self.cdm}.{m['table']} e\n"
+            f"  FROM {m['table']} e\n"
             f"  JOIN cs_expanded c ON c.cs_id = {_lit(ie.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
             f"{join}{cond}\n)")
         where = "WHERE rn = 1" if ie.first_occurrence_only else ""
@@ -149,9 +177,9 @@ class Compiler:
             f"         p.{pm['gender_col']} AS gender_concept_id,\n"
             f"         EXTRACT(YEAR FROM ie.index_date) - p.{pm['year_of_birth_col']} AS age_at_index\n"
             f"  FROM index_events ie\n"
-            f"  JOIN {self.cdm}.{op['table']} op ON op.person_id = ie.person_id\n"
+            f"  JOIN {op['table']} op ON op.person_id = ie.person_id\n"
             f"   AND ie.index_date BETWEEN op.{op['start_col']} AND op.{op['end_col']}\n"
-            f"  JOIN {self.cdm}.{pm['table']} p ON p.{pm['person_key']} = ie.person_id\n)")
+            f"  JOIN {pm['table']} p ON p.{pm['person_key']} = ie.person_id\n)")
 
         # rules: (label, boolean SQL meaning "passes")
         rules: list[tuple[str, str]] = []
@@ -171,10 +199,10 @@ class Compiler:
         if d.gender_concept_ids:
             rules.append(("Gender", f"b.gender_concept_id IN ({_id_list(d.gender_concept_ids)})"))
         for c in ir.inclusion:
-            rules.append((f"Inclusion: {c.name}", self._occurrence(self._criterion_count_sql(c, unit_norm is not None), c)))
+            rules.append((f"Inclusion: {c.name}", self._criterion_sql(c, unit_norm is not None)))
         for c in ir.exclusion:
             rules.append((f"Exclusion: {c.name}",
-                          f"NOT {self._occurrence(self._criterion_count_sql(c, unit_norm is not None), c)}"))
+                          f"NOT {self._criterion_sql(c, unit_norm is not None)}"))
 
         flag_cols = ",\n".join(f"    {expr} AS r{i + 1}" for i, (_, expr) in enumerate(rules))
         flags = (f"flags AS (\n  SELECT b.person_id, b.index_date, b.op_start, b.op_end"

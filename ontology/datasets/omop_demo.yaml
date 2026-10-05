@@ -1,0 +1,60 @@
+# Dataset profile: OMOP CDM v5.4 (demo EHR-style data).
+# A dataset profile binds the ontology to one physical data source:
+# what the source can answer (capabilities), where each entity lives (mapping),
+# how "observable" is defined, and any semantic views to install.
+name: omop_demo
+version: 1.0.0
+description: Synthetic EHR-style patients already in OMOP CDM v5.4 tables.
+data_type: ehr
+
+capabilities:
+  entities: [ConditionOccurrence, DrugExposure, Measurement, ProcedureOccurrence, VisitOccurrence]
+  attributes: []                     # claims-only attributes (claim_status, dx_position) not available
+  observation: observation_period    # explicit observation periods from the source
+  notes:
+    - Lab values with units are available for some measurements.
+
+snapshot_sql: >-
+  SELECT cdm_source_name || ' @ ' || CAST(cdm_release_date AS VARCHAR) FROM cdm.cdm_source LIMIT 1
+
+mapping:
+  vocab_schema: vocab
+  person:
+    table: cdm.person
+    person_key: person_id
+    gender_col: gender_concept_id
+    year_of_birth_col: year_of_birth
+  observation_period:
+    table: cdm.observation_period
+    start_col: observation_period_start_date
+    end_col: observation_period_end_date
+  entities:
+    ConditionOccurrence:
+      table: cdm.condition_occurrence
+      concept_col: condition_concept_id
+      start_col: condition_start_date
+      end_col: condition_end_date
+    DrugExposure:
+      table: cdm.drug_exposure
+      concept_col: drug_concept_id
+      start_col: drug_exposure_start_date
+      end_col: drug_exposure_end_date
+    Measurement:
+      table: cdm.measurement
+      concept_col: measurement_concept_id
+      start_col: measurement_date
+      end_col: measurement_date
+      value_col: value_as_number
+      unit_col: unit_concept_id
+    ProcedureOccurrence:
+      table: cdm.procedure_occurrence
+      concept_col: procedure_concept_id
+      start_col: procedure_date
+      end_col: procedure_date
+    VisitOccurrence:
+      table: cdm.visit_occurrence
+      concept_col: visit_concept_id
+      start_col: visit_start_date
+      end_col: visit_end_date
+
+setup_sql: []
