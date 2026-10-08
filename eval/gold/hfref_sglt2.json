@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "ontology_version": "1.0.0",
+  "ontology_version": "1.1.0",
   "vocabulary_version": "DEMO-2026-10-01",
   "post_observation_days": 0,
   "exclusion": [],

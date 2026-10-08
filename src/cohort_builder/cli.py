@@ -24,13 +24,19 @@ def _builder(settings: Settings):
     from .orchestrator import CohortBuilder
     from .security import ConfigError, GovernancePolicy, SecurityConfig
 
+    import duckdb
+
     if not settings.db_path.exists():
         sys.exit(f"Database {settings.db_path} not found. Run `cohort-builder init-demo` (or load-athena) first.")
     try:
         policy = GovernancePolicy.from_security(SecurityConfig.from_env())
     except ConfigError as exc:
         sys.exit(f"configuration error: {exc}")
-    return CohortBuilder(settings, policy=policy)
+    try:
+        return CohortBuilder(settings, policy=policy)
+    except duckdb.IOException as exc:
+        # DuckDB allows one writing process per database file (e.g. `serve` and `mcp` at the same time)
+        sys.exit(f"cannot open {settings.db_path}: {str(exc).splitlines()[0]}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -95,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--tenant", default="default")
     t.add_argument("--expires-days", type=int, default=90, help="0 = no expiry (not recommended)")
     t.add_argument("--id", dest="token_id", help="label shown in audit records (default: subject + random)")
+    t.add_argument("--tokens-file", type=Path, help="append the hashed entry to this token file (created 0600)")
     s = sub.add_parser("serve", help="run the HTTP API")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8000)
@@ -109,12 +116,23 @@ def main(argv: list[str] | None = None) -> int:
 
         from .security import issue_token
 
+        import os
+
         token, entry = issue_token(a.subject, [r.strip() for r in a.roles.split(",") if r.strip()], a.tenant,
                                    a.expires_days or None, a.token_id)
         print("Bearer token (shown once; give it to the user over a secure channel, never commit it):", file=sys.stderr)
         print(token, file=sys.stderr)
-        print("\nAdd this entry under `tokens:` in the file named by CB_AUTH_TOKENS_FILE:\n", file=sys.stderr)
-        print(yaml.safe_dump([entry], sort_keys=False).rstrip())
+        if a.tokens_file:
+            doc = yaml.safe_load(a.tokens_file.read_text()) if a.tokens_file.exists() else None
+            doc = doc or {"tokens": []}
+            doc.setdefault("tokens", []).append(entry)
+            fd = os.open(a.tokens_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                yaml.safe_dump(doc, fh, sort_keys=False)
+            print(f"\nEntry for {a.subject} written to {a.tokens_file} (hash only).", file=sys.stderr)
+        else:
+            print("\nAdd this entry under `tokens:` in the file named by CB_AUTH_TOKENS_FILE:\n", file=sys.stderr)
+            print(yaml.safe_dump([entry], sort_keys=False).rstrip())
         return 0
 
     if a.cmd == "datasets":
@@ -160,12 +178,11 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "mcp":
         from .mcp_server import create_server, run_http
 
-        if not settings.db_path.exists():
-            sys.exit(f"Database {settings.db_path} not found. Run `cohort-builder init-demo` (or load-athena) first.")
+        builder = _builder(settings)  # open the database now: fail fast (e.g. file locked by another process)
         if a.http:
-            run_http(a.host, a.port)
+            run_http(a.host, a.port, builder)
         else:
-            create_server().run("stdio")
+            create_server(builder).run("stdio")
         return 0
     if a.cmd == "eval":
         from .evaluation import run_eval

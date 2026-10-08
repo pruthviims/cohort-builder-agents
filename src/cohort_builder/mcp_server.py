@@ -291,7 +291,7 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
     return mcp
 
 
-def run_http(host: str = "127.0.0.1", port: int = 8765) -> None:
+def run_http(host: str = "127.0.0.1", port: int = 8765, builder: CohortBuilder | None = None) -> None:
     """Serve over Streamable HTTP at /mcp. Requires CB_MCP_TOKEN when binding beyond localhost."""
     import uvicorn
 
@@ -308,7 +308,7 @@ def run_http(host: str = "127.0.0.1", port: int = 8765) -> None:
                                              allowed_origins=[f"https://{h.split(':')[0]}" for h in allowed])
     elif not local:
         raise SystemExit("Set CB_MCP_ALLOWED_HOSTS (e.g. cohorts.example.org:*) when serving beyond localhost.")
-    app = create_server().streamable_http_app(host=host, transport_security=security)
+    app = create_server(builder).streamable_http_app(host=host, transport_security=security)
     uvicorn.run(BearerTokenMiddleware(app, token) if token else app, host=host, port=port)
 
 

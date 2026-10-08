@@ -33,12 +33,12 @@ Only **three steps call an LLM**: the intent parser, the concept resolver and th
 ```bash
 pip install -e ".[api,mcp,dev]"
 cohort-builder init-demo                  # demo vocabulary + synthetic OMOP patients and LAAD-style claims (DuckDB)
-pytest                                    # 40 tests, no API key needed
+pytest                                    # full offline test suite, no API key needed
 
 export ANTHROPIC_API_KEY=sk-ant-...
 cohort-builder ask "Adults with type 2 diabetes who started metformin and had an HbA1c above 8% in the year before starting"
-cohort-builder approve 1 --reviewer dr_rao
-cohort-builder execute 1                  # writes results.cohort + attrition
+cohort-builder approve 1 --reviewer dr_rao   # a different person than the author (self-approval is refused)
+cohort-builder execute 1                  # writes results.cohort; prints suppressed counts + caveats
 cohort-builder replay <run_id>            # re-run from recorded LLM responses, compare hashes
 ```
 
@@ -50,17 +50,32 @@ cohort-builder dry-run examples/t2dm_metformin_hba1c.json
 
 ### HTTP API
 
-Start it with `cohort-builder serve`. Interactive docs are at `http://127.0.0.1:8000/docs`.
+Every endpoint except `GET /health` requires a bearer token. The caller's identity and roles come from the
+token, never from the request body. To set it up:
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/cohorts/ask` | Natural-language request → draft definition, explanation, attrition, manifest |
-| POST | `/cohorts` | Submit a hand-written or edited IR (saved as a new immutable version) |
-| GET | `/cohorts/{id}` · `/cohorts/{id}/sql` | Definition with explanation · compiled SQL |
-| POST | `/cohorts/{id}/review` | `approved` / `rejected` (execution requires approval) |
-| POST | `/cohorts/{id}/execute` | Materialize into `results.cohort` |
-| GET / POST | `/runs/{run_id}` · `/runs/{run_id}/replay` | Run trace and manifest · exact replay |
-| GET | `/concepts/search?q=` | Vocabulary search |
+```bash
+cohort-builder auth issue-token --subject alice@example.org --roles author,viewer --tokens-file tokens.yaml
+# the token is printed once (stderr); only its hash is written to tokens.yaml (mode 0600)
+export CB_ENV=production CB_AUTH_TOKENS_FILE=$PWD/tokens.yaml
+cohort-builder serve                      # refuses to start on unsafe settings; docs at http://127.0.0.1:8000/docs
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/me
+```
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/health` | public | Liveness only |
+| GET | `/me`, `/versions` | any | Who am I · component versions |
+| POST | `/cohorts/ask` | author | Natural-language request → draft definition, explanation, attrition, manifest |
+| POST | `/cohorts` · `/cohorts/validate` | author | Save a hand-written or edited IR as a new immutable draft · validate without saving |
+| GET | `/cohorts` · `/cohorts/{id}` · `/cohorts/{id}/sql` | any | List (own tenant) · definition with explanation · compiled SQL |
+| POST | `/cohorts/{id}/review` | reviewer | `{"decision": "approved"\|"rejected"}`; you can't approve your own definition |
+| POST | `/cohorts/{id}/execute` | executor | Run an **approved** definition; returns suppressed counts and caveats |
+| GET / POST | `/runs/{run_id}` · `/runs/{run_id}/replay` | author (own), reviewer | Run trace and manifest · exact replay |
+| GET | `/concepts/search?q=` | any | Vocabulary search |
+| GET | `/audit` | admin | Audit log of submissions, reviews, executions and denials |
+
+Roles, tenants, token rotation, the development bypass and the audit log are described in
+[`docs/SECURITY.md`](docs/SECURITY.md).
 
 ### MCP server
 
@@ -144,7 +159,7 @@ Every run writes a **manifest** with:
 - LLM call, cache-hit and tool-call counts
 - both IR hashes
 
-All of it is stored in the `meta` schema: `agent_run`, `agent_step`, `llm_call`, `llm_cache`, `tool_call`, `cohort_definition`, `cohort_generation`, `review`, `eval_run` and `eval_result`.
+All of it is stored in the `meta` schema: `agent_run`, `agent_step`, `llm_call`, `llm_cache`, `tool_call`, `cohort_definition`, `cohort_generation`, `review`, `audit_event`, `eval_run` and `eval_result`.
 
 **Guardrails built into the agent loop:**
 
@@ -208,8 +223,8 @@ Oncology (lines of therapy, staging, biomarkers) needs new entities and IR crite
   - Concept and unit IDs at or above 2,000,000,000 in the demo files are local placeholders (for example eGFR, LVEF and mmol/mol). Replace them with the real Athena IDs in `unit_conversions.yaml` and `curated_concept_sets.yaml`.
   - The other top-level IDs follow standard OMOP but should still be verified against your vocabulary release.
 - **CDM:** the executor runs on DuckDB. You can load your CDM into the `cdm` schema, or point a dataset profile (`ontology/datasets/`) at your tables.
-  - The compiled SQL sticks to portable constructs (`date + int`, `COUNT(*) FILTER`, window functions), so `cohort-builder compile <id>` output is written to run on PostgreSQL.
-  - Executing directly against Postgres, Databricks or Snowflake needs a small executor adapter. That has not been tested yet.
+  - **PostgreSQL:** the compiled cohort SQL uses portable constructs (`date + int`, `COUNT(*) FILTER`, window functions). CI **executes** it on PostgreSQL 16, and the tests check that it returns the same patients as DuckDB.
+  - **What isn't portable yet:** dataset-profile setup SQL (e.g. the LAAD semantic views use `CREATE OR REPLACE TABLE`) is DuckDB-specific. An executor that runs directly against PostgreSQL, Databricks or Snowflake is not implemented.
 - **Search:** concept search is lexical (exact, synonym, code and Jaro-Winkler). An embedding searcher, such as pgvector, can be plugged in through `vocab.ConceptSearcher`.
 
 ## Evaluation
@@ -228,10 +243,81 @@ The eval harness measures, for each golden case:
 
 The golden sets cover cardiometabolic, renal, mental-health and market-access (claim rejection) cases. LAAD cases live in `eval/golden_cases_laad.yaml` (`cohort-builder --dataset iqvia_laad eval --cases eval/golden_cases_laad.yaml`). The `eval` GitHub workflow runs it against the live API when you trigger it.
 
+## Validation results: errors and warnings
+
+Every definition is checked twice: by the IR models, which enforce structure, and by the validator, which
+checks it against the ontology, vocabulary and dataset. Results come back as `issues`, each with a
+`severity` and a `stage`.
+
+| Severity / stage | Meaning | What to do |
+|---|---|---|
+| error / `intent` | The logic is invalid as written: unknown unit, threshold not in the canonical unit, wrong operator, contradictory rules | Fix the definition; agents get this as feedback |
+| error / `concepts` | Unknown, deprecated, non-standard or wrong-domain concept; no index events found | Pick standard concepts in the right domain |
+| error / `dataset` | The selected data source cannot answer this (e.g. lab values on open claims, no observation periods) | Use another dataset, or drop the requirement knowingly |
+| error / `data` | The data can't support the run (e.g. index events but none inside an observation period) | Check the data and its observation coverage |
+| warning / `data` | It runs, but there is a limitation the reviewer must accept. Execution returns and stores all warnings as **caveats** | Read them before using the result |
+| warning / `intent` | Unusual but allowed (unused concept set, exclusion with `at_most`) | Confirm it's intended |
+
+Typical `data` caveats:
+
+- **"No record" treated as "did not happen":** any exclusion or zero-count rule. The wording depends on the
+  dataset: on open claims, observation is inferred from claim activity, so the evidence is weak.
+- **Lookback longer than the required prior observation:** e.g. "no T1D in the 730 days before" with only
+  365 days of observation required.
+- **Follow-up window longer than the required post observation.**
+- **Measurements only partially captured,** or results in units with no conversion metadata.
+
+These caveats describe limits of the data. They are not clinical validation. Concept sets, definitions and
+dataset profiles still need review by clinicians and data owners.
+
+## Cohort semantics (what the compiler guarantees)
+
+- **Windows:** inclusive at both ends, in calendar days relative to the index date. `{start_days: -365,
+  end_days: 0}` means the 365 days before index plus the index day. `null` bounds mean "within the
+  observation period that contains the index".
+- **Index:** `first_occurrence_only` takes the person's earliest qualifying event *ever*. If that event falls
+  outside an observation period, the person does not enter; there is no fallback to a later event. With
+  `false`, the earliest event that satisfies all rules is used.
+- **Ties:** same-day ties are resolved deterministically. If observation periods overlap, the
+  earliest-starting period wins, then the latest-ending one.
+- **Age:** calendar year of index minus year of birth.
+- **Counting:** `count` counts qualifying records by default; `count_by: "dates"` counts distinct event days.
+  `min_span_days` requires the first and last qualifying events to be at least that many days apart.
+- **Labs:** thresholds must be in the analyte's canonical unit. Results in other units are converted when a
+  conversion exists, and otherwise never compared. Null values never match.
+- **Claims (LAAD profile):**
+  - identical duplicate claims count once
+  - a diagnosis code counts once per claim, at its best position
+  - reversed claims are not "paid"
+  - rows without a patient id are dropped
+  - patients missing from the patient table show up as a drop between the first two attrition steps
+
+Each rule above has a test on a small hand-built dataset in `tests/test_compiler_semantics.py`.
+
+## Running tests and checks
+
+```bash
+pip install -e ".[api,mcp,dev]"
+pytest                                    # synthetic data and a scripted fake LLM; no network, no API key
+pytest --cov                              # with coverage (CI gate: 80%)
+CB_TEST_POSTGRES_DSN=postgresql://user:pass@localhost:5432/postgres pytest   # also run compiled SQL on PostgreSQL
+ruff check src tests && ruff format --check src tests && mypy
+pip-audit --skip-editable                 # dependency vulnerabilities (run in a clean virtualenv)
+git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline   # secret scan
+```
+
+CI runs all of these on Python 3.11–3.13, against a PostgreSQL 16 service, using synthetic data and
+throwaway credentials only.
+
 ## Configuration
 
 | Variable | Default |
 |---|---|
+| `CB_ENV` | `production` (fails closed; `development` enables the dev-only switches) |
+| `CB_AUTH_TOKENS_FILE` | (none: every protected API endpoint returns 401) |
+| `CB_ALLOW_SELF_APPROVAL` | `false` |
+| `CB_AUTH_DEV_BYPASS`, `CB_AUTH_DEV_SUBJECT`, `CB_AUTH_DEV_ROLES` | off; development only |
+| `CB_ALLOW_DRAFT_EXECUTION` | `false`; development only |
 | `ANTHROPIC_API_KEY` | (required for `ask` in live/cached mode) |
 | `CB_DATASET` | `omop_demo` (or `iqvia_laad`) |
 | `CB_MODEL` | `claude-sonnet-5-5` |
@@ -239,6 +325,12 @@ The golden sets cover cardiometabolic, renal, mental-health and market-access (c
 | `CB_LLM_MODE` | `cached` |
 | `CB_DB_PATH` | `data/cohort_builder.duckdb` |
 | `CB_MAX_RETRIES` / `CB_MAX_RESOLVER_TURNS` | `2` / `8` |
+| `CB_QUERY_TIMEOUT_SECONDS` | `300` |
+| `CB_DUCKDB_MEMORY_LIMIT` / `CB_DUCKDB_THREADS` | DuckDB defaults |
+| `CB_DUCKDB_LOCK_EXTERNAL_ACCESS` | `true` (SQL cannot read files, attach databases or load extensions) |
+| `CB_MCP_USER`, `CB_MCP_TENANT`, `CB_MCP_TOKEN`, `CB_MCP_ALLOWED_HOSTS` | see MCP server |
+
+A placeholder-only template is in `.env.example`.
 
 ## Layout
 
@@ -265,7 +357,11 @@ tests/               offline tests with a scripted fake LLM
 
 ## Status and limitations
 
-- **Live API untested:** the agents were built against the Anthropic Messages API (forced tool use), but the live API path hasn't been run from this repo yet. The test suite uses a scripted fake LLM.
-- **Run a live baseline first:** with an API key, run `cohort-builder eval` to get a real baseline before trusting any accuracy numbers.
-- **Synthetic data only:** the demo data is synthetic. Counts mean nothing clinically.
-- **Simplified cohort model:** each person can enter a cohort only once (their earliest qualifying index). Era collapsing and censoring events are not implemented yet.
+**Experimental or untested:**
+- **Live API path untested:** the agents were built against the Anthropic Messages API (forced tool use), but the live API path hasn't been run from this repo yet. The test suite uses a scripted fake LLM. Run `cohort-builder eval` with an API key to get a real accuracy baseline before trusting the agents.
+- **Placeholder LAAD layout:** the LAAD profile uses placeholder table and column names. Map it to your IQVIA data dictionary and check its claim-status conventions before use.
+- **Not compliance-assessed:** no clinical validation and no regulatory compliance assessment has been done. The demo data is synthetic, and its counts mean nothing clinically.
+
+**Not implemented yet:**
+- **Single entry per person:** each person enters a cohort once, at their earliest qualifying index. Era collapsing and censoring events are not implemented.
+- **No warehouse executor:** a PostgreSQL or warehouse executor and OIDC/SSO are not implemented. See [`docs/SECURITY.md`](docs/SECURITY.md) for the controls that need a deployment-level assessment.
