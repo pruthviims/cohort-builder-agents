@@ -31,6 +31,11 @@ class Settings:
     llm_mode: str = "cached"
     max_retries: int = 2
     max_resolver_turns: int = 8
+    # execution limits and DuckDB hardening
+    query_timeout_seconds: float = 300.0
+    duckdb_memory_limit: str | None = None      # e.g. "4GB"
+    duckdb_threads: int | None = None
+    lock_external_access: bool = True           # block file/network access from SQL after setup
     prompt_versions: dict[str, str] = field(
         default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2"}
     )
@@ -50,4 +55,9 @@ class Settings:
             llm_mode=env.get("CB_LLM_MODE", base.llm_mode),
             max_retries=int(env.get("CB_MAX_RETRIES", base.max_retries)),
             max_resolver_turns=int(env.get("CB_MAX_RESOLVER_TURNS", base.max_resolver_turns)),
+            query_timeout_seconds=float(env.get("CB_QUERY_TIMEOUT_SECONDS", base.query_timeout_seconds)),
+            duckdb_memory_limit=env.get("CB_DUCKDB_MEMORY_LIMIT") or None,
+            duckdb_threads=int(env["CB_DUCKDB_THREADS"]) if env.get("CB_DUCKDB_THREADS") else None,
+            lock_external_access=(env.get("CB_DUCKDB_LOCK_EXTERNAL_ACCESS", "true").strip().lower()
+                                  not in ("0", "false", "no", "off")),
         )

@@ -23,9 +23,15 @@ def _attrition_table(rows: list[dict]) -> str:
 def _builder(settings: Settings):
     from .orchestrator import CohortBuilder
 
+    from .security import ConfigError, GovernancePolicy, SecurityConfig
+
     if not settings.db_path.exists():
         sys.exit(f"Database {settings.db_path} not found. Run `cohort-builder init-demo` (or load-athena) first.")
-    return CohortBuilder(settings)
+    try:
+        policy = GovernancePolicy.from_security(SecurityConfig.from_env())
+    except ConfigError as exc:
+        sys.exit(f"configuration error: {exc}")
+    return CohortBuilder(settings, policy=policy)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,7 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("execute", help="materialize an approved definition into results.cohort")
     s.add_argument("definition_id", type=int)
     s.add_argument("--user", default="cli")
-    s.add_argument("--allow-draft", action="store_true")
+    s.add_argument("--allow-draft", action="store_true",
+                   help="run a draft (only honored when CB_ENV=development and CB_ALLOW_DRAFT_EXECUTION=true)")
     s = sub.add_parser("run", help="show a run and its manifest")
     s.add_argument("run_id")
     s = sub.add_parser("replay", help="replay a run from recorded LLM responses and compare")
@@ -81,6 +88,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--http", action="store_true", help="serve Streamable HTTP at /mcp instead of stdio")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)
+    s = sub.add_parser("auth", help="API credentials")
+    auth = s.add_subparsers(dest="auth_cmd", required=True)
+    t = auth.add_parser("issue-token", help="create a bearer token; prints it once plus the hashed file entry")
+    t.add_argument("--subject", required=True, help="user identity, e.g. alice@example.org")
+    t.add_argument("--roles", required=True, help="comma-separated: viewer,author,reviewer,executor,admin")
+    t.add_argument("--tenant", default="default")
+    t.add_argument("--expires-days", type=int, default=90, help="0 = no expiry (not recommended)")
+    t.add_argument("--id", dest="token_id", help="label shown in audit records (default: subject + random)")
     s = sub.add_parser("serve", help="run the HTTP API")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8000)
@@ -89,6 +104,19 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings.from_env()
     if a.dataset:
         settings = dataclasses.replace(settings, dataset=a.dataset)
+
+    if a.cmd == "auth":
+        import yaml
+
+        from .security import issue_token
+
+        token, entry = issue_token(a.subject, [r.strip() for r in a.roles.split(",") if r.strip()], a.tenant,
+                                   a.expires_days or None, a.token_id)
+        print("Bearer token (shown once; give it to the user over a secure channel, never commit it):", file=sys.stderr)
+        print(token, file=sys.stderr)
+        print("\nAdd this entry under `tokens:` in the file named by CB_AUTH_TOKENS_FILE:\n", file=sys.stderr)
+        print(yaml.safe_dump([entry], sort_keys=False).rstrip())
+        return 0
 
     if a.cmd == "datasets":
         import yaml
@@ -123,7 +151,13 @@ def main(argv: list[str] | None = None) -> int:
 
         from .api import create_app
 
-        uvicorn.run(create_app(), host=a.host, port=a.port)
+        from .security import ConfigError
+
+        try:
+            app = create_app()
+        except ConfigError as exc:
+            sys.exit(f"refusing to start: {exc}")
+        uvicorn.run(app, host=a.host, port=a.port)
         return 0
     if a.cmd == "mcp":
         from .mcp_server import create_server, run_http
@@ -171,7 +205,12 @@ def main(argv: list[str] | None = None) -> int:
         print(b.explainer.explain(ir) + "\n")
         _print({k: v for k, v in row.items() if k != "ir"})
     elif a.cmd in ("approve", "reject"):
-        b.review(a.definition_id, a.reviewer, "approved" if a.cmd == "approve" else "rejected", a.comments)
+        from .orchestrator import GovernanceError
+
+        try:
+            b.review(a.definition_id, a.reviewer, "approved" if a.cmd == "approve" else "rejected", a.comments)
+        except (GovernanceError, ValueError) as exc:
+            sys.exit(f"refused: {exc}")
         print(f"definition {a.definition_id} {a.cmd}d by {a.reviewer}")
     elif a.cmd == "submit-ir":
         from .ir import CohortDefinition
@@ -194,9 +233,17 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "compile":
         print(b.compile_sql(a.definition_id))
     elif a.cmd == "execute":
-        r = b.execute(a.definition_id, a.user, a.allow_draft)
-        print(f"generation {r['generation_id']}: {r['person_count']} people written to results.cohort\n")
+        from .orchestrator import GovernanceError
+
+        try:
+            r = b.execute(a.definition_id, a.user, a.allow_draft)
+        except (GovernanceError, ValueError) as exc:
+            sys.exit(f"refused: {exc}")
+        print(f"generation {r['generation_id']}: {r['person_count']} people written to results.cohort "
+              f"(counts below {r['min_cell_count']} suppressed)\n")
         print(_attrition_table(r["attrition"]))
+        for c in r["caveats"]:
+            print(f"[caveat/{c['stage']}] {c['message']}")
     elif a.cmd == "run":
         _print(b.store.get_run(a.run_id))
     elif a.cmd == "replay":

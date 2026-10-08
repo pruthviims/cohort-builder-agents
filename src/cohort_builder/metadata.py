@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS meta.cohort_generation (
   compiler_version VARCHAR, sql_hash VARCHAR, person_count BIGINT, executed_by VARCHAR, executed_at TIMESTAMP);
 ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS dataset VARCHAR;
 ALTER TABLE meta.cohort_generation ADD COLUMN IF NOT EXISTS dataset VARCHAR;
+ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS tenant VARCHAR;
+ALTER TABLE meta.cohort_generation ADD COLUMN IF NOT EXISTS tenant VARCHAR;
+ALTER TABLE meta.cohort_generation ADD COLUMN IF NOT EXISTS caveats_json VARCHAR;
+ALTER TABLE meta.agent_run ADD COLUMN IF NOT EXISTS tenant VARCHAR;
+CREATE TABLE IF NOT EXISTS meta.audit_event (
+  event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
+  resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);
 CREATE TABLE IF NOT EXISTS meta.review (
   review_id VARCHAR PRIMARY KEY, cohort_definition_id BIGINT, reviewer VARCHAR, decision VARCHAR,
   comments VARCHAR, created_at TIMESTAMP);
@@ -80,11 +87,28 @@ class MetadataStore:
                          [component_type, name, version, content_hash, now()])
 
     # ---- runs ------------------------------------------------------------
-    def start_run(self, user_query: str, user_id: str) -> str:
+    def start_run(self, user_query: str, user_id: str, tenant: str = "default") -> str:
         run_id = str(uuid.uuid4())
-        self.con.execute("INSERT INTO meta.agent_run VALUES (?,?,?,?,NULL,'running',0,NULL,NULL)",
-                         [run_id, user_id, user_query, now()])
+        self.con.execute("INSERT INTO meta.agent_run (run_id, user_id, user_query, submitted_at, status, "
+                         "retry_count, tenant) VALUES (?,?,?,?,'running',0,?)",
+                         [run_id, user_id, user_query, now(), tenant])
         return run_id
+
+    # ---- audit -----------------------------------------------------------
+    def audit(self, actor: str, action: str, resource_type: str, resource_id: Any, outcome: str,
+              tenant: str | None = None, details: dict | None = None) -> None:
+        """Append-only record of governance-relevant actions. Never pass secrets or patient data in details."""
+        self.con.execute("INSERT INTO meta.audit_event VALUES (?,?,?,?,?,?,?,?,?)",
+                         [str(uuid.uuid4()), now(), actor, tenant, action, resource_type,
+                          None if resource_id is None else str(resource_id), outcome, dumps(details or {})])
+
+    def audit_events(self, limit: int = 100, tenant: str | None = None) -> list[dict]:
+        rows = _rows(self.con.execute(
+            "SELECT * FROM meta.audit_event WHERE (? IS NULL OR tenant = ?) ORDER BY occurred_at DESC LIMIT ?",
+            [tenant, tenant, limit]))
+        for r in rows:
+            r["details"] = json.loads(r.pop("details_json") or "{}")
+        return rows
 
     def finish_run(self, run_id: str, status: str, retry_count: int, definition_id: int | None,
                    manifest: dict) -> None:
@@ -125,16 +149,17 @@ class MetadataStore:
 
     # ---- definitions -----------------------------------------------------
     def save_definition(self, ir, status: str, created_by: str, run_id: str | None = None,
-                        parent_id: int | None = None, issues: list | None = None, dataset: str | None = None) -> int:
+                        parent_id: int | None = None, issues: list | None = None, dataset: str | None = None,
+                        tenant: str = "default") -> int:
         """Definitions are immutable; an edit is a new row with parent_definition_id."""
         def_id = self.con.execute("SELECT nextval('meta.cohort_definition_seq')").fetchone()[0]
         self.con.execute(
             "INSERT INTO meta.cohort_definition (cohort_definition_id, name, ir_json, content_hash, semantic_hash, "
             "schema_version, ontology_version, vocabulary_version, status, created_by, created_at, "
-            "parent_definition_id, run_id, issues_json, dataset) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "parent_definition_id, run_id, issues_json, dataset, tenant) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [def_id, ir.name, ir.canonical_json(), ir.content_hash(), ir.semantic_hash(), ir.schema_version,
              ir.ontology_version, ir.vocabulary_version, status, created_by, now(), parent_id, run_id,
-             dumps(issues or []), dataset])
+             dumps(issues or []), dataset, tenant])
         return int(def_id)
 
     def get_definition(self, def_id: int) -> dict | None:
@@ -147,10 +172,11 @@ class MetadataStore:
         row["issues"] = json.loads(row.pop("issues_json") or "[]")
         return row
 
-    def list_definitions(self, limit: int = 50) -> list[dict]:
+    def list_definitions(self, limit: int = 50, tenant: str | None = None) -> list[dict]:
         return _rows(self.con.execute(
-            "SELECT cohort_definition_id, name, status, dataset, semantic_hash, created_by, created_at "
-            "FROM meta.cohort_definition ORDER BY cohort_definition_id DESC LIMIT ?", [limit]))
+            "SELECT cohort_definition_id, name, status, dataset, tenant, semantic_hash, created_by, created_at "
+            "FROM meta.cohort_definition WHERE (? IS NULL OR tenant = ?) "
+            "ORDER BY cohort_definition_id DESC LIMIT ?", [tenant, tenant, limit]))
 
     def review(self, def_id: int, reviewer: str, decision: str, comments: str = "") -> None:
         if decision not in ("approved", "rejected"):
@@ -165,12 +191,14 @@ class MetadataStore:
                              [def_id])
 
     def record_generation(self, generation_id: str, def_id: int, data_snapshot: str, compiler_version: str,
-                          sql_hash: str, person_count: int, executed_by: str, dataset: str | None = None) -> None:
+                          sql_hash: str, person_count: int, executed_by: str, dataset: str | None = None,
+                          tenant: str = "default", caveats: list | None = None) -> None:
         self.con.execute(
             "INSERT INTO meta.cohort_generation (generation_id, cohort_definition_id, data_snapshot, "
-            "compiler_version, sql_hash, person_count, executed_by, executed_at, dataset) VALUES (?,?,?,?,?,?,?,?,?)",
+            "compiler_version, sql_hash, person_count, executed_by, executed_at, dataset, tenant, caveats_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             [generation_id, def_id, data_snapshot, compiler_version, sql_hash, person_count, executed_by, now(),
-             dataset])
+             dataset, tenant, dumps(caveats or [])])
 
     # ---- reads -----------------------------------------------------------
     def get_run(self, run_id: str) -> dict | None:

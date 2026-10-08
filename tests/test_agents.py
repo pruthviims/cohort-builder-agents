@@ -136,21 +136,7 @@ def test_replay_fails_loudly_on_changed_inputs(builder):
     assert ReplayMiss  # exported for callers
 
 
-def test_api_end_to_end(builder):
-    from fastapi.testclient import TestClient
-
-    from cohort_builder.api import create_app
-
-    client = TestClient(create_app(builder))
-    r = client.post("/cohorts/ask", json={"query": T2DM_QUERY}).json()
-    def_id = r["cohort_definition_id"]
-    assert client.post(f"/cohorts/{def_id}/execute", json={}).status_code == 409
-    assert client.post(f"/cohorts/{def_id}/review", json={"reviewer": "r", "decision": "approved"}).status_code == 200
-    out = client.post(f"/cohorts/{def_id}/execute", json={}).json()
-    assert out["person_count"] > 0
-    assert "WITH cs_expanded" in client.get(f"/cohorts/{def_id}/sql").json()["sql"]
-    assert client.get(f"/runs/{r['run_id']}").json()["status"] == "draft"
-    assert client.get("/concepts/search", params={"q": "metformin"}).json()[0]["concept_id"] == 1503297
+# API tests (with authentication) live in tests/test_api_security.py
 
 
 def test_eval_harness_on_golden_cases(builder):

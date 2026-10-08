@@ -34,7 +34,9 @@ from pydantic import Field, ValidationError
 
 from .agents.validator import validate
 from .ir import CohortDefinition
+from .executor import ExecutionError
 from .orchestrator import CohortBuilder
+from .security import DEFAULT_TENANT
 
 INSTRUCTIONS = """\
 Cohort builder for OMOP CDM patient data, grounded in a semantic ontology.
@@ -64,10 +66,12 @@ def _j(obj: Any) -> Any:
     return json.loads(json.dumps(obj, default=str))
 
 
-def create_server(builder: CohortBuilder | None = None, acting_user: str | None = None) -> MCPServer:
+def create_server(builder: CohortBuilder | None = None, acting_user: str | None = None,
+                  acting_tenant: str | None = None) -> MCPServer:
     state: dict[str, Any] = {"builder": builder}
     lock = threading.RLock()  # a single DuckDB connection is shared: serialize access
     user = f"mcp:{acting_user or os.environ.get('CB_MCP_USER', 'anonymous')}"
+    tenant = acting_tenant or os.environ.get("CB_MCP_TENANT") or DEFAULT_TENANT
 
     def b() -> CohortBuilder:
         if state["builder"] is None:
@@ -89,7 +93,7 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
         reproducible agent pipeline. Returns a DRAFT (plain-language explanation, dry-run
         attrition, issues, run manifest) that a human must approve before execution."""
         with lock:
-            r = b().ask(request, user_id=user)
+            r = b().ask(request, user_id=user, tenant=tenant)
             out = r.as_dict()
             out["next_step"] = ("A human reviewer must approve definition "
                                 f"{r.cohort_definition_id} outside MCP before it can be executed."
@@ -100,7 +104,7 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
     def get_run(run_id: str) -> dict:
         """Get a past run's steps, status and reproducibility manifest."""
         with lock:
-            run = b().store.get_run(run_id)
+            run = b().get_run(run_id, tenant)
             return _j(run) if run else {"error": "run not found"}
 
     @mcp.tool(annotations=WRITES)
@@ -109,7 +113,7 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
         resulting cohort logic (semantic hash) is identical."""
         with lock:
             try:
-                return _j(b().replay(run_id))
+                return _j(b().replay(run_id, tenant, actor=user))
             except KeyError:
                 return {"error": "run not found"}
 
@@ -186,7 +190,10 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
                 ir = parse_ir(definition)
             except ValidationError as exc:
                 return {"saved": False, "schema_errors": _j(exc.errors(include_url=False))}
-            def_id, issues = b().submit_ir(ir, user, parent_definition_id)
+            try:
+                def_id, issues = b().submit_ir(ir, user, parent_definition_id, tenant)
+            except KeyError as exc:
+                return {"saved": False, "error": str(exc).strip("'\"")}
             status = b().store.get_definition(def_id)["status"]
             return _j({"saved": True, "cohort_definition_id": def_id, "status": status, "issues": issues,
                        "semantic_hash": ir.semantic_hash()})
@@ -196,14 +203,14 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
     def list_cohort_definitions(limit: int = 20) -> list[dict]:
         """Most recent cohort definitions with status (draft, needs_review, approved, rejected)."""
         with lock:
-            return _j(b().store.list_definitions(limit))
+            return _j(b().store.list_definitions(max(1, min(limit, 200)), tenant=tenant))
 
     @mcp.tool(annotations=READ_ONLY)
     def get_cohort_definition(definition_id: int) -> dict:
         """A saved definition: IR, status, hashes, versions and plain-language explanation."""
         with lock:
             try:
-                row, ir = b().load_definition(definition_id)
+                row, ir = b().load_definition(definition_id, tenant)
             except KeyError as exc:
                 return {"error": str(exc)}
             return _j({**row, "explanation": b().explainer.explain(ir)})
@@ -213,7 +220,7 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
         """The deterministic SQL the compiler generates for a saved definition."""
         with lock:
             try:
-                return {"sql": b().compile_sql(definition_id)}
+                return {"sql": b().compile_sql(definition_id, tenant)}
             except KeyError as exc:
                 return {"error": str(exc)}
 
@@ -223,14 +230,14 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
         and suppressed counts only; patient-level rows are never returned."""
         with lock:
             try:
-                out = b().execute(definition_id, user, allow_draft=False)
+                out = b().execute(definition_id, user, allow_draft=False, tenant=tenant)
             except KeyError as exc:
-                return {"error": str(exc)}
+                return {"error": str(exc).strip("'\"")}
             except PermissionError as exc:
                 return {"error": str(exc), "hint": "A human reviewer must approve this definition first."}
-            min_cell = b().executor.min_cell
-            n = out["person_count"]
-            return _j({**out, "person_count": f"<{min_cell}" if 0 < n < min_cell else n})
+            except (ValueError, ExecutionError) as exc:
+                return {"error": str(exc)}
+            return _j(out)  # counts are already small-cell suppressed by the core
 
     # ---- resources ------------------------------------------------------------------
     def _file(name: str) -> str:
@@ -255,8 +262,11 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
     @mcp.resource("cohort://definitions/{definition_id}", name="Cohort definition", mime_type="application/json")
     def definition_resource(definition_id: str) -> str:
         with lock:
-            row = b().store.get_definition(int(definition_id))
-            return json.dumps(row or {"error": "not found"}, default=str, indent=2)
+            try:
+                row, _ = b().load_definition(int(definition_id), tenant)
+            except (KeyError, ValueError):
+                row = {"error": "not found"}
+            return json.dumps(row, default=str, indent=2)
 
     # ---- prompts --------------------------------------------------------------------
     @mcp.prompt(title="Build a cohort interactively")
