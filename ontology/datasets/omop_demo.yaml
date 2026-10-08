@@ -3,7 +3,7 @@
 # what the source can answer (capabilities), where each entity lives (mapping),
 # how "observable" is defined, and any semantic views to install.
 name: omop_demo
-version: 1.0.0
+version: 1.1.0
 description: Synthetic EHR-style patients already in OMOP CDM v5.4 tables.
 data_type: ehr
 
@@ -11,8 +11,10 @@ capabilities:
   entities: [ConditionOccurrence, DrugExposure, Measurement, ProcedureOccurrence, VisitOccurrence]
   attributes: []                     # claims-only attributes (claim_status, dx_position) not available
   observation: observation_period    # explicit observation periods from the source
+  # captured for only some patients/tests: a missing record is not evidence of a normal value
+  partial_entities: [Measurement]
   notes:
-    - Lab values with units are available for some measurements.
+    - Lab values with units are available for some patients and some tests only.
 
 snapshot_sql: >-
   SELECT cdm_source_name || ' @ ' || CAST(cdm_release_date AS VARCHAR) FROM cdm.cdm_source LIMIT 1

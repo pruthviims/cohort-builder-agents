@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from .executor import suppress_count
 from .ir import CohortDefinition, Criterion
 from .metadata import dumps, now
 from .orchestrator import CohortBuilder
@@ -64,8 +65,9 @@ def compare(builder: CohortBuilder, gold: CohortDefinition, got: CohortDefinitio
         "extra_criteria": extra,
         "demographics_match": gold.demographics == got.demographics,
         "patient_jaccard": round(jaccard(gold_people, got_people), 4),
-        "gold_count": len(gold_people),
-        "got_count": len(got_people),
+        # reports may be saved or shared: counts are small-cell suppressed like every other output
+        "gold_count": suppress_count(len(gold_people), builder.executor.min_cell),
+        "got_count": suppress_count(len(got_people), builder.executor.min_cell),
     }
 
 
