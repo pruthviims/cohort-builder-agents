@@ -85,7 +85,8 @@ def run_eval(builder: CohortBuilder, cases_file: Path, repeats: int = 3, case_id
     per_case = []
     for case in cases:
         gold = CohortDefinition.model_validate_json((cases_file.parent / case["gold"]).read_text())
-        hashes, metrics = [], []
+        hashes: list[str | None] = []
+        metrics: list[dict] = []
         for r in range(repeats):
             result = builder.ask(case["query"], user_id="eval")
             m: dict = {"status": result.status, "run_id": result.run_id}

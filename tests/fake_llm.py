@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 def _tool_use(name: str, inp: dict, n: int) -> dict:

@@ -5,12 +5,12 @@ import json
 
 import pytest
 import yaml
-from fake_llm import T2DM_QUERY
 from fastapi.testclient import TestClient
 
 from cohort_builder.api import create_app
 from cohort_builder.config import REPO_ROOT
 from cohort_builder.security import ConfigError, SecurityConfig, TokenAuthenticator, issue_token
+from fake_llm import T2DM_QUERY
 
 EXAMPLE_IR = json.loads((REPO_ROOT / "examples" / "t2dm_metformin_hba1c.json").read_text())
 

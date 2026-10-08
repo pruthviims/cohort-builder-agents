@@ -79,6 +79,7 @@ class _Session:
 
     def run_tool(self, name: str, args: dict) -> Any:
         v, ont = self.ctx.vocab, self.ctx.ontology
+        result: Any
         if name == "search_curated_concept_sets":
             result = ont.search_curated(args["query"], domain=self.domain)
         elif name == "search_concepts":

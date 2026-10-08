@@ -23,6 +23,7 @@ def _window(w: Window) -> str:
     if s is None and e is None:
         return "at any time during observation"
     if s is None:
+        assert e is not None
         return "any time before index" if e == 0 else (
             f"any time up to {abs(e)} days before index" if e < 0 else f"any time up to {e} days after index")
     if e is None:

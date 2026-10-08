@@ -20,7 +20,8 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -31,8 +32,19 @@ from .agents.validator import validate
 from .executor import ExecutionError, QueryTimeout
 from .ir import CohortDefinition
 from .orchestrator import CohortBuilder, GovernanceError
-from .security import (ADMIN, AUTHOR, EXECUTOR, REVIEWER, ROLES, VIEWER, AuthError, GovernancePolicy, Principal,
-                       SecurityConfig, TokenAuthenticator)
+from .security import (
+    ADMIN,
+    AUTHOR,
+    EXECUTOR,
+    REVIEWER,
+    ROLES,
+    VIEWER,
+    AuthError,
+    GovernancePolicy,
+    Principal,
+    SecurityConfig,
+    TokenAuthenticator,
+)
 
 log = logging.getLogger(__name__)
 ANY_ROLE = tuple(sorted(ROLES))
@@ -116,6 +128,13 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
             return principal
         return dep
 
+    any_role = require(*ANY_ROLE)
+    need_author = require(AUTHOR)
+    need_reviewer = require(REVIEWER)
+    need_executor = require(EXECUTOR)
+    need_admin = require(ADMIN)
+    need_trace_reader = require(AUTHOR, REVIEWER)
+
     def scope(p: Principal) -> str | None:
         """Tenant filter: admins see all tenants, everyone else only their own."""
         return None if p.is_admin else p.tenant
@@ -145,21 +164,21 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
         return {"status": "ok"}
 
     @app.get("/me")
-    def me(p: Principal = Depends(require(*ANY_ROLE))) -> dict:
+    def me(p: Principal = Depends(any_role)) -> dict:
         return {"subject": p.subject, "roles": sorted(p.roles), "tenant": p.tenant, "auth_method": p.auth_method}
 
     @app.get("/versions")
-    def versions(_: Principal = Depends(require(*ANY_ROLE))) -> dict:
+    def versions(_: Principal = Depends(any_role)) -> dict:
         with lock:
             return b().component_versions()
 
     @app.post("/cohorts/ask")
-    def ask(req: AskRequest, p: Principal = Depends(require(AUTHOR))) -> dict:
+    def ask(req: AskRequest, p: Principal = Depends(need_author)) -> dict:
         with lock:
             return b().ask(req.query, p.subject, p.tenant).as_dict()
 
     @app.post("/cohorts/validate")
-    def validate_ir(req: ValidateIRRequest, _: Principal = Depends(require(AUTHOR))) -> dict:
+    def validate_ir(req: ValidateIRRequest, _: Principal = Depends(need_author)) -> dict:
         with lock:
             bb = b()
             issues, attrition = validate(req.ir, bb.ontology, bb.vocab, bb.executor)
@@ -169,7 +188,7 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
                     "explanation": bb.explainer.explain(req.ir), "semantic_hash": req.ir.semantic_hash()}
 
     @app.post("/cohorts")
-    def submit(req: SubmitIRRequest, p: Principal = Depends(require(AUTHOR))) -> dict:
+    def submit(req: SubmitIRRequest, p: Principal = Depends(need_author)) -> dict:
         with lock:
             try:
                 def_id, issues = b().submit_ir(req.ir, p.subject, req.parent_definition_id, p.tenant)
@@ -178,12 +197,12 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
             return {"cohort_definition_id": def_id, "issues": issues}
 
     @app.get("/cohorts")
-    def list_cohorts(limit: int = 50, p: Principal = Depends(require(*ANY_ROLE))) -> list[dict]:
+    def list_cohorts(limit: int = 50, p: Principal = Depends(any_role)) -> list[dict]:
         with lock:
             return b().store.list_definitions(max(1, min(limit, 500)), tenant=scope(p))
 
     @app.get("/cohorts/{def_id}")
-    def get_cohort(def_id: int, p: Principal = Depends(require(*ANY_ROLE))) -> dict:
+    def get_cohort(def_id: int, p: Principal = Depends(any_role)) -> dict:
         with lock:
             try:
                 row, ir = b().load_definition(def_id, scope(p))
@@ -192,7 +211,7 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
             return {**row, "explanation": b().explainer.explain(ir)}
 
     @app.get("/cohorts/{def_id}/sql")
-    def get_sql(def_id: int, p: Principal = Depends(require(*ANY_ROLE))) -> dict:
+    def get_sql(def_id: int, p: Principal = Depends(any_role)) -> dict:
         with lock:
             try:
                 return {"sql": b().compile_sql(def_id, scope(p))}
@@ -200,7 +219,7 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
                 raise HTTPException(404, f"cohort definition {def_id} not found") from exc
 
     @app.post("/cohorts/{def_id}/review")
-    def review(def_id: int, req: ReviewRequest, p: Principal = Depends(require(REVIEWER))) -> dict:
+    def review(def_id: int, req: ReviewRequest, p: Principal = Depends(need_reviewer)) -> dict:
         with lock:
             try:
                 b().review(def_id, p.subject, req.decision, req.comments, scope(p))
@@ -211,7 +230,7 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
             return {"cohort_definition_id": def_id, "decision": req.decision, "reviewer": p.subject}
 
     @app.post("/cohorts/{def_id}/execute")
-    def execute(def_id: int, req: ExecuteRequest | None = None, p: Principal = Depends(require(EXECUTOR))) -> dict:
+    def execute(def_id: int, req: ExecuteRequest | None = None, p: Principal = Depends(need_executor)) -> dict:
         req = req or ExecuteRequest()
         with lock:
             try:
@@ -229,12 +248,12 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
         return run
 
     @app.get("/runs/{run_id}")
-    def get_run(run_id: str, p: Principal = Depends(require(AUTHOR, REVIEWER))) -> dict:
+    def get_run(run_id: str, p: Principal = Depends(need_trace_reader)) -> dict:
         with lock:
             return _visible_run(run_id, p)
 
     @app.post("/runs/{run_id}/replay")
-    def replay(run_id: str, p: Principal = Depends(require(AUTHOR))) -> dict:
+    def replay(run_id: str, p: Principal = Depends(need_author)) -> dict:
         with lock:
             run = _visible_run(run_id, p)
             if run.get("user_id") != p.subject and not p.is_admin:
@@ -243,12 +262,12 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
 
     @app.get("/concepts/search")
     def search(q: str, domain: str | None = None, limit: int = 10,
-               _: Principal = Depends(require(*ANY_ROLE))) -> list[dict]:
+               _: Principal = Depends(any_role)) -> list[dict]:
         with lock:
             return b().vocab.search_concepts(q[:200], domain, limit=max(1, min(limit, 25)))
 
     @app.get("/audit")
-    def audit(limit: int = 100, _: Principal = Depends(require(ADMIN))) -> list[dict]:
+    def audit(limit: int = 100, _: Principal = Depends(need_admin)) -> list[dict]:
         with lock:
             return b().store.audit_events(max(1, min(limit, 1000)))
 

@@ -6,13 +6,13 @@ from collections import defaultdict
 from datetime import date
 
 import pytest
-from fake_llm import LAAD_SGLT2_QUERY, T2DM_QUERY, FakeLLM
 
 from cohort_builder.agents.validator import validate
 from cohort_builder.config import REPO_ROOT
 from cohort_builder.evaluation import run_eval
 from cohort_builder.ir import CohortDefinition
 from cohort_builder.orchestrator import CohortBuilder
+from fake_llm import LAAD_SGLT2_QUERY, T2DM_QUERY, FakeLLM
 
 GOLD = REPO_ROOT / "eval" / "gold"
 
@@ -45,7 +45,7 @@ def test_activity_based_observation_splits_on_gaps(laad_builder):
     assert multi
     periods = q(f"SELECT observation_period_start_date, observation_period_end_date FROM sem.observation_period "
                 f"WHERE person_id = {multi[0][0]} ORDER BY 1")
-    for (s1, e1), (s2, _) in zip(periods, periods[1:]):
+    for (_, e1), (s2, _) in zip(periods, periods[1:], strict=False):
         assert (s2 - e1).days > 365  # split only on gaps longer than max_activity_gap_days
 
 
@@ -65,7 +65,7 @@ def _reference_sglt2_t2d(con) -> set[int]:
     def periods(pid):
         ds = sorted(activity[pid])
         out, start = [], ds[0]
-        for prev, cur in zip(ds, ds[1:]):
+        for prev, cur in zip(ds, ds[1:], strict=False):
             if (cur - prev).days > 365:
                 out.append((start, prev))
                 start = cur

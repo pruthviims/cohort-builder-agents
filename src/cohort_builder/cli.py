@@ -22,7 +22,6 @@ def _attrition_table(rows: list[dict]) -> str:
 
 def _builder(settings: Settings):
     from .orchestrator import CohortBuilder
-
     from .security import ConfigError, GovernancePolicy, SecurityConfig
 
     if not settings.db_path.exists():
@@ -150,7 +149,6 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         from .api import create_app
-
         from .security import ConfigError
 
         try:

@@ -103,15 +103,16 @@ def validate(ir: CohortDefinition, ont: Ontology, vocab: Vocabulary, executor: E
                           "split it into one criterion per analyte")
             return
         if analytes:
-            a = ont.analytes[sorted(analytes)[0]]
-            canonical = int(a["canonical_unit"])
+            meta = ont.analytes[sorted(analytes)[0]]
+            canonical = int(meta["canonical_unit"])
             if vf.unit_concept_id != canonical:
-                conv = next((c for c in a.get("conversions", []) if int(c["from_unit"]) == vf.unit_concept_id), None)
+                conv = next((c for c in meta.get("conversions", []) if int(c["from_unit"]) == vf.unit_concept_id),
+                            None)
                 hint = ""
                 if conv:
                     hint = f" ({vf.value:g} {ont.unit_symbol(vf.unit_concept_id)} = " \
                            f"{vf.value * conv['factor'] + conv['offset']:.3f} {ont.unit_symbol(canonical)})"
-                err("intent", f"{where}: {a['name']} thresholds must be in the canonical unit "
+                err("intent", f"{where}: {meta['name']} thresholds must be in the canonical unit "
                               f"{ont.unit_symbol(canonical)}, got {ont.unit_symbol(vf.unit_concept_id)}{hint}. "
                               "Results in other units are converted to the canonical unit before comparison.")
             if unknown:
@@ -188,7 +189,7 @@ def validate(ir: CohortDefinition, ont: Ontology, vocab: Vocabulary, executor: E
     elif attrition.final_count == 0:
         err("intent", "the cohort is empty after applying all rules")
     ratio = ont.rules["attrition_warning_ratio"]
-    for prev, cur in zip(rules, rules[1:]):
+    for prev, cur in zip(rules, rules[1:], strict=False):
         if prev["remaining"] and 1 - cur["remaining"] / prev["remaining"] > ratio:
             warn("data", f"rule {cur['name']!r} removes more than {ratio:.1%} of remaining people")
     return issues, attrition

@@ -4,10 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fake_llm import T2DM_QUERY
 from mcp import Client
 
 from cohort_builder.mcp_server import BearerTokenMiddleware, create_server
+from fake_llm import T2DM_QUERY
 
 
 def run(coro):

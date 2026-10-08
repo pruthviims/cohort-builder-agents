@@ -7,6 +7,9 @@ on:
       repeats:
         description: "Repeats per golden case"
         default: "3"
+permissions:
+  contents: read
+
 jobs:
   eval:
     runs-on: ubuntu-latest

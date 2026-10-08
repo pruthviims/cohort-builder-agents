@@ -7,12 +7,12 @@ import random
 
 import duckdb
 import pytest
-from fake_llm import T2DM_QUERY
 from mcp import Client
 
 from cohort_builder.config import REPO_ROOT
 from cohort_builder.executor import COMPLEMENTARY, Executor, QueryTimeout, suppress_count, suppress_series
 from cohort_builder.ir import CohortDefinition
+from fake_llm import T2DM_QUERY
 
 K = 10
 BASE = json.loads((REPO_ROOT / "examples" / "t2dm_metformin_hba1c.json").read_text())

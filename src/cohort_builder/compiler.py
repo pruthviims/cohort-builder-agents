@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from . import COMPILER_VERSION
@@ -91,12 +92,13 @@ class Compiler:
         else:
             join, expr = "", f"(CASE WHEN {unit} = {u} THEN {val} END)"
         if vf.op == "between":
+            assert vf.value_high is not None  # guaranteed by the ValueFilter model
             cond = f"{expr} BETWEEN {_num(vf.value)} AND {_num(vf.value_high)}"
         else:
             cond = f"{expr} {vf.op} {_num(vf.value)}"
         return join, cond
 
-    def _claims_conditions(self, entity: str, claim_status: list[str] | None, dx_position: str | None) -> str:
+    def _claims_conditions(self, entity: str, claim_status: Sequence[str] | None, dx_position: str | None) -> str:
         """Claims filters (adjudication status, diagnosis position) from the dataset mapping."""
         m = self.ont.table_mapping(entity)
         conds = []
@@ -206,7 +208,7 @@ class Compiler:
                           f"NOT {self._criterion_sql(c, unit_norm is not None)}"))
 
         flag_cols = ",\n".join(f"    {expr} AS r{i + 1}" for i, (_, expr) in enumerate(rules))
-        flags = (f"flags AS (\n  SELECT b.person_id, b.index_date, b.op_start, b.op_end"
+        flags = ("flags AS (\n  SELECT b.person_id, b.index_date, b.op_start, b.op_end"
                  + (f",\n{flag_cols}" if rules else "") + "\n  FROM base b\n)")
         ctes.append(flags)
         prefix = "WITH " + ",\n".join(ctes) + "\n"

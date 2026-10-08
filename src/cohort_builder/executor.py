@@ -69,7 +69,7 @@ class Attrition:
 
     def suppressed(self, min_cell: int) -> list[dict]:
         shown = suppress_series([r["remaining"] for r in self.rules], min_cell)
-        return [{**r, "remaining": v} for r, v in zip(self.rules, shown)]
+        return [{**r, "remaining": v} for r, v in zip(self.rules, shown, strict=True)]
 
     def suppressed_final(self, min_cell: int) -> int | str:
         """The final count, consistent with the suppressed attrition table."""

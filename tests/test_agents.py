@@ -4,12 +4,12 @@ from __future__ import annotations
 import copy
 
 import pytest
-from fake_llm import T2DM_INTENT, T2DM_QUERY, FakeLLM
 
 from cohort_builder.config import REPO_ROOT
 from cohort_builder.evaluation import run_eval
 from cohort_builder.llm import ReplayMiss
 from cohort_builder.orchestrator import CohortBuilder
+from fake_llm import T2DM_INTENT, T2DM_QUERY, FakeLLM
 
 
 def test_ask_builds_valid_draft(builder):

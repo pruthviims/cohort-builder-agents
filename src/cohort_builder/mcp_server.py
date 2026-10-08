@@ -33,8 +33,8 @@ from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
 
 from .agents.validator import validate
-from .ir import CohortDefinition
 from .executor import ExecutionError
+from .ir import CohortDefinition
 from .orchestrator import CohortBuilder
 from .security import DEFAULT_TENANT
 
@@ -53,8 +53,11 @@ before `execute_approved_cohort` will run them. No tool returns patient-level da
 
 class CohortDefinitionInput(CohortDefinition):
     """Cohort definition as submitted by an MCP client; versions are filled in by the server."""
-    ontology_version: str | None = Field(default=None, description="Leave empty; the server sets it")
-    vocabulary_version: str | None = Field(default=None, description="Leave empty; the server sets it")
+    # pydantic allows widening a field in a subclass; the server fills these before validation
+    ontology_version: str | None = Field(  # type: ignore[assignment]
+        default=None, description="Leave empty; the server sets it")
+    vocabulary_version: str | None = Field(  # type: ignore[assignment]
+        default=None, description="Leave empty; the server sets it")
 
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -194,7 +197,8 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
                 def_id, issues = b().submit_ir(ir, user, parent_definition_id, tenant)
             except KeyError as exc:
                 return {"saved": False, "error": str(exc).strip("'\"")}
-            status = b().store.get_definition(def_id)["status"]
+            saved_row = b().store.get_definition(def_id) or {}
+            status = saved_row.get("status")
             return _j({"saved": True, "cohort_definition_id": def_id, "status": status, "issues": issues,
                        "semantic_hash": ir.semantic_hash()})
 

@@ -74,9 +74,9 @@ def generate_laad(con: duckdb.DuckDBPyConnection, n_patients: int = 4000, seed: 
                 return
             codes = list(codes)
             fillers = rng.sample(FILLER_DX, k=rng.randint(0, 2))
-            ordered = codes + fillers if primary else fillers[:1] + codes + fillers[1:]
+            ordered: list[str | None] = list(codes + fillers if primary else fillers[:1] + codes + fillers[1:])
             if not primary and not fillers:
-                ordered = ["Z0000"] + codes
+                ordered = ["Z0000", *codes]
             ordered = (ordered + [None] * 4)[:4]
             ids["dx"] += 1
             rows["dx_claims"].append([ids["dx"], pid, d, rng.choice(["11", "22", "21"]), *ordered])

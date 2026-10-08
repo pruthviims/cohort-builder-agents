@@ -17,7 +17,7 @@ CONCEPT_COLS = "c.concept_id, c.concept_name, c.domain_id, c.vocabulary_id, c.co
 
 def _rows(cur: duckdb.DuckDBPyConnection) -> list[dict[str, Any]]:
     cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
+    return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
 
 
 class ConceptSearcher(Protocol):

@@ -14,6 +14,7 @@ import random
 import tempfile
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -216,7 +217,7 @@ def _rand_date(rng: random.Random, lo: date, hi: date) -> date:
 class _Writer:
     def __init__(self, tmp: Path):
         self.tmp = tmp
-        self.files: dict[str, tuple[Path, csv.writer, object]] = {}
+        self.files: dict[str, tuple[Path, Any, Any]] = {}  # (path, csv writer, file handle)
         self.ids: dict[str, int] = {}
 
     def row(self, table: str, values: list) -> int:

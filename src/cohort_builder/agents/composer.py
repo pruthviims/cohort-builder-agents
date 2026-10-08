@@ -6,13 +6,14 @@ ontology, so the stored IR is unit-consistent.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from functools import partial
+from typing import TypeVar
 
 from pydantic import ValidationError
 
-from ..ir import (CohortDefinition, CohortExit, ConceptSet, Criterion, Demographics, IndexEvent, ValueFilter,
-                  Window)
+from ..ir import CohortDefinition, CohortExit, ConceptSet, Criterion, Demographics, IndexEvent, ValueFilter, Window
 from ..ontology import Ontology
 from ..vocab import Vocabulary
 from .intent import CohortIntent, ValueSpec
@@ -88,7 +89,7 @@ def _build(issues: list["Issue"], where: str, fn: Callable[[], T], stage: str = 
         return None
 
 
-def _claim_status(entity: str, requested: list[str] | None, ont: Ontology) -> list[str] | None:
+def _claim_status(entity: str, requested: Sequence[str] | None, ont: Ontology) -> list[str] | None:
     """Make the dataset's default claim status explicit in the IR (e.g. paid claims only)."""
     if requested is not None:
         return sorted(set(requested))
@@ -105,8 +106,8 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
     concept_sets: dict[str, ConceptSet] = {}
     for key, rcs in sorted(resolved.items()):
         cs_obj = _build(issues, f"concept set for {key!r}",
-                        lambda rcs=rcs, key=key: ConceptSet(id=_cs_id(key), name=rcs.name, domain=rcs.domain,
-                                                            items=rcs.items, source=rcs.source), "concepts")
+                        partial(ConceptSet, id=_cs_id(key), name=rcs.name, domain=rcs.domain, items=rcs.items,
+                                source=rcs.source), "concepts")
         if cs_obj is not None:
             concept_sets[key] = cs_obj
 
@@ -135,17 +136,15 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
         if c.value:
             vf = _value_filter(c.value, resolved[c.mention_key], ont, vocab, f"criterion {c.name!r}", issues)
         where = f"criterion {c.name!r}"
-        window = _build(issues, where, lambda c=c: Window(start_days=c.window_start_days,
-                                                         end_days=c.window_end_days))
+        window = _build(issues, where, partial(Window, start_days=c.window_start_days, end_days=c.window_end_days))
         if window is None:
             continue
         target = inclusion if c.role == "inclusion" else exclusion
         prefix = "inc" if c.role == "inclusion" else "exc"
         entity = mentions[c.mention_key].entity
-        crit = _build(issues, where, lambda c=c, cs=cs, window=window, vf=vf, entity=entity, target=target,
-                      prefix=prefix: Criterion(
-            id=f"{prefix}_{len(target) + 1}", name=c.name, entity=entity, concept_set_id=cs.id, window=window,
-            occurrence=c.occurrence, count=c.count, count_by=c.count_by, value_filter=vf,
+        crit = _build(issues, where, partial(
+            Criterion, id=f"{prefix}_{len(target) + 1}", name=c.name, entity=entity, concept_set_id=cs.id,
+            window=window, occurrence=c.occurrence, count=c.count, count_by=c.count_by, value_filter=vf,
             claim_status=_claim_status(entity, c.claim_status, ont),
             dx_position=c.dx_position if c.dx_position == "primary" else None, min_span_days=c.min_span_days))
         if crit is not None:

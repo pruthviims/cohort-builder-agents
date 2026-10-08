@@ -11,8 +11,7 @@ from pydantic import ValidationError
 from cohort_builder.agents.composer import compose, format_validation_error
 from cohort_builder.agents.validator import validate
 from cohort_builder.config import REPO_ROOT
-from cohort_builder.ir import (CohortDefinition, CohortExit, ConceptSet, Criterion, Demographics, ValueFilter,
-                               Window)
+from cohort_builder.ir import CohortDefinition, CohortExit, ConceptSet, Criterion, Demographics, ValueFilter, Window
 
 BASE = json.loads((REPO_ROOT / "examples" / "t2dm_metformin_hba1c.json").read_text())
 

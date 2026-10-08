@@ -12,9 +12,11 @@ from __future__ import annotations
 import dataclasses
 import re
 import time
+from functools import partial
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import duckdb
 
@@ -38,6 +40,10 @@ from .security import DEFAULT_TENANT, GovernancePolicy
 from .vocab import Vocabulary
 
 _MEMORY_LIMIT = re.compile(r"^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)$")
+
+
+def _resolve(ctx: AgentContext, mention: Any, query: str, feedback: str | None) -> ResolvedConceptSet:
+    return resolve_mention(ctx, mention, query, feedback)
 
 
 class GovernanceError(PermissionError):
@@ -168,7 +174,7 @@ class CohortBuilder:
                         resolved[m.key] = resolved_cache[sig]
                         continue
                     rcs = step("concept_resolver", attempt, {"mention": m.model_dump(), "feedback": concept_feedback},
-                               lambda c, m=m: resolve_mention(c, m, query, concept_feedback))
+                               partial(_resolve, mention=m, query=query, feedback=concept_feedback))
                     resolved[m.key] = resolved_cache[sig] = rcs
                 concept_feedback = None
 

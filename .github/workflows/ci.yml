@@ -2,16 +2,71 @@ name: ci
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read   # least privilege for the workflow token
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[api,mcp,dev]"
+      - name: ruff (lint)
+        run: ruff check src tests
+      - name: ruff (format)
+        run: ruff format --check src tests
+      - name: mypy (types)
+        run: mypy
+
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:   # compiled cohort SQL is executed on PostgreSQL as well as DuckDB
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password   # throwaway CI container  # pragma: allowlist secret
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CB_TEST_POSTGRES_DSN: postgresql://postgres:ci-only-password@localhost:5432/postgres  # pragma: allowlist secret
+      CB_ENV: production   # tests must pass with production defaults
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[api,mcp,dev]"
-      - run: pytest -q
+      - name: tests (synthetic data only) with coverage
+        run: pytest -q --cov --cov-report=term --cov-report=xml --cov-fail-under=80
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.12'
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip setuptools wheel
+      - run: pip install -e ".[api,mcp,dev]"
+      - name: dependency vulnerability audit
+        run: pip-audit --skip-editable
+      - name: secret scan (fails on any secret not in the reviewed baseline)
+        run: git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline

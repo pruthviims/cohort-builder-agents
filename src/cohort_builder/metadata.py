@@ -74,7 +74,7 @@ def sha(obj: Any) -> str:
 
 def _rows(cur) -> list[dict]:
     cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
+    return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
 
 
 class MetadataStore:
