@@ -1,3 +1,3 @@
 # Mechanical reformat (ruff format); skip in git blame with:
 #   git config blame.ignoreRevsFile .git-blame-ignore-revs
-33039b114f72e486154bd8e138857637bdc3ec2a
+1ae56360fb66778ded1258e6248e9c9da0275f65
