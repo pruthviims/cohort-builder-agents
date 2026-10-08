@@ -1,4 +1,5 @@
 """Agent graph, grounding, retries, review workflow, caching, replay, API and eval (fake LLM)."""
+
 from __future__ import annotations
 
 import copy
@@ -21,8 +22,15 @@ def test_ask_builds_valid_draft(builder):
     assert "curated:t2dm@v1" in sources.values() and "curated:type1_diabetes@v1" in sources.values()
     assert ir.inclusion[1].value_filter.unit_concept_id == 8554
     m = r.manifest
-    for key in ("ir_semantic_hash", "prompts", "ontology", "vocabulary_version", "compiler_version", "model",
-                "data_snapshot"):
+    for key in (
+        "ir_semantic_hash",
+        "prompts",
+        "ontology",
+        "vocabulary_version",
+        "compiler_version",
+        "model",
+        "data_snapshot",
+    ):
         assert m[key]
     assert m["tool_calls"] > 0 and m["llm_calls"]["total"] >= 6
     assert "HbA1c" in r.explanation or "Hemoglobin A1c" in r.explanation
@@ -42,26 +50,33 @@ def test_review_gate_and_execution(builder):
         builder.execute(r.cohort_definition_id, "bob")
     builder.review(r.cohort_definition_id, "dr_reviewer", "approved", "looks right")
     out = builder.execute(r.cohort_definition_id, "bob")
-    n = builder.con.execute("SELECT count(*) FROM results.cohort WHERE generation_id=?",
-                            [out["generation_id"]]).fetchone()[0]
+    n = builder.con.execute(
+        "SELECT count(*) FROM results.cohort WHERE generation_id=?", [out["generation_id"]]
+    ).fetchone()[0]
     assert n == out["person_count"] > 0
     # executing again yields identical people (replay reproducibility)
     out2 = builder.execute(r.cohort_definition_id, "bob")
-    a = builder.con.execute("SELECT list(subject_id ORDER BY subject_id) FROM results.cohort WHERE generation_id=?",
-                            [out["generation_id"]]).fetchone()[0]
-    b = builder.con.execute("SELECT list(subject_id ORDER BY subject_id) FROM results.cohort WHERE generation_id=?",
-                            [out2["generation_id"]]).fetchone()[0]
+    a = builder.con.execute(
+        "SELECT list(subject_id ORDER BY subject_id) FROM results.cohort WHERE generation_id=?", [out["generation_id"]]
+    ).fetchone()[0]
+    b = builder.con.execute(
+        "SELECT list(subject_id ORDER BY subject_id) FROM results.cohort WHERE generation_id=?", [out2["generation_id"]]
+    ).fetchone()[0]
     assert a == b and out["sql_hash"] == out2["sql_hash"]
 
 
 def test_resolver_cannot_submit_ungrounded_ids(settings):
-    llm = FakeLLM({T2DM_QUERY: [T2DM_INTENT]},
-                  resolver_scripts={"metformin": [("submit_ids", [1503297])]})  # guesses before searching
+    llm = FakeLLM(
+        {T2DM_QUERY: [T2DM_INTENT]}, resolver_scripts={"metformin": [("submit_ids", [1503297])]}
+    )  # guesses before searching
     b = CohortBuilder(settings, backend=llm)
     r = b.ask(T2DM_QUERY)
     assert r.status == "draft"
-    rejected = [req for req in llm.requests
-                if any("not returned by any tool call" in str(m.get("content")) for m in req["messages"])]
+    rejected = [
+        req
+        for req in llm.requests
+        if any("not returned by any tool call" in str(m.get("content")) for m in req["messages"])
+    ]
     assert rejected, "the ungrounded submission should have been rejected and retried"
 
 
@@ -83,6 +98,7 @@ def _critic_revise_first(stage):
         if n == 1:
             return {"verdict": "revise", "issues": [{"stage": stage, "message": "fix it"}]}
         return {"verdict": "pass", "issues": [], "notes": "ok"}
+
     return critic
 
 
@@ -101,15 +117,17 @@ def test_concept_revision_reresolves_and_stops_when_unchanged(settings):
     b = CohortBuilder(settings, backend=llm)
     r = b.ask(T2DM_QUERY)
     steps = [s["agent_name"] for s in b.store.get_run(r.run_id)["steps"]]
-    assert steps.count("concept_resolver") == 8          # concepts re-resolved with feedback
-    assert llm.critic_calls == 1                         # same logic is not sent to the critic again
+    assert steps.count("concept_resolver") == 8  # concepts re-resolved with feedback
+    assert llm.critic_calls == 1  # same logic is not sent to the critic again
     assert r.status == "needs_review"
     assert any("did not change" in i["message"] for i in r.issues)
 
 
 def test_persistent_critic_rejection_needs_review(settings):
-    llm = FakeLLM({T2DM_QUERY: [T2DM_INTENT]},
-                  critic=lambda u, n: {"verdict": "revise", "issues": [{"stage": "intent", "message": "wrong"}]})
+    llm = FakeLLM(
+        {T2DM_QUERY: [T2DM_INTENT]},
+        critic=lambda u, n: {"verdict": "revise", "issues": [{"stage": "intent", "message": "wrong"}]},
+    )
     b = CohortBuilder(settings, backend=llm)
     r = b.ask(T2DM_QUERY)
     assert r.status == "needs_review" and r.cohort_definition_id is not None

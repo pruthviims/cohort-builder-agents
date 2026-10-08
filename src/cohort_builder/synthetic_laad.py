@@ -8,6 +8,7 @@ map your delivery in ontology/datasets/iqvia_laad.yaml.
 
 All data is synthetic and deterministic for a given seed.
 """
+
 from __future__ import annotations
 
 import csv
@@ -35,9 +36,15 @@ CREATE OR REPLACE TABLE laad.px_claims (
 """
 
 NDC = {
-    "metformin_500": "99999010101", "metformin_er": "99999010201", "empa_met": "99999010301",
-    "empagliflozin": "99999020101", "dapagliflozin": "99999020201", "canagliflozin": "99999020301",
-    "lisinopril": "99999030101", "sertraline": "99999040101", "atorvastatin": "99999050101",
+    "metformin_500": "99999010101",
+    "metformin_er": "99999010201",
+    "empa_met": "99999010301",
+    "empagliflozin": "99999020101",
+    "dapagliflozin": "99999020201",
+    "canagliflozin": "99999020301",
+    "lisinopril": "99999030101",
+    "sertraline": "99999040101",
+    "atorvastatin": "99999050101",
     "unmapped": "00000000000",
 }
 FILLER_DX = ["Z0000", "R05", "M545", "J069", "K219"]  # common non-study codes (unmapped in the demo vocabulary)
@@ -91,11 +98,23 @@ def generate_laad(con: duckdb.DuckDBPyConnection, n_patients: int = 4000, seed: 
                 return None
             ids["rx"] += 1
             rows["rx_claims"].append([ids["rx"], pid, d, ndc, supply, float(supply), status, reject, None, payer])
-            if status == "PAID" and rng.random() < 0.03:   # reversed a few days later
+            if status == "PAID" and rng.random() < 0.03:  # reversed a few days later
                 rid = ids["rx"]
                 ids["rx"] += 1
-                rows["rx_claims"].append([ids["rx"], pid, d + timedelta(days=rng.randint(0, 5)), ndc, supply,
-                                          float(supply), "REVERSAL", None, rid, payer])
+                rows["rx_claims"].append(
+                    [
+                        ids["rx"],
+                        pid,
+                        d + timedelta(days=rng.randint(0, 5)),
+                        ndc,
+                        supply,
+                        float(supply),
+                        "REVERSAL",
+                        None,
+                        rid,
+                        payer,
+                    ]
+                )
             return ids["rx"]
 
         def therapy(first: date, ndc: str, fills: int, supply: int = 30) -> None:
@@ -122,9 +141,11 @@ def generate_laad(con: duckdb.DuckDBPyConnection, n_patients: int = 4000, seed: 
             for k in range(rng.randint(1, 6)):
                 dx(dx0 + timedelta(days=k * rng.randint(20, 150)), [code], primary=rng.random() < 0.65)
             if rng.random() < 0.8:
-                therapy(dx0 + timedelta(days=rng.randint(0, 120)),
-                        rng.choices([NDC["metformin_500"], NDC["metformin_er"], NDC["empa_met"]], [0.6, 0.3, 0.1])[0],
-                        rng.randint(1, 14))
+                therapy(
+                    dx0 + timedelta(days=rng.randint(0, 120)),
+                    rng.choices([NDC["metformin_500"], NDC["metformin_er"], NDC["empa_met"]], [0.6, 0.3, 0.1])[0],
+                    rng.randint(1, 14),
+                )
             if rng.random() < 0.35:  # SGLT2 access journey: often PA-rejected first
                 t = _d(rng, dx0, stop)
                 drug = rng.choice([NDC["empagliflozin"], NDC["dapagliflozin"], NDC["canagliflozin"]])
@@ -166,6 +187,8 @@ def generate_laad(con: duckdb.DuckDBPyConnection, n_patients: int = 4000, seed: 
             path = Path(td) / f"{table}.csv"
             with open(path, "w", newline="") as fh:
                 csv.writer(fh).writerows([["" if v is None else v for v in r] for r in data])
-            con.execute(f"INSERT INTO laad.{table} SELECT * FROM read_csv('{path}', header=false, nullstr='', "
-                        f"auto_detect=true, all_varchar=true)")
+            con.execute(
+                f"INSERT INTO laad.{table} SELECT * FROM read_csv('{path}', header=false, nullstr='', "
+                f"auto_detect=true, all_varchar=true)"
+            )
     return {f"laad.{t}": con.execute(f"SELECT count(*) FROM laad.{t}").fetchone()[0] for t in rows}

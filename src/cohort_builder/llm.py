@@ -4,6 +4,7 @@ Every request is canonicalized and hashed. In `cached` mode an identical
 request returns the recorded response; in `replay` mode only recorded
 responses are allowed, which reproduces a past run exactly.
 """
+
 from __future__ import annotations
 
 import copy
@@ -101,8 +102,17 @@ class LLMClient:
             self._backend = anthropic_backend()
         return self._backend
 
-    def create(self, *, prompt: Prompt, system: str, messages: list[dict], tools: list[dict],
-               tool_choice: dict, run_id: str | None = None, step_id: str | None = None) -> dict:
+    def create(
+        self,
+        *,
+        prompt: Prompt,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: dict,
+        run_id: str | None = None,
+        step_id: str | None = None,
+    ) -> dict:
         request: dict[str, Any] = {
             "model": self.settings.model,
             "max_tokens": self.settings.max_tokens,
@@ -129,21 +139,47 @@ class LLMClient:
             self.store.cache_put(request_hash, self.settings.model, response)
         usage = response.get("usage", {})
         self.store.record_llm_call(
-            run_id=run_id, step_id=step_id, model=self.settings.model, temperature=self.settings.temperature,
-            prompt_name=prompt.name, prompt_version=prompt.version, prompt_hash=prompt.hash,
-            request_hash=request_hash, response=response, input_tokens=usage.get("input_tokens"),
-            output_tokens=usage.get("output_tokens"), cache_hit=cache_hit)
+            run_id=run_id,
+            step_id=step_id,
+            model=self.settings.model,
+            temperature=self.settings.temperature,
+            prompt_name=prompt.name,
+            prompt_version=prompt.version,
+            prompt_hash=prompt.hash,
+            request_hash=request_hash,
+            response=response,
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            cache_hit=cache_hit,
+        )
         return response
 
-    def structured(self, *, prompt: Prompt, system: str, user: str, schema: type[T], tool_name: str,
-                   tool_description: str, run_id: str | None = None, step_id: str | None = None,
-                   max_repairs: int = 2) -> T:
+    def structured(
+        self,
+        *,
+        prompt: Prompt,
+        system: str,
+        user: str,
+        schema: type[T],
+        tool_name: str,
+        tool_description: str,
+        run_id: str | None = None,
+        step_id: str | None = None,
+        max_repairs: int = 2,
+    ) -> T:
         """Force a single tool call whose input must validate against `schema`."""
         tool = {"name": tool_name, "description": tool_description, "input_schema": inline_schema(schema)}
         messages: list[dict] = [{"role": "user", "content": user}]
         for attempt in range(max_repairs + 1):
-            resp = self.create(prompt=prompt, system=system, messages=messages, tools=[tool],
-                               tool_choice={"type": "tool", "name": tool_name}, run_id=run_id, step_id=step_id)
+            resp = self.create(
+                prompt=prompt,
+                system=system,
+                messages=messages,
+                tools=[tool],
+                tool_choice={"type": "tool", "name": tool_name},
+                run_id=run_id,
+                step_id=step_id,
+            )
             block = next((b for b in resp["content"] if b.get("type") == "tool_use"), None)
             if block is None:
                 raise LLMError(f"{prompt.name}: model did not call {tool_name}")
@@ -154,9 +190,17 @@ class LLMClient:
                     raise LLMError(f"{prompt.name}: invalid structured output: {exc}") from exc
                 messages = messages + [
                     {"role": "assistant", "content": resp["content"]},
-                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": block["id"],
-                                                  "is_error": True,
-                                                  "content": f"Schema validation failed, fix and call again:\n{exc}"}]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block["id"],
+                                "is_error": True,
+                                "content": f"Schema validation failed, fix and call again:\n{exc}",
+                            }
+                        ],
+                    },
                 ]
         raise AssertionError("unreachable")
 

@@ -1,5 +1,6 @@
 """Agents. Only three steps use an LLM (intent parser, concept resolver, critic);
 composition, validation and explanation are deterministic code."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

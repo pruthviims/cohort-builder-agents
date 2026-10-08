@@ -3,6 +3,7 @@
 Also normalizes value thresholds to the analyte's canonical unit using the
 ontology, so the stored IR is unit-consistent.
 """
+
 from __future__ import annotations
 
 import re
@@ -36,7 +37,7 @@ def format_validation_error(exc: ValidationError) -> list[str]:
 @dataclass
 class Issue:
     severity: str  # error | warning
-    stage: str     # intent | concepts | data
+    stage: str  # intent | concepts | data
     message: str
 
     def as_dict(self) -> dict:
@@ -54,12 +55,19 @@ def _analyte_for(ont: Ontology, vocab: Vocabulary, cs: ResolvedConceptSet) -> in
     return None
 
 
-def _value_filter(spec: ValueSpec, cs: ResolvedConceptSet, ont: Ontology, vocab: Vocabulary,
-                  where: str, issues: list[Issue]) -> ValueFilter | None:
+def _value_filter(
+    spec: ValueSpec, cs: ResolvedConceptSet, ont: Ontology, vocab: Vocabulary, where: str, issues: list[Issue]
+) -> ValueFilter | None:
     unit = ont.find_unit(spec.unit_text)
     if unit is None:
-        issues.append(Issue("error", "intent", f"{where}: unknown unit {spec.unit_text!r}; known units: "
-                            f"{sorted(u['symbol'] for u in ont.units.values())}"))
+        issues.append(
+            Issue(
+                "error",
+                "intent",
+                f"{where}: unknown unit {spec.unit_text!r}; known units: "
+                f"{sorted(u['symbol'] for u in ont.units.values())}",
+            )
+        )
         return None
     analyte = _analyte_for(ont, vocab, cs)
     value, high, original = spec.value, spec.value_high, None
@@ -69,15 +77,23 @@ def _value_filter(spec: ValueSpec, cs: ResolvedConceptSet, ont: Ontology, vocab:
         if unit != canonical:
             conv = next((c for c in a.get("conversions", []) if int(c["from_unit"]) == unit), None)
             if conv is None:
-                issues.append(Issue("error", "intent", f"{where}: cannot convert {spec.unit_text} to "
-                                    f"{ont.unit_symbol(canonical)} for {a['name']}"))
+                issues.append(
+                    Issue(
+                        "error",
+                        "intent",
+                        f"{where}: cannot convert {spec.unit_text} to {ont.unit_symbol(canonical)} for {a['name']}",
+                    )
+                )
                 return None
             original = f"{spec.op} {spec.value}{'' if high is None else ' and ' + str(high)} {spec.unit_text}"
             value = round(spec.value * conv["factor"] + conv["offset"], 3)
             high = None if high is None else round(high * conv["factor"] + conv["offset"], 3)
             unit = canonical
-    return _build(issues, where, lambda: ValueFilter(op=spec.op, value=value, value_high=high,
-                                                     unit_concept_id=unit, original_text=original))
+    return _build(
+        issues,
+        where,
+        lambda: ValueFilter(op=spec.op, value=value, value_high=high, unit_concept_id=unit, original_text=original),
+    )
 
 
 def _build(issues: list["Issue"], where: str, fn: Callable[[], T], stage: str = "intent") -> T | None:
@@ -99,15 +115,22 @@ def _claim_status(entity: str, requested: Sequence[str] | None, ont: Ontology) -
     return None
 
 
-def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: Ontology, vocab: Vocabulary,
-            ) -> tuple[CohortDefinition | None, list[Issue]]:
+def compose(
+    intent: CohortIntent,
+    resolved: dict[str, ResolvedConceptSet],
+    ont: Ontology,
+    vocab: Vocabulary,
+) -> tuple[CohortDefinition | None, list[Issue]]:
     issues: list[Issue] = []
     mentions = {m.key: m for m in intent.mentions}
     concept_sets: dict[str, ConceptSet] = {}
     for key, rcs in sorted(resolved.items()):
-        cs_obj = _build(issues, f"concept set for {key!r}",
-                        partial(ConceptSet, id=_cs_id(key), name=rcs.name, domain=rcs.domain, items=rcs.items,
-                                source=rcs.source), "concepts")
+        cs_obj = _build(
+            issues,
+            f"concept set for {key!r}",
+            partial(ConceptSet, id=_cs_id(key), name=rcs.name, domain=rcs.domain, items=rcs.items, source=rcs.source),
+            "concepts",
+        )
         if cs_obj is not None:
             concept_sets[key] = cs_obj
 
@@ -123,8 +146,9 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
     idx_cs = cs_for(intent.index_mention_key, "index event")
     index_vf = None
     if idx_cs and intent.index_value:
-        index_vf = _value_filter(intent.index_value, resolved[intent.index_mention_key], ont, vocab,
-                                 "index event", issues)
+        index_vf = _value_filter(
+            intent.index_value, resolved[intent.index_mention_key], ont, vocab, "index event", issues
+        )
 
     inclusion: list[Criterion] = []
     exclusion: list[Criterion] = []
@@ -142,11 +166,25 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
         target = inclusion if c.role == "inclusion" else exclusion
         prefix = "inc" if c.role == "inclusion" else "exc"
         entity = mentions[c.mention_key].entity
-        crit = _build(issues, where, partial(
-            Criterion, id=f"{prefix}_{len(target) + 1}", name=c.name, entity=entity, concept_set_id=cs.id,
-            window=window, occurrence=c.occurrence, count=c.count, count_by=c.count_by, value_filter=vf,
-            claim_status=_claim_status(entity, c.claim_status, ont),
-            dx_position=c.dx_position if c.dx_position == "primary" else None, min_span_days=c.min_span_days))
+        crit = _build(
+            issues,
+            where,
+            partial(
+                Criterion,
+                id=f"{prefix}_{len(target) + 1}",
+                name=c.name,
+                entity=entity,
+                concept_set_id=cs.id,
+                window=window,
+                occurrence=c.occurrence,
+                count=c.count,
+                count_by=c.count_by,
+                value_filter=vf,
+                claim_status=_claim_status(entity, c.claim_status, ont),
+                dx_position=c.dx_position if c.dx_position == "primary" else None,
+                min_span_days=c.min_span_days,
+            ),
+        )
         if crit is not None:
             target.append(crit)
 
@@ -155,29 +193,47 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
 
     used = {idx_cs.id} | {c.concept_set_id for c in inclusion + exclusion}
     index_entity = mentions[intent.index_mention_key].entity
-    index_event = _build(issues, "index event", lambda: IndexEvent(
-        entity=index_entity, concept_set_id=idx_cs.id, first_occurrence_only=intent.index_first_occurrence_only,
-        value_filter=index_vf, claim_status=_claim_status(index_entity, intent.index_claim_status, ont),
-        dx_position=intent.index_dx_position if intent.index_dx_position == "primary" else None))
-    demographics = _build(issues, "demographics", lambda: Demographics(
-        age_min=intent.age_min, age_max=intent.age_max,
-        gender_concept_ids=sorted(GENDERS[g] for g in intent.genders)))
+    index_event = _build(
+        issues,
+        "index event",
+        lambda: IndexEvent(
+            entity=index_entity,
+            concept_set_id=idx_cs.id,
+            first_occurrence_only=intent.index_first_occurrence_only,
+            value_filter=index_vf,
+            claim_status=_claim_status(index_entity, intent.index_claim_status, ont),
+            dx_position=intent.index_dx_position if intent.index_dx_position == "primary" else None,
+        ),
+    )
+    demographics = _build(
+        issues,
+        "demographics",
+        lambda: Demographics(
+            age_min=intent.age_min,
+            age_max=intent.age_max,
+            gender_concept_ids=sorted(GENDERS[g] for g in intent.genders),
+        ),
+    )
     cohort_exit = _build(issues, "exit", lambda: CohortExit(type=intent.exit_type, days=intent.exit_days))
     if index_event is None or demographics is None or cohort_exit is None:
         return None, issues
-    ir = _build(issues, "cohort definition", lambda: CohortDefinition(
-        ontology_version=ont.version,
-        vocabulary_version=vocab.version(),
-        name=intent.name,
-        description=intent.description,
-        concept_sets=sorted((cs for cs in concept_sets.values() if cs.id in used), key=lambda s: s.id),
-        index_event=index_event,
-        prior_observation_days=intent.prior_observation_days,
-        post_observation_days=intent.post_observation_days,
-        demographics=demographics,
-        inclusion=inclusion,
-        exclusion=exclusion,
-        exit=cohort_exit,
-        assumptions=intent.assumptions,
-    ))
+    ir = _build(
+        issues,
+        "cohort definition",
+        lambda: CohortDefinition(
+            ontology_version=ont.version,
+            vocabulary_version=vocab.version(),
+            name=intent.name,
+            description=intent.description,
+            concept_sets=sorted((cs for cs in concept_sets.values() if cs.id in used), key=lambda s: s.id),
+            index_event=index_event,
+            prior_observation_days=intent.prior_observation_days,
+            post_observation_days=intent.post_observation_days,
+            demographics=demographics,
+            inclusion=inclusion,
+            exclusion=exclusion,
+            exit=cohort_exit,
+            assumptions=intent.assumptions,
+        ),
+    )
     return ir, issues

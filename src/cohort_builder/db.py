@@ -1,4 +1,5 @@
 """DuckDB connection and OMOP CDM v5.4 / vocabulary DDL (subset used by the builder)."""
+
 from __future__ import annotations
 
 from pathlib import Path

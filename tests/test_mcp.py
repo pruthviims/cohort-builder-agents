@@ -1,4 +1,5 @@
 """MCP server tests through a real in-process MCP client."""
+
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +26,7 @@ async def call(client: Client, name: str, args: dict | None = None):
 
 def example_ir(path) -> dict:
     data = json.loads(path.read_text())
-    data.pop("ontology_version")   # the server fills current versions in
+    data.pop("ontology_version")  # the server fills current versions in
     data.pop("vocabulary_version")
     return data
 
@@ -34,20 +35,27 @@ def test_tools_exposed_and_approval_is_not(builder):
     async def go():
         async with Client(create_server(builder, "tester")) as c:
             names = {t.name for t in (await c.list_tools()).tools}
-            assert {"build_cohort", "search_concepts", "validate_cohort", "save_cohort_definition",
-                    "execute_approved_cohort", "replay_run"} <= names
+            assert {
+                "build_cohort",
+                "search_concepts",
+                "validate_cohort",
+                "save_cohort_definition",
+                "execute_approved_cohort",
+                "replay_run",
+            } <= names
             assert not any(n.startswith(("approve", "review", "reject")) for n in names)
             schema = next(t for t in (await c.list_tools()).tools if t.name == "validate_cohort").input_schema
             assert "index_event" in json.dumps(schema)  # clients see the full cohort definition schema
-            read_only = {t.name for t in (await c.list_tools()).tools
-                         if t.annotations and t.annotations.read_only_hint}
+            read_only = {t.name for t in (await c.list_tools()).tools if t.annotations and t.annotations.read_only_hint}
             assert {"search_concepts", "validate_cohort", "get_cohort_sql"} <= read_only
             assert "execute_approved_cohort" not in read_only
+
     run(go())
 
 
 def test_client_driven_flow_with_human_approval(builder, example_ir_path):
     """Option B: the client's LLM searches, validates and saves; a human approves; then MCP executes."""
+
     async def go():
         async with Client(create_server(builder, "tester")) as c:
             curated = await call(c, "search_curated_concept_sets", {"query": "type 2 diabetes"})
@@ -76,26 +84,32 @@ def test_client_driven_flow_with_human_approval(builder, example_ir_path):
     def_id = run(go())
     row = builder.store.get_definition(def_id)
     assert row["created_by"] == "mcp:tester"
-    assert builder.con.execute("SELECT executed_by FROM meta.cohort_generation WHERE cohort_definition_id=?",
-                               [def_id]).fetchone()[0] == "mcp:tester"
+    assert (
+        builder.con.execute(
+            "SELECT executed_by FROM meta.cohort_generation WHERE cohort_definition_id=?", [def_id]
+        ).fetchone()[0]
+        == "mcp:tester"
+    )
 
 
 def test_server_rejects_invalid_definitions(builder, example_ir_path):
     async def go():
         async with Client(create_server(builder)) as c:
             bad = example_ir(example_ir_path)
-            bad["concept_sets"][1]["items"][0]["concept_id"] = 2000003099   # deprecated
+            bad["concept_sets"][1]["items"][0]["concept_id"] = 2000003099  # deprecated
             v = await call(c, "validate_cohort", {"definition": bad})
             assert not v["valid"] and any("deprecated" in i["message"] for i in v["issues"])
             broken = await c.call_tool("validate_cohort", {"definition": {"name": "x"}})
             assert broken.is_error  # rejected by the tool's input schema before any code runs
             saved = await call(c, "save_cohort_definition", {"definition": bad})
             assert saved["status"] == "needs_review"
+
     run(go())
 
 
 def test_reproducible_pipeline_and_replay(builder):
     """Option A: the server's own agents build the cohort; replay reproduces it exactly."""
+
     async def go():
         async with Client(create_server(builder, "tester")) as c:
             r = await call(c, "build_cohort", {"request": T2DM_QUERY})
@@ -104,6 +118,7 @@ def test_reproducible_pipeline_and_replay(builder):
             assert run_info["manifest"]["ir_semantic_hash"] == r["manifest"]["ir_semantic_hash"]
             rep = await call(c, "replay_run", {"run_id": r["run_id"]})
             assert rep["identical"]
+
     run(go())
 
 
@@ -118,6 +133,7 @@ def test_resources_and_prompt(builder):
             assert "entities:" in domain
             p = await c.get_prompt("build_cohort_interactively", {"request": "adults with CKD"})
             assert "adults with CKD" in p.messages[0].content.text
+
     run(go())
 
 
@@ -125,9 +141,12 @@ def test_http_transport_requires_token(builder):
     from starlette.testclient import TestClient
 
     app = BearerTokenMiddleware(create_server(builder).streamable_http_app(), "s3cret")
-    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                       "clientInfo": {"name": "t", "version": "1"}}}
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}},
+    }
     headers = {"accept": "application/json, text/event-stream", "content-type": "application/json"}
     with TestClient(app, base_url="http://127.0.0.1:8765") as http:
         assert http.post("/mcp", json=init, headers=headers).status_code == 401

@@ -4,6 +4,7 @@ Privacy: counts leave this module only through `suppress_series` / `suppress_cou
 Small-cell suppression here is a disclosure-risk control, not a guarantee of
 anonymity (see README "Small-cell suppression").
 """
+
 from __future__ import annotations
 
 import logging
@@ -18,7 +19,7 @@ from .compiler import CompiledCohort
 
 log = logging.getLogger(__name__)
 
-PRIMARY = "<{k}"        # count below the threshold
+PRIMARY = "<{k}"  # count below the threshold
 COMPLEMENTARY = "suppressed"  # count hidden because it would reveal a small difference
 
 
@@ -77,8 +78,11 @@ class Attrition:
         return shown[-1]["remaining"] if shown else 0
 
 
-_FORBIDDEN = re.compile(r"\b(ATTACH|DETACH|COPY|EXPORT|IMPORT|INSTALL|LOAD|PRAGMA|SET|CALL|DROP|DELETE|UPDATE|"
-                        r"INSERT|ALTER|CREATE|GRANT|REVOKE|TRUNCATE)\b", re.IGNORECASE)
+_FORBIDDEN = re.compile(
+    r"\b(ATTACH|DETACH|COPY|EXPORT|IMPORT|INSTALL|LOAD|PRAGMA|SET|CALL|DROP|DELETE|UPDATE|"
+    r"INSERT|ALTER|CREATE|GRANT|REVOKE|TRUNCATE)\b",
+    re.IGNORECASE,
+)
 
 
 def guard_select(sql: str) -> str:
@@ -123,8 +127,9 @@ class Executor:
 
     def attrition(self, compiled: CompiledCohort) -> Attrition:
         row = self._run(guard_select(compiled.attrition_sql), fetch="one")
-        return Attrition([{"sequence": i, "name": name, "remaining": int(row[i])}
-                          for i, name in enumerate(compiled.rule_names)])
+        return Attrition(
+            [{"sequence": i, "name": name, "remaining": int(row[i])} for i, name in enumerate(compiled.rule_names)]
+        )
 
     def generate(self, compiled: CompiledCohort, cohort_definition_id: int) -> tuple[str, Attrition]:
         """Materialize the cohort into results.cohort under a new generation_id (all-or-nothing)."""
@@ -133,11 +138,16 @@ class Executor:
         attrition = self.attrition(compiled)
         self.con.execute("BEGIN")
         try:
-            self._run(f"INSERT INTO results.cohort SELECT ?, subject_id, cohort_start_date, cohort_end_date, ? "
-                      f"FROM ({cohort_sql})", [cohort_definition_id, generation_id])
+            self._run(
+                f"INSERT INTO results.cohort SELECT ?, subject_id, cohort_start_date, cohort_end_date, ? "
+                f"FROM ({cohort_sql})",
+                [cohort_definition_id, generation_id],
+            )
             for r in attrition.rules:
-                self.con.execute("INSERT INTO results.cohort_inclusion_stats VALUES (?,?,?,?,?)",
-                                 [generation_id, cohort_definition_id, r["sequence"], r["name"], r["remaining"]])
+                self.con.execute(
+                    "INSERT INTO results.cohort_inclusion_stats VALUES (?,?,?,?,?)",
+                    [generation_id, cohort_definition_id, r["sequence"], r["name"], r["remaining"]],
+                )
             self.con.execute("COMMIT")
         except Exception:
             self.con.execute("ROLLBACK")

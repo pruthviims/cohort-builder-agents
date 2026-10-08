@@ -12,6 +12,7 @@ Environments (CB_ENV):
   development allows CB_AUTH_DEV_BYPASS (a fixed, explicitly configured local identity)
               and CB_ALLOW_DRAFT_EXECUTION.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -152,8 +153,13 @@ class TokenAuthenticator:
         return len(self._by_hash)
 
 
-def issue_token(subject: str, roles: list[str], tenant: str = DEFAULT_TENANT, expires_days: int | None = 90,
-                token_id: str | None = None) -> tuple[str, dict[str, Any]]:
+def issue_token(
+    subject: str,
+    roles: list[str],
+    tenant: str = DEFAULT_TENANT,
+    expires_days: int | None = 90,
+    token_id: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Create a new random token. Returns (token, file entry). Show the token once; store only the entry."""
     roles_set = frozenset(roles)
     if not roles_set or not roles_set <= ROLES:
@@ -161,11 +167,15 @@ def issue_token(subject: str, roles: list[str], tenant: str = DEFAULT_TENANT, ex
     if not _NAME.match(subject) or not _NAME.match(tenant):
         raise ValueError(f"subject/tenant must match {_NAME.pattern}")
     token = "cbk_" + secrets.token_urlsafe(32)
-    entry: dict[str, Any] = {"id": token_id or f"{subject}-{secrets.token_hex(3)}", "sha256": hash_token(token),
-                             "subject": subject, "roles": sorted(roles_set), "tenant": tenant}
+    entry: dict[str, Any] = {
+        "id": token_id or f"{subject}-{secrets.token_hex(3)}",
+        "sha256": hash_token(token),
+        "subject": subject,
+        "roles": sorted(roles_set),
+        "tenant": tenant,
+    }
     if expires_days:
-        entry["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=expires_days)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
+        entry["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=expires_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return token, entry
 
 
@@ -228,6 +238,7 @@ class SecurityConfig:
 @dataclass(frozen=True)
 class GovernancePolicy:
     """Rules every interface (CLI, API, MCP) shares; enforced inside CohortBuilder."""
+
     allow_self_approval: bool = False
     allow_draft_execution: bool = False
 

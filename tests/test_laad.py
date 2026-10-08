@@ -1,4 +1,5 @@
 """IQVIA LAAD-style claims profile: semantic views, claims logic, capability checks, cross-dataset runs."""
+
 from __future__ import annotations
 
 import copy
@@ -30,11 +31,13 @@ def test_semantic_views_map_codes_and_statuses(laad_builder):
     n_rev_rows = q("SELECT count(*) FROM laad.rx_claims WHERE txn_type = 'REVERSAL'")[0][0]
     assert n_rev_rows > 0 and statuses["reversed"] == n_rev_rows
     # dot-less ICD-10-CM codes map to standard SNOMED concepts
-    assert q("SELECT DISTINCT condition_concept_id FROM sem.condition_occurrence WHERE source_value='E119'") \
-        == [(201826,)]
+    assert q("SELECT DISTINCT condition_concept_id FROM sem.condition_occurrence WHERE source_value='E119'") == [
+        (201826,)
+    ]
     # NDCs map to RxNorm products, which roll up to ingredients
-    assert q("SELECT DISTINCT drug_concept_id FROM sem.drug_exposure WHERE source_value='99999020101'") \
-        == [(2000005004,)]
+    assert q("SELECT DISTINCT drug_concept_id FROM sem.drug_exposure WHERE source_value='99999020101'") == [
+        (2000005004,)
+    ]
     # unpivoted diagnosis positions
     assert {r[0] for r in q("SELECT DISTINCT dx_position FROM sem.condition_occurrence")} >= {1, 2}
 
@@ -43,8 +46,10 @@ def test_activity_based_observation_splits_on_gaps(laad_builder):
     q = lambda sql: laad_builder.con.execute(sql).fetchall()  # noqa: E731
     multi = q("SELECT person_id FROM sem.observation_period GROUP BY 1 HAVING count(*) > 1 LIMIT 1")
     assert multi
-    periods = q(f"SELECT observation_period_start_date, observation_period_end_date FROM sem.observation_period "
-                f"WHERE person_id = {multi[0][0]} ORDER BY 1")
+    periods = q(
+        f"SELECT observation_period_start_date, observation_period_end_date FROM sem.observation_period "
+        f"WHERE person_id = {multi[0][0]} ORDER BY 1"
+    )
     for (_, e1), (s2, _) in zip(periods, periods[1:], strict=False):
         assert (s2 - e1).days > 365  # split only on gaps longer than max_activity_gap_days
 
@@ -58,8 +63,9 @@ def _reference_sglt2_t2d(con) -> set[int]:
     activity = defaultdict(set)
     for _, pid, d, *_ in rx:
         activity[pid].add(d)
-    for pid, d in con.execute("SELECT patient_id, svc_dt FROM laad.dx_claims UNION ALL "
-                              "SELECT patient_id, svc_dt FROM laad.px_claims").fetchall():
+    for pid, d in con.execute(
+        "SELECT patient_id, svc_dt FROM laad.dx_claims UNION ALL SELECT patient_id, svc_dt FROM laad.px_claims"
+    ).fetchall():
         activity[pid].add(d)
 
     def periods(pid):
@@ -104,8 +110,8 @@ def test_claim_status_and_span_change_results(laad_builder):
     any_status.index_event.claim_status = ["paid", "rejected", "reversed"]
     no_span = base.model_copy(deep=True)
     no_span.inclusion[0].min_span_days = None
-    assert n(no_span) > n(base)                 # spacing rule removes people
-    assert n(any_status) != n(base)             # counting rejected/reversed claims changes the cohort
+    assert n(no_span) > n(base)  # spacing rule removes people
+    assert n(any_status) != n(base)  # counting rejected/reversed claims changes the cohort
     assert base.semantic_hash() != any_status.semantic_hash()
 
 
@@ -134,7 +140,7 @@ def test_unsupported_request_stops_without_retries(laad_builder, laad_llm):
 def test_agents_build_gold_cohort_on_laad(laad_builder):
     r = laad_builder.ask(LAAD_SGLT2_QUERY)
     assert r.status == "draft", r.issues
-    assert r.ir.index_event.claim_status == ["paid"]          # dataset default made explicit
+    assert r.ir.index_event.claim_status == ["paid"]  # dataset default made explicit
     assert r.ir.semantic_hash() == gold("laad_sglt2_t2d").semantic_hash()
     assert r.manifest["dataset"]["name"] == "iqvia_laad"
     assert "LAAD-style" in r.manifest["data_snapshot"]
@@ -151,20 +157,22 @@ def test_laad_golden_eval(laad_builder):
 def test_same_definition_runs_on_both_datasets(settings, fake_llm):
     """Logic built on OMOP can execute on LAAD if LAAD can answer it; otherwise it is refused."""
     omop = CohortBuilder(settings, backend=fake_llm)
-    portable, _ = omop.submit_ir(gold("sertraline_depression"), "alice")       # drug + diagnosis only
-    labs, _ = omop.submit_ir(gold("t2dm_metformin_hba1c"), "alice")            # needs HbA1c values
+    portable, _ = omop.submit_ir(gold("sertraline_depression"), "alice")  # drug + diagnosis only
+    labs, _ = omop.submit_ir(gold("t2dm_metformin_hba1c"), "alice")  # needs HbA1c values
     for d in (portable, labs):
         omop.review(d, "dr_reviewer", "approved")
     omop_n = omop.execute(portable, "alice")["person_count"]
 
-    laad = CohortBuilder(settings.__class__(**{**settings.__dict__, "dataset": "iqvia_laad"}),
-                         backend=fake_llm, con=omop.con)
+    laad = CohortBuilder(
+        settings.__class__(**{**settings.__dict__, "dataset": "iqvia_laad"}), backend=fake_llm, con=omop.con
+    )
     out = laad.execute(portable, "alice")
     assert out["dataset"] == "iqvia_laad" and out["person_count"] > 0 and omop_n > 0
     with pytest.raises(ValueError, match="cannot run on dataset 'iqvia_laad'"):
         laad.execute(labs, "alice")
-    gens = omop.con.execute("SELECT dataset FROM meta.cohort_generation WHERE cohort_definition_id = ? "
-                            "ORDER BY executed_at", [portable]).fetchall()
+    gens = omop.con.execute(
+        "SELECT dataset FROM meta.cohort_generation WHERE cohort_definition_id = ? ORDER BY executed_at", [portable]
+    ).fetchall()
     assert [g[0] for g in gens] == ["omop_demo", "iqvia_laad"]
 
 

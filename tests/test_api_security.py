@@ -1,4 +1,5 @@
 """HTTP API authentication, role-based authorization, governance policy and tenant isolation."""
+
 from __future__ import annotations
 
 import json
@@ -19,7 +20,7 @@ USERS = {
     "bob": (["reviewer", "viewer"], "research"),
     "carol": (["executor", "viewer"], "research"),
     "victor": (["viewer"], "research"),
-    "dana": (["author", "reviewer"], "research"),     # can author and review: self-approval test
+    "dana": (["author", "reviewer"], "research"),  # can author and review: self-approval test
     "eve": (["author", "reviewer", "executor"], "other"),  # different tenant
     "root": (["admin"], "ops"),
 }
@@ -69,9 +70,18 @@ def test_health_is_public_and_minimal(api):
     assert r.status_code == 200 and r.json() == {"status": "ok"}
 
 
-@pytest.mark.parametrize("method,path", [("get", "/cohorts"), ("post", "/cohorts/ask"), ("get", "/me"),
-                                         ("post", "/cohorts/1/review"), ("post", "/cohorts/1/execute"),
-                                         ("get", "/audit"), ("get", "/versions")])
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/cohorts"),
+        ("post", "/cohorts/ask"),
+        ("get", "/me"),
+        ("post", "/cohorts/1/review"),
+        ("post", "/cohorts/1/execute"),
+        ("get", "/audit"),
+        ("get", "/versions"),
+    ],
+)
 def test_unauthenticated_requests_are_rejected(api, method, path):
     client, _ = api
     r = getattr(client, method)(path)
@@ -79,8 +89,9 @@ def test_unauthenticated_requests_are_rejected(api, method, path):
     assert r.headers.get("www-authenticate") == "Bearer"
 
 
-@pytest.mark.parametrize("header", ["Bearer not-a-real-token-but-long-enough-0123456789", "Bearer short",
-                                    "Basic YWxpY2U6cGFzcw=="])
+@pytest.mark.parametrize(
+    "header", ["Bearer not-a-real-token-but-long-enough-0123456789", "Bearer short", "Basic YWxpY2U6cGFzcw=="]
+)
 def test_invalid_credentials_are_rejected(api, header):
     client, _ = api
     assert client.get("/me", headers={"Authorization": header}).status_code == 401
@@ -95,7 +106,11 @@ def test_expired_token_is_rejected(api):
 def test_identity_comes_from_token(api):
     client, toks = api
     assert client.get("/me", headers=h(toks["alice"])).json() == {
-        "subject": "alice", "roles": ["author", "viewer"], "tenant": "research", "auth_method": "token"}
+        "subject": "alice",
+        "roles": ["author", "viewer"],
+        "tenant": "research",
+        "auth_method": "token",
+    }
 
 
 def test_identity_fields_in_body_are_rejected(api):
@@ -103,8 +118,9 @@ def test_identity_fields_in_body_are_rejected(api):
     r = client.post("/cohorts/ask", json={"query": T2DM_QUERY, "user_id": "mallory"}, headers=h(toks["alice"]))
     assert r.status_code == 422
     def_id = _draft(client, toks)
-    r = client.post(f"/cohorts/{def_id}/review", json={"decision": "approved", "reviewer": "mallory"},
-                    headers=h(toks["bob"]))
+    r = client.post(
+        f"/cohorts/{def_id}/review", json={"decision": "approved", "reviewer": "mallory"}, headers=h(toks["bob"])
+    )
     assert r.status_code == 422
 
 
@@ -136,8 +152,9 @@ def test_author_cannot_execute(api, builder):
 def test_reviewer_approval_records_authenticated_reviewer(api, builder):
     client, toks = api
     def_id = _draft(client, toks)
-    r = client.post(f"/cohorts/{def_id}/review", json={"decision": "approved", "comments": "ok"},
-                    headers=h(toks["bob"]))
+    r = client.post(
+        f"/cohorts/{def_id}/review", json={"decision": "approved", "comments": "ok"}, headers=h(toks["bob"])
+    )
     assert r.status_code == 200 and r.json()["reviewer"] == "bob"
     row = builder.store.get_definition(def_id)
     assert row["status"] == "approved" and row["approved_by"] == "bob" and row["created_by"] == "alice"
@@ -211,11 +228,17 @@ def test_other_tenant_resources_are_not_visible(api):
     assert client.get(f"/cohorts/{def_id}", headers=h(toks["eve"])).status_code == 404
     assert client.get(f"/cohorts/{def_id}/sql", headers=h(toks["eve"])).status_code == 404
     assert def_id not in [d["cohort_definition_id"] for d in client.get("/cohorts", headers=h(toks["eve"])).json()]
-    assert client.post(f"/cohorts/{def_id}/review", json={"decision": "approved"},
-                       headers=h(toks["eve"])).status_code == 404
+    assert (
+        client.post(f"/cohorts/{def_id}/review", json={"decision": "approved"}, headers=h(toks["eve"])).status_code
+        == 404
+    )
     assert client.post(f"/cohorts/{def_id}/execute", headers=h(toks["eve"])).status_code == 404
-    assert client.post("/cohorts", json={"ir": EXAMPLE_IR, "parent_definition_id": def_id},
-                       headers=h(toks["eve"])).status_code == 404
+    assert (
+        client.post(
+            "/cohorts", json={"ir": EXAMPLE_IR, "parent_definition_id": def_id}, headers=h(toks["eve"])
+        ).status_code
+        == 404
+    )
     # same tenant and admin can see it
     assert client.get(f"/cohorts/{def_id}", headers=h(toks["victor"])).status_code == 200
     assert client.get(f"/cohorts/{def_id}", headers=h(toks["root"])).status_code == 200
@@ -227,18 +250,22 @@ def test_run_traces_visible_to_owner_and_reviewers_only(api):
     assert r.status_code == 200, r.text
     run_id = r.json()["run_id"]
     assert client.get(f"/runs/{run_id}", headers=h(toks["alice"])).status_code == 200
-    assert client.get(f"/runs/{run_id}", headers=h(toks["bob"])).status_code == 200       # reviewer, same tenant
-    assert client.get(f"/runs/{run_id}", headers=h(toks["dana"])).status_code == 200      # reviewer role
-    assert client.get(f"/runs/{run_id}", headers=h(toks["victor"])).status_code == 403    # viewer: no traces
-    assert client.get(f"/runs/{run_id}", headers=h(toks["eve"])).status_code == 404       # other tenant
+    assert client.get(f"/runs/{run_id}", headers=h(toks["bob"])).status_code == 200  # reviewer, same tenant
+    assert client.get(f"/runs/{run_id}", headers=h(toks["dana"])).status_code == 200  # reviewer role
+    assert client.get(f"/runs/{run_id}", headers=h(toks["victor"])).status_code == 403  # viewer: no traces
+    assert client.get(f"/runs/{run_id}", headers=h(toks["eve"])).status_code == 404  # other tenant
     assert client.post(f"/runs/{run_id}/replay", headers=h(toks["alice"])).json()["identical"] is True
     assert client.post(f"/runs/{run_id}/replay", headers=h(toks["eve"])).status_code == 404
 
 
 # ---- configuration safety -----------------------------------------------------------------
 def test_production_refuses_dev_bypass():
-    env = {"CB_ENV": "production", "CB_AUTH_DEV_BYPASS": "true", "CB_AUTH_DEV_SUBJECT": "dev",
-           "CB_AUTH_DEV_ROLES": "admin"}
+    env = {
+        "CB_ENV": "production",
+        "CB_AUTH_DEV_BYPASS": "true",
+        "CB_AUTH_DEV_SUBJECT": "dev",
+        "CB_AUTH_DEV_ROLES": "admin",
+    }
     with pytest.raises(ConfigError, match="not allowed when CB_ENV=production"):
         SecurityConfig.from_env(env)
 
@@ -260,8 +287,10 @@ def test_production_refuses_draft_execution_and_bad_values():
 
 def test_create_app_refuses_unsafe_config(builder):
     with pytest.raises(ConfigError):
-        create_app(builder, SecurityConfig(environment="production", dev_bypass=True, dev_subject="d",
-                                           dev_roles=frozenset({"admin"})))
+        create_app(
+            builder,
+            SecurityConfig(environment="production", dev_bypass=True, dev_subject="d", dev_roles=frozenset({"admin"})),
+        )
 
 
 def test_dev_bypass_requires_explicit_identity():
@@ -271,11 +300,17 @@ def test_dev_bypass_requires_explicit_identity():
 
 def test_dev_bypass_in_development(builder, tokens):
     path, toks = tokens
-    client = make_client(builder, path, environment="development", dev_bypass=True, dev_subject="devuser",
-                         dev_roles=frozenset({"viewer"}))
+    client = make_client(
+        builder,
+        path,
+        environment="development",
+        dev_bypass=True,
+        dev_subject="devuser",
+        dev_roles=frozenset({"viewer"}),
+    )
     assert client.get("/me").json()["auth_method"] == "dev-bypass"
-    assert client.post("/cohorts", json={"ir": EXAMPLE_IR}).status_code == 403   # bypass roles still apply
-    assert client.get("/me", headers=h("x" * 40)).status_code == 401             # bad tokens still rejected
+    assert client.post("/cohorts", json={"ir": EXAMPLE_IR}).status_code == 403  # bypass roles still apply
+    assert client.get("/me", headers=h("x" * 40)).status_code == 401  # bad tokens still rejected
 
 
 def test_token_file_must_hold_hashes_and_known_roles(tmp_path):

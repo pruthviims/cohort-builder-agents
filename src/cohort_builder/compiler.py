@@ -3,6 +3,7 @@
 The SQL uses only portable constructs (date + integer, date - date,
 COUNT(*) FILTER, window functions), so it runs on DuckDB and PostgreSQL.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -55,8 +56,10 @@ class Compiler:
             exact = [i.concept_id for i in items if not i.include_descendants]
             parts = []
             if desc:
-                parts.append(f"SELECT descendant_concept_id AS concept_id FROM {self.vocab}.concept_ancestor "
-                             f"WHERE ancestor_concept_id IN ({_id_list(desc)})")
+                parts.append(
+                    f"SELECT descendant_concept_id AS concept_id FROM {self.vocab}.concept_ancestor "
+                    f"WHERE ancestor_concept_id IN ({_id_list(desc)})"
+                )
             if exact:
                 parts.append(f"SELECT concept_id FROM {self.vocab}.concept WHERE concept_id IN ({_id_list(exact)})")
             return "\n      UNION ".join(parts) if parts else None
@@ -72,13 +75,17 @@ class Compiler:
         rows = []
         for analyte_id, a in sorted(self.ont.analytes.items()):
             for conv in sorted(a.get("conversions", []), key=lambda c: c["from_unit"]):
-                rows.append(f"({analyte_id}, {int(conv['from_unit'])}, {int(a['canonical_unit'])}, "
-                            f"{float(conv['factor'])!r}, {float(conv['offset'])!r})")
+                rows.append(
+                    f"({analyte_id}, {int(conv['from_unit'])}, {int(a['canonical_unit'])}, "
+                    f"{float(conv['factor'])!r}, {float(conv['offset'])!r})"
+                )
         if not rows:
             return None
-        return (f"  SELECT ca.descendant_concept_id AS measurement_concept_id, v.from_unit, v.to_unit, v.factor, "
-                f"v.offset_\n  FROM (VALUES {', '.join(rows)}) AS v(analyte_id, from_unit, to_unit, factor, offset_)\n"
-                f"  JOIN {self.vocab}.concept_ancestor ca ON ca.ancestor_concept_id = v.analyte_id")
+        return (
+            f"  SELECT ca.descendant_concept_id AS measurement_concept_id, v.from_unit, v.to_unit, v.factor, "
+            f"v.offset_\n  FROM (VALUES {', '.join(rows)}) AS v(analyte_id, from_unit, to_unit, factor, offset_)\n"
+            f"  JOIN {self.vocab}.concept_ancestor ca ON ca.ancestor_concept_id = v.analyte_id"
+        )
 
     def _value_sql(self, vf: ValueFilter, has_unit_norm: bool) -> tuple[str, str]:
         """Returns (extra join, condition) for a measurement value filter, normalizing units."""
@@ -86,8 +93,10 @@ class Compiler:
         val, unit = f"e.{m['value_col']}", f"e.{m['unit_col']}"
         u = int(vf.unit_concept_id)
         if has_unit_norm:
-            join = (f"\n      LEFT JOIN unit_norm u ON u.measurement_concept_id = e.{m['concept_col']} "
-                    f"AND u.from_unit = {unit} AND u.to_unit = {u}")
+            join = (
+                f"\n      LEFT JOIN unit_norm u ON u.measurement_concept_id = e.{m['concept_col']} "
+                f"AND u.from_unit = {unit} AND u.to_unit = {u}"
+            )
             expr = f"(CASE WHEN {unit} = {u} THEN {val} ELSE {val} * u.factor + u.offset_ END)"
         else:
             join, expr = "", f"(CASE WHEN {unit} = {u} THEN {val} END)"
@@ -130,17 +139,21 @@ class Compiler:
             join, cond = self._value_sql(c.value_filter, has_unit_norm)
             cond = f"\n        AND {cond}"
         cond += self._claims_conditions(c.entity, c.claim_status, c.dx_position)
-        frm = (f"FROM {m['table']} e\n"
-               f"      JOIN cs_expanded c ON c.cs_id = {_lit(c.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
-               f"{join}\n"
-               f"      WHERE e.person_id = b.person_id AND {start} >= {lo} AND {start} <= {hi}{cond}")
+        frm = (
+            f"FROM {m['table']} e\n"
+            f"      JOIN cs_expanded c ON c.cs_id = {_lit(c.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
+            f"{join}\n"
+            f"      WHERE e.person_id = b.person_id AND {start} >= {lo} AND {start} <= {hi}{cond}"
+        )
         counted = f"COUNT(DISTINCT {start})" if c.count_by == "dates" else "COUNT(*)"
         if c.min_span_days is not None:
             if c.occurrence != "at_least":
                 raise ValueError("min_span_days requires occurrence at_least")
             # at least N qualifying events whose first and last dates are >= min_span_days apart
-            return (f"((SELECT CASE WHEN {counted} >= {int(c.count)} AND MAX({start}) - MIN({start}) >= "
-                    f"{int(c.min_span_days)} THEN 1 ELSE 0 END {frm}) = 1)")
+            return (
+                f"((SELECT CASE WHEN {counted} >= {int(c.count)} AND MAX({start}) - MIN({start}) >= "
+                f"{int(c.min_span_days)} THEN 1 ELSE 0 END {frm}) = 1)"
+            )
         op = {"at_least": ">=", "at_most": "<=", "exactly": "="}[c.occurrence]
         return f"((SELECT {counted} {frm}) {op} {int(c.count)})"
 
@@ -149,8 +162,11 @@ class Compiler:
         needs_value = any(x.value_filter for x in [*ir.inclusion, *ir.exclusion]) or ir.index_event.value_filter
         unit_norm = self._unit_norm_sql() if needs_value else None
 
-        ctes = ["cs_expanded AS (\n" + "\n  UNION ALL\n".join(
-            self._concept_set_sql(cs) for cs in sorted(ir.concept_sets, key=lambda s: s.id)) + "\n)"]
+        ctes = [
+            "cs_expanded AS (\n"
+            + "\n  UNION ALL\n".join(self._concept_set_sql(cs) for cs in sorted(ir.concept_sets, key=lambda s: s.id))
+            + "\n)"
+        ]
         if unit_norm:
             ctes.append(f"unit_norm AS (\n{unit_norm}\n)")
 
@@ -166,10 +182,12 @@ class Compiler:
         ctes.append(
             f"index_candidates AS (\n"
             f"  SELECT e.person_id, e.{m['start_col']} AS index_date,\n"
-            f"         ROW_NUMBER() OVER (PARTITION BY e.person_id ORDER BY e.{m['start_col']}, e.{m['concept_col']}) AS rn\n"
+            f"         ROW_NUMBER() OVER (PARTITION BY e.person_id "
+            f"ORDER BY e.{m['start_col']}, e.{m['concept_col']}) AS rn\n"
             f"  FROM {m['table']} e\n"
             f"  JOIN cs_expanded c ON c.cs_id = {_lit(ie.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
-            f"{join}{cond}\n)")
+            f"{join}{cond}\n)"
+        )
         where = "WHERE rn = 1" if ie.first_occurrence_only else ""
         ctes.append(f"index_events AS (\n  SELECT DISTINCT person_id, index_date FROM index_candidates {where}\n)")
 
@@ -182,34 +200,50 @@ class Compiler:
             f"  FROM index_events ie\n"
             f"  JOIN {op['table']} op ON op.person_id = ie.person_id\n"
             f"   AND ie.index_date BETWEEN op.{op['start_col']} AND op.{op['end_col']}\n"
-            f"  JOIN {pm['table']} p ON p.{pm['person_key']} = ie.person_id\n)")
+            f"  JOIN {pm['table']} p ON p.{pm['person_key']} = ie.person_id\n)"
+        )
 
         # rules: (label, boolean SQL meaning "passes")
         rules: list[tuple[str, str]] = []
         if ir.prior_observation_days:
-            rules.append((f"At least {ir.prior_observation_days} days of observation before index",
-                          f"(b.index_date - b.op_start) >= {int(ir.prior_observation_days)}"))
+            rules.append(
+                (
+                    f"At least {ir.prior_observation_days} days of observation before index",
+                    f"(b.index_date - b.op_start) >= {int(ir.prior_observation_days)}",
+                )
+            )
         if ir.post_observation_days:
-            rules.append((f"At least {ir.post_observation_days} days of observation after index",
-                          f"(b.op_end - b.index_date) >= {int(ir.post_observation_days)}"))
+            rules.append(
+                (
+                    f"At least {ir.post_observation_days} days of observation after index",
+                    f"(b.op_end - b.index_date) >= {int(ir.post_observation_days)}",
+                )
+            )
         d = ir.demographics
         if d.age_min is not None or d.age_max is not None:
             lo = d.age_min if d.age_min is not None else 0
             hi = d.age_max if d.age_max is not None else 200
-            label = (f"Age at index >= {lo}" if d.age_max is None else
-                     f"Age at index <= {hi}" if d.age_min is None else f"Age at index {lo}-{hi}")
+            label = (
+                f"Age at index >= {lo}"
+                if d.age_max is None
+                else f"Age at index <= {hi}"
+                if d.age_min is None
+                else f"Age at index {lo}-{hi}"
+            )
             rules.append((label, f"b.age_at_index BETWEEN {int(lo)} AND {int(hi)}"))
         if d.gender_concept_ids:
             rules.append(("Gender", f"b.gender_concept_id IN ({_id_list(d.gender_concept_ids)})"))
         for c in ir.inclusion:
             rules.append((f"Inclusion: {c.name}", self._criterion_sql(c, unit_norm is not None)))
         for c in ir.exclusion:
-            rules.append((f"Exclusion: {c.name}",
-                          f"NOT {self._criterion_sql(c, unit_norm is not None)}"))
+            rules.append((f"Exclusion: {c.name}", f"NOT {self._criterion_sql(c, unit_norm is not None)}"))
 
         flag_cols = ",\n".join(f"    {expr} AS r{i + 1}" for i, (_, expr) in enumerate(rules))
-        flags = ("flags AS (\n  SELECT b.person_id, b.index_date, b.op_start, b.op_end"
-                 + (f",\n{flag_cols}" if rules else "") + "\n  FROM base b\n)")
+        flags = (
+            "flags AS (\n  SELECT b.person_id, b.index_date, b.op_start, b.op_end"
+            + (f",\n{flag_cols}" if rules else "")
+            + "\n  FROM base b\n)"
+        )
         ctes.append(flags)
         prefix = "WITH " + ",\n".join(ctes) + "\n"
 
@@ -218,25 +252,30 @@ class Compiler:
             end_expr = f"LEAST(index_date + ({int(ir.exit.days or 0)}), op_end)"
         else:
             end_expr = "op_end"
-        cohort_sql = (prefix + ", ranked AS (\n"
-                      f"  SELECT person_id, index_date, op_end,\n"
-                      # deterministic: earliest qualifying index; if observation periods overlap, the one
-                      # starting earliest (longest history), then the one ending latest
-                      f"         ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY index_date, op_start, "
-                      f"op_end DESC) AS rn\n"
-                      f"  FROM flags WHERE {all_pass}\n)\n"
-                      f"SELECT person_id AS subject_id, index_date AS cohort_start_date, {end_expr} AS cohort_end_date\n"
-                      f"FROM ranked WHERE rn = 1\nORDER BY subject_id")
+        cohort_sql = (
+            prefix + ", ranked AS (\n"
+            f"  SELECT person_id, index_date, op_end,\n"
+            # deterministic: earliest qualifying index; if observation periods overlap, the one
+            # starting earliest (longest history), then the one ending latest
+            f"         ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY index_date, op_start, "
+            f"op_end DESC) AS rn\n"
+            f"  FROM flags WHERE {all_pass}\n)\n"
+            f"SELECT person_id AS subject_id, index_date AS cohort_start_date, {end_expr} AS cohort_end_date\n"
+            f"FROM ranked WHERE rn = 1\nORDER BY subject_id"
+        )
 
         # rule 0 counts people with a qualifying index event *before* the observation-period join, so people
         # lost for missing/non-covering observation periods (or missing person records) are visible
-        cols = ["  (SELECT COUNT(DISTINCT person_id) FROM index_events) AS rule_0",
-                "  COUNT(DISTINCT person_id) AS rule_1"]
+        cols = [
+            "  (SELECT COUNT(DISTINCT person_id) FROM index_events) AS rule_0",
+            "  COUNT(DISTINCT person_id) AS rule_1",
+        ]
         for i in range(len(rules)):
             cond = " AND ".join(f"r{j + 1}" for j in range(i + 1))
             cols.append(f"  COUNT(DISTINCT person_id) FILTER (WHERE {cond}) AS rule_{i + 2}")
         attrition_sql = prefix + "SELECT\n" + ",\n".join(cols) + "\nFROM flags"
 
-        names = ["Persons with a qualifying index event",
-                 "Index event within an observation period"] + [r[0] for r in rules]
+        names = ["Persons with a qualifying index event", "Index event within an observation period"] + [
+            r[0] for r in rules
+        ]
         return CompiledCohort(cohort_sql=cohort_sql, attrition_sql=attrition_sql, rule_names=names)

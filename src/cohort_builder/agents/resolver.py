@@ -4,6 +4,7 @@ Grounding rule enforced in code: the agent may only submit concept IDs that
 appeared in its own tool results during this resolution, so it cannot invent
 IDs. Curated concept sets, when chosen, are copied verbatim from the ontology.
 """
+
 from __future__ import annotations
 
 import json
@@ -29,34 +30,56 @@ class ResolvedConceptSet(BaseModel):
 class SubmitConceptSet(BaseModel):
     name: str = Field(description="Human-readable concept set name")
     curated_key: str | None = Field(default=None, description="Key of an approved curated set to reuse verbatim")
-    items: list[ConceptSetItem] = Field(default_factory=list,
-                                        description="Required unless curated_key is set. IDs must come from tool results")
+    items: list[ConceptSetItem] = Field(
+        default_factory=list, description="Required unless curated_key is set. IDs must come from tool results"
+    )
     rationale: str = Field(description="One or two sentences on why these concepts match the mention")
 
 
 TOOLS: list[dict[str, Any]] = [
-    {"name": "search_curated_concept_sets",
-     "description": "Search organization-approved concept sets. Always try this first.",
-     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-    {"name": "search_concepts",
-     "description": "Search the standardized vocabulary by name, synonym or code. Returns standard concepts by default.",
-     "input_schema": {"type": "object", "properties": {
-         "query": {"type": "string"},
-         "include_non_standard": {"type": "boolean", "default": False}}, "required": ["query"]}},
-    {"name": "get_concept",
-     "description": "Details for a concept: parents, number of descendants, and Maps-to targets if non-standard.",
-     "input_schema": {"type": "object", "properties": {"concept_id": {"type": "integer"}},
-                      "required": ["concept_id"]}},
-    {"name": "get_descendants",
-     "description": "List descendants of a concept (what include_descendants would cover).",
-     "input_schema": {"type": "object", "properties": {"concept_id": {"type": "integer"},
-                                                        "limit": {"type": "integer", "default": 25}},
-                      "required": ["concept_id"]}},
-    {"name": "lookup_code",
-     "description": "Find a concept by source code (e.g. ICD-10 'E11.9', LOINC '4548-4') and its standard mapping.",
-     "input_schema": {"type": "object", "properties": {"code": {"type": "string"},
-                                                        "vocabulary_id": {"type": "string"}},
-                      "required": ["code"]}},
+    {
+        "name": "search_curated_concept_sets",
+        "description": "Search organization-approved concept sets. Always try this first.",
+        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    },
+    {
+        "name": "search_concepts",
+        "description": (
+            "Search the standardized vocabulary by name, synonym or code. Returns standard concepts by default."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "include_non_standard": {"type": "boolean", "default": False}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_concept",
+        "description": "Details for a concept: parents, number of descendants, and Maps-to targets if non-standard.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"concept_id": {"type": "integer"}},
+            "required": ["concept_id"],
+        },
+    },
+    {
+        "name": "get_descendants",
+        "description": "List descendants of a concept (what include_descendants would cover).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"concept_id": {"type": "integer"}, "limit": {"type": "integer", "default": 25}},
+            "required": ["concept_id"],
+        },
+    },
+    {
+        "name": "lookup_code",
+        "description": "Find a concept by source code (e.g. ICD-10 'E11.9', LOINC '4548-4') and its standard mapping.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"code": {"type": "string"}, "vocabulary_id": {"type": "string"}},
+            "required": ["code"],
+        },
+    },
 ]
 
 
@@ -83,8 +106,9 @@ class _Session:
         if name == "search_curated_concept_sets":
             result = ont.search_curated(args["query"], domain=self.domain)
         elif name == "search_concepts":
-            result = v.search_concepts(args["query"], domain=self.domain,
-                                       standard_only=not args.get("include_non_standard", False))
+            result = v.search_concepts(
+                args["query"], domain=self.domain, standard_only=not args.get("include_non_standard", False)
+            )
         elif name == "get_concept":
             result = v.get_concept(int(args["concept_id"])) or {"error": "concept not found"}
         elif name == "get_descendants":
@@ -106,9 +130,14 @@ class _Session:
             if cs["domain"] != self.domain:
                 return None, f"curated set domain {cs['domain']} != required domain {self.domain}"
             items = [ConceptSetItem(**i) for i in cs["items"]]
-            return ResolvedConceptSet(mention_key="", name=cs["label"], domain=self.domain,
-                                      source=f"curated:{sub.curated_key}@v{cs['version']}", items=items,
-                                      rationale=sub.rationale), None
+            return ResolvedConceptSet(
+                mention_key="",
+                name=cs["label"],
+                domain=self.domain,
+                source=f"curated:{sub.curated_key}@v{cs['version']}",
+                items=items,
+                rationale=sub.rationale,
+            ), None
         if not sub.items:
             return None, "items is empty; provide concept IDs or a curated_key"
         problems = []
@@ -130,22 +159,28 @@ class _Session:
         if problems:
             return None, "Submission rejected:\n- " + "\n- ".join(problems)
         items = sorted(sub.items, key=lambda i: (i.concept_id, i.is_excluded))
-        return ResolvedConceptSet(mention_key="", name=sub.name, domain=self.domain, source="resolved",
-                                  items=items, rationale=sub.rationale), None
+        return ResolvedConceptSet(
+            mention_key="", name=sub.name, domain=self.domain, source="resolved", items=items, rationale=sub.rationale
+        ), None
 
 
-def resolve_mention(ctx: AgentContext, mention: ConceptMention, query: str,
-                    feedback: str | None = None) -> ResolvedConceptSet:
+def resolve_mention(
+    ctx: AgentContext, mention: ConceptMention, query: str, feedback: str | None = None
+) -> ResolvedConceptSet:
     domain = ctx.ontology.entity_domain(mention.entity)
     prompt = ctx.prompt("concept_resolver")
     system = prompt.render(ontology=ctx.ontology.summary_for_prompt())
-    submit_tool = {"name": "submit_concept_set",
-                   "description": "Submit the final concept set for this mention. Ends the task.",
-                   "input_schema": _submit_schema()}
+    submit_tool = {
+        "name": "submit_concept_set",
+        "description": "Submit the final concept set for this mention. Ends the task.",
+        "input_schema": _submit_schema(),
+    }
     tools = TOOLS + [submit_tool]
-    user = (f"<cohort_request>{query.strip()}</cohort_request>\n"
-            f"<mention key=\"{mention.key}\" entity=\"{mention.entity}\" domain=\"{domain}\">"
-            f"{mention.text}</mention>")
+    user = (
+        f"<cohort_request>{query.strip()}</cohort_request>\n"
+        f'<mention key="{mention.key}" entity="{mention.entity}" domain="{domain}">'
+        f"{mention.text}</mention>"
+    )
     if mention.notes:
         user += f"\n<notes>{mention.notes}</notes>"
     if feedback:
@@ -154,8 +189,15 @@ def resolve_mention(ctx: AgentContext, mention: ConceptMention, query: str,
     session = _Session(ctx, domain)
 
     for _turn in range(ctx.settings.max_resolver_turns):
-        resp = ctx.llm.create(prompt=prompt, system=system, messages=messages, tools=tools,
-                              tool_choice={"type": "any"}, run_id=ctx.run_id, step_id=ctx.step_id)
+        resp = ctx.llm.create(
+            prompt=prompt,
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice={"type": "any"},
+            run_id=ctx.run_id,
+            step_id=ctx.step_id,
+        )
         messages.append({"role": "assistant", "content": resp["content"]})
         results = []
         for block in resp["content"]:
@@ -172,8 +214,7 @@ def resolve_mention(ctx: AgentContext, mention: ConceptMention, query: str,
                 results.append({"type": "tool_result", "tool_use_id": block["id"], "is_error": True, "content": err})
             else:
                 out = session.run_tool(block["name"], block["input"])
-                results.append({"type": "tool_result", "tool_use_id": block["id"],
-                                "content": tool_result_text(out)})
+                results.append({"type": "tool_result", "tool_use_id": block["id"], "content": tool_result_text(out)})
         if not results:
             results = [{"type": "text", "text": "Call a tool, or submit_concept_set when done."}]
         messages.append({"role": "user", "content": results})

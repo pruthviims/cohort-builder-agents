@@ -1,5 +1,6 @@
 """Clinical / data-coverage caveats: absence of evidence, lookback beyond observed data, partial capture,
 missing observation definitions, and caveats carried into execution metadata."""
+
 from __future__ import annotations
 
 import copy
@@ -25,8 +26,15 @@ def warnings(issues) -> list[str]:
 def with_exclusion(base: dict, window: dict, prior: int = 365, post: int = 0) -> CohortDefinition:
     data = copy.deepcopy(base)
     data["prior_observation_days"], data["post_observation_days"] = prior, post
-    data["exclusion"] = [{"id": "x1", "name": "prior depression", "entity": "ConditionOccurrence",
-                          "concept_set_id": "cs_depression", "window": window}]
+    data["exclusion"] = [
+        {
+            "id": "x1",
+            "name": "prior depression",
+            "entity": "ConditionOccurrence",
+            "concept_set_id": "cs_depression",
+            "window": window,
+        }
+    ]
     return CohortDefinition.model_validate(data)
 
 
@@ -50,28 +58,36 @@ def test_presence_based_criteria_have_no_absence_caveat(builder):
     assert not any("did not happen" in m for m in w)
 
 
-@pytest.mark.parametrize("window,prior,expect", [
-    ({"start_days": -730, "end_days": 0}, 365, "looks back 730 days but only 365"),
-    ({"start_days": None, "end_days": 0}, 0, "history may be empty"),
-    ({"start_days": None, "end_days": 0}, 365, "guaranteed to be at least 365 days"),
-])
+@pytest.mark.parametrize(
+    "window,prior,expect",
+    [
+        ({"start_days": -730, "end_days": 0}, 365, "looks back 730 days but only 365"),
+        ({"start_days": None, "end_days": 0}, 0, "history may be empty"),
+        ({"start_days": None, "end_days": 0}, 365, "guaranteed to be at least 365 days"),
+    ],
+)
 def test_lookback_beyond_observable_history(builder, window, prior, expect):
     w = warnings(validate(with_exclusion(SERT, window, prior=prior), builder.ontology, builder.vocab)[0])
     assert any(expect in m for m in w), w
 
 
 def test_no_lookback_caveat_when_observation_covers_window(builder):
-    w = warnings(validate(with_exclusion(SERT, {"start_days": -365, "end_days": 0}, prior=365),
-                          builder.ontology, builder.vocab)[0])
+    w = warnings(
+        validate(with_exclusion(SERT, {"start_days": -365, "end_days": 0}, prior=365), builder.ontology, builder.vocab)[
+            0
+        ]
+    )
     assert not any("looks back" in m for m in w)
 
 
 def test_follow_up_beyond_required_observation(builder):
-    w = warnings(validate(with_exclusion(SERT, {"start_days": 0, "end_days": 90}, post=0),
-                          builder.ontology, builder.vocab)[0])
+    w = warnings(
+        validate(with_exclusion(SERT, {"start_days": 0, "end_days": 90}, post=0), builder.ontology, builder.vocab)[0]
+    )
     assert any("looks 90 days after index but only 0 days of follow-up" in m for m in w)
-    w = warnings(validate(with_exclusion(SERT, {"start_days": 0, "end_days": 90}, post=90),
-                          builder.ontology, builder.vocab)[0])
+    w = warnings(
+        validate(with_exclusion(SERT, {"start_days": 0, "end_days": 90}, post=90), builder.ontology, builder.vocab)[0]
+    )
     assert not any("days after index" in m for m in w)
 
 

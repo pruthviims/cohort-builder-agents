@@ -18,6 +18,7 @@ Governance:
 Run:  cohort-builder mcp                      (stdio, for a local client)
       cohort-builder mcp --http --port 8765   (shared server; set CB_MCP_TOKEN)
 """
+
 from __future__ import annotations
 
 import hmac
@@ -51,13 +52,17 @@ Saved definitions are drafts. A human reviewer must approve them outside this to
 before `execute_approved_cohort` will run them. No tool returns patient-level data.
 """
 
+
 class CohortDefinitionInput(CohortDefinition):
     """Cohort definition as submitted by an MCP client; versions are filled in by the server."""
+
     # pydantic allows widening a field in a subclass; the server fills these before validation
     ontology_version: str | None = Field(  # type: ignore[assignment]
-        default=None, description="Leave empty; the server sets it")
+        default=None, description="Leave empty; the server sets it"
+    )
     vocabulary_version: str | None = Field(  # type: ignore[assignment]
-        default=None, description="Leave empty; the server sets it")
+        default=None, description="Leave empty; the server sets it"
+    )
 
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -69,8 +74,9 @@ def _j(obj: Any) -> Any:
     return json.loads(json.dumps(obj, default=str))
 
 
-def create_server(builder: CohortBuilder | None = None, acting_user: str | None = None,
-                  acting_tenant: str | None = None) -> MCPServer:
+def create_server(
+    builder: CohortBuilder | None = None, acting_user: str | None = None, acting_tenant: str | None = None
+) -> MCPServer:
     state: dict[str, Any] = {"builder": builder}
     lock = threading.RLock()  # a single DuckDB connection is shared: serialize access
     user = f"mcp:{acting_user or os.environ.get('CB_MCP_USER', 'anonymous')}"
@@ -98,9 +104,12 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
         with lock:
             r = b().ask(request, user_id=user, tenant=tenant)
             out = r.as_dict()
-            out["next_step"] = ("A human reviewer must approve definition "
-                                f"{r.cohort_definition_id} outside MCP before it can be executed."
-                                if r.status == "draft" else "Resolve the issues, then try again or edit the IR.")
+            out["next_step"] = (
+                "A human reviewer must approve definition "
+                f"{r.cohort_definition_id} outside MCP before it can be executed."
+                if r.status == "draft"
+                else "Resolve the issues, then try again or edit the IR."
+            )
             return _j(out)
 
     @mcp.tool(annotations=READ_ONLY)
@@ -127,9 +136,14 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
         that cohort definitions must follow."""
         with lock:
             ont = b().ontology
-            return _j({"ontology_version": ont.version, "ontology_hash": ont.content_hash,
-                       "vocabulary_version": b().vocab.version(),
-                       "summary": yaml.safe_load(ont.summary_for_prompt())})
+            return _j(
+                {
+                    "ontology_version": ont.version,
+                    "ontology_hash": ont.content_hash,
+                    "vocabulary_version": b().vocab.version(),
+                    "summary": yaml.safe_load(ont.summary_for_prompt()),
+                }
+            )
 
     @mcp.tool(annotations=READ_ONLY)
     def search_curated_concept_sets(query: str, domain: str | None = None) -> list[dict]:
@@ -139,8 +153,9 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
             return _j(b().ontology.search_curated(query, domain=domain))
 
     @mcp.tool(annotations=READ_ONLY)
-    def search_concepts(query: str, domain: str | None = None, include_non_standard: bool = False,
-                        limit: int = 10) -> list[dict]:
+    def search_concepts(
+        query: str, domain: str | None = None, include_non_standard: bool = False, limit: int = 10
+    ) -> list[dict]:
         """Search the OMOP vocabulary by name, synonym or code. Standard concepts only by default."""
         with lock:
             return _j(b().vocab.search_concepts(query, domain, not include_non_standard, limit))
@@ -175,14 +190,16 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
                 return {"valid": False, "schema_errors": _j(exc.errors(include_url=False))}
             bb = b()
             issues, attrition = validate(ir, bb.ontology, bb.vocab, bb.executor)
-            return _j({
-                "valid": not any(i.severity == "error" for i in issues),
-                "issues": [i.as_dict() for i in issues],
-                "attrition": attrition.suppressed(bb.executor.min_cell) if attrition else None,
-                "explanation": bb.explainer.explain(ir),
-                "content_hash": ir.content_hash(),
-                "semantic_hash": ir.semantic_hash(),
-            })
+            return _j(
+                {
+                    "valid": not any(i.severity == "error" for i in issues),
+                    "issues": [i.as_dict() for i in issues],
+                    "attrition": attrition.suppressed(bb.executor.min_cell) if attrition else None,
+                    "explanation": bb.explainer.explain(ir),
+                    "content_hash": ir.content_hash(),
+                    "semantic_hash": ir.semantic_hash(),
+                }
+            )
 
     @mcp.tool(annotations=WRITES)
     def save_cohort_definition(definition: CohortDefinitionInput, parent_definition_id: int | None = None) -> dict:
@@ -199,8 +216,15 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
                 return {"saved": False, "error": str(exc).strip("'\"")}
             saved_row = b().store.get_definition(def_id) or {}
             status = saved_row.get("status")
-            return _j({"saved": True, "cohort_definition_id": def_id, "status": status, "issues": issues,
-                       "semantic_hash": ir.semantic_hash()})
+            return _j(
+                {
+                    "saved": True,
+                    "cohort_definition_id": def_id,
+                    "status": status,
+                    "issues": issues,
+                    "semantic_hash": ir.semantic_hash(),
+                }
+            )
 
     # ---- definitions & execution ---------------------------------------------------
     @mcp.tool(annotations=READ_ONLY)
@@ -286,7 +310,8 @@ def create_server(builder: CohortBuilder | None = None, acting_user: str | None 
             "concept IDs returned by the tools.\n"
             "4. Call validate_cohort and fix every error. Show me the explanation and attrition, and list "
             "every assumption you made.\n"
-            "5. When I confirm, call save_cohort_definition. Remind me that a human reviewer must approve it.")
+            "5. When I confirm, call save_cohort_definition. Remind me that a human reviewer must approve it."
+        )
 
     return mcp
 
@@ -303,9 +328,11 @@ def run_http(host: str = "127.0.0.1", port: int = 8765, builder: CohortBuilder |
     allowed = [h.strip() for h in os.environ.get("CB_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
     security = None
     if allowed:
-        security = TransportSecuritySettings(enable_dns_rebinding_protection=True,
-                                             allowed_hosts=allowed + ["127.0.0.1:*", "localhost:*"],
-                                             allowed_origins=[f"https://{h.split(':')[0]}" for h in allowed])
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed + ["127.0.0.1:*", "localhost:*"],
+            allowed_origins=[f"https://{h.split(':')[0]}" for h in allowed],
+        )
     elif not local:
         raise SystemExit("Set CB_MCP_ALLOWED_HOSTS (e.g. cohorts.example.org:*) when serving beyond localhost.")
     app = create_server(builder).streamable_http_app(host=host, transport_security=security)
@@ -322,9 +349,13 @@ class BearerTokenMiddleware:
         if scope["type"] == "http":
             headers = dict(scope.get("headers") or [])
             if not hmac.compare_digest(headers.get(b"authorization", b""), b"Bearer " + self.token):
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"application/json"),
-                                        (b"www-authenticate", b"Bearer")]})
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [(b"content-type", b"application/json"), (b"www-authenticate", b"Bearer")],
+                    }
+                )
                 await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
                 return
         await self.app(scope, receive, send)

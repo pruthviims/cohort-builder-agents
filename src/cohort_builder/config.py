@@ -1,4 +1,5 @@
 """Runtime settings, read from environment variables (CB_*)."""
+
 from __future__ import annotations
 
 import os
@@ -33,9 +34,9 @@ class Settings:
     max_resolver_turns: int = 8
     # execution limits and DuckDB hardening
     query_timeout_seconds: float = 300.0
-    duckdb_memory_limit: str | None = None      # e.g. "4GB"
+    duckdb_memory_limit: str | None = None  # e.g. "4GB"
     duckdb_threads: int | None = None
-    lock_external_access: bool = True           # block file/network access from SQL after setup
+    lock_external_access: bool = True  # block file/network access from SQL after setup
     prompt_versions: dict[str, str] = field(
         default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2"}
     )
@@ -58,6 +59,7 @@ class Settings:
             query_timeout_seconds=float(env.get("CB_QUERY_TIMEOUT_SECONDS", base.query_timeout_seconds)),
             duckdb_memory_limit=env.get("CB_DUCKDB_MEMORY_LIMIT") or None,
             duckdb_threads=int(env["CB_DUCKDB_THREADS"]) if env.get("CB_DUCKDB_THREADS") else None,
-            lock_external_access=(env.get("CB_DUCKDB_LOCK_EXTERNAL_ACCESS", "true").strip().lower()
-                                  not in ("0", "false", "no", "off")),
+            lock_external_access=(
+                env.get("CB_DUCKDB_LOCK_EXTERNAL_ACCESS", "true").strip().lower() not in ("0", "false", "no", "off")
+            ),
         )

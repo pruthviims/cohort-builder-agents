@@ -1,4 +1,5 @@
 """Command-line interface: `cohort-builder <command>`."""
+
 from __future__ import annotations
 
 import argparse
@@ -21,10 +22,10 @@ def _attrition_table(rows: list[dict]) -> str:
 
 
 def _builder(settings: Settings):
+    import duckdb
+
     from .orchestrator import CohortBuilder
     from .security import ConfigError, GovernancePolicy, SecurityConfig
-
-    import duckdb
 
     if not settings.db_path.exists():
         sys.exit(f"Database {settings.db_path} not found. Run `cohort-builder init-demo` (or load-athena) first.")
@@ -74,8 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("execute", help="materialize an approved definition into results.cohort")
     s.add_argument("definition_id", type=int)
     s.add_argument("--user", default="cli")
-    s.add_argument("--allow-draft", action="store_true",
-                   help="run a draft (only honored when CB_ENV=development and CB_ALLOW_DRAFT_EXECUTION=true)")
+    s.add_argument(
+        "--allow-draft",
+        action="store_true",
+        help="run a draft (only honored when CB_ENV=development and CB_ALLOW_DRAFT_EXECUTION=true)",
+    )
     s = sub.add_parser("run", help="show a run and its manifest")
     s.add_argument("run_id")
     s = sub.add_parser("replay", help="replay a run from recorded LLM responses and compare")
@@ -112,14 +116,19 @@ def main(argv: list[str] | None = None) -> int:
         settings = dataclasses.replace(settings, dataset=a.dataset)
 
     if a.cmd == "auth":
+        import os
+
         import yaml
 
         from .security import issue_token
 
-        import os
-
-        token, entry = issue_token(a.subject, [r.strip() for r in a.roles.split(",") if r.strip()], a.tenant,
-                                   a.expires_days or None, a.token_id)
+        token, entry = issue_token(
+            a.subject,
+            [r.strip() for r in a.roles.split(",") if r.strip()],
+            a.tenant,
+            a.expires_days or None,
+            a.token_id,
+        )
         print("Bearer token (shown once; give it to the user over a secure channel, never commit it):", file=sys.stderr)
         print(token, file=sys.stderr)
         if a.tokens_file:
@@ -146,7 +155,10 @@ def main(argv: list[str] | None = None) -> int:
             caps = prof["capabilities"]
             print(f"{prof['name']} (v{prof.get('version')}, {prof.get('data_type')}): {prof.get('description', '')}")
             print(f"    entities: {', '.join(caps['entities'])}")
-            print(f"    attributes: {', '.join(caps.get('attributes', [])) or '-'}; observation: {caps.get('observation')}")
+            print(
+                f"    attributes: {', '.join(caps.get('attributes', [])) or '-'}; "
+                f"observation: {caps.get('observation')}"
+            )
         return 0
 
     if a.cmd == "init-demo":
@@ -254,8 +266,10 @@ def main(argv: list[str] | None = None) -> int:
             r = b.execute(a.definition_id, a.user, a.allow_draft)
         except (GovernanceError, ValueError) as exc:
             sys.exit(f"refused: {exc}")
-        print(f"generation {r['generation_id']}: {r['person_count']} people written to results.cohort "
-              f"(counts below {r['min_cell_count']} suppressed)\n")
+        print(
+            f"generation {r['generation_id']}: {r['person_count']} people written to results.cohort "
+            f"(counts below {r['min_cell_count']} suppressed)\n"
+        )
         print(_attrition_table(r["attrition"]))
         for c in r["caveats"]:
             print(f"[caveat/{c['stage']}] {c['message']}")

@@ -15,6 +15,7 @@ Roles per endpoint (admin implies all):
   GET  /runs/{id}, POST /runs/{id}/replay                             author (own runs), reviewer (tenant), admin
   GET  /audit                                                         admin
 """
+
 from __future__ import annotations
 
 import logging
@@ -78,15 +79,21 @@ class ValidateIRRequest(_Strict):
     ir: CohortDefinition
 
 
-def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | None = None,
-               authenticator: TokenAuthenticator | None = None) -> FastAPI:
-    security = security or SecurityConfig.from_env()   # raises ConfigError on unsafe settings
+def create_app(
+    builder: CohortBuilder | None = None,
+    security: SecurityConfig | None = None,
+    authenticator: TokenAuthenticator | None = None,
+) -> FastAPI:
+    security = security or SecurityConfig.from_env()  # raises ConfigError on unsafe settings
     security.check()
     authenticator = authenticator if authenticator is not None else security.authenticator()
     policy = GovernancePolicy.from_security(security)
     if security.dev_bypass:
-        log.warning("CB_AUTH_DEV_BYPASS is ON (development): unauthenticated requests act as %r with roles %s",
-                    security.dev_subject, sorted(security.dev_roles))
+        log.warning(
+            "CB_AUTH_DEV_BYPASS is ON (development): unauthenticated requests act as %r with roles %s",
+            security.dev_subject,
+            sorted(security.dev_roles),
+        )
     elif len(authenticator) == 0:
         log.warning("no API tokens configured (CB_AUTH_TOKENS_FILE): all protected endpoints will return 401")
 
@@ -103,8 +110,7 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
         return state["builder"]
 
     # ---- authentication / authorization ------------------------------------------
-    def current_principal(request: Request,
-                          creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> Principal:
+    def current_principal(request: Request, creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> Principal:
         if creds is not None:
             if creds.scheme.lower() != "bearer":
                 raise HTTPException(401, "invalid authorization scheme", headers={"WWW-Authenticate": "Bearer"})
@@ -122,10 +128,18 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
         def dep(request: Request, principal: Principal = Depends(current_principal)) -> Principal:
             if not principal.has_any(*roles):
                 with lock:
-                    b().store.audit(principal.subject, "authz.denied", "endpoint", request.url.path, "denied",
-                                    principal.tenant, {"method": request.method, "required_any": sorted(roles)})
+                    b().store.audit(
+                        principal.subject,
+                        "authz.denied",
+                        "endpoint",
+                        request.url.path,
+                        "denied",
+                        principal.tenant,
+                        {"method": request.method, "required_any": sorted(roles)},
+                    )
                 raise HTTPException(403, f"requires one of the roles: {', '.join(sorted(roles))}")
             return principal
+
         return dep
 
     any_role = require(*ANY_ROLE)
@@ -182,10 +196,13 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
         with lock:
             bb = b()
             issues, attrition = validate(req.ir, bb.ontology, bb.vocab, bb.executor)
-            return {"valid": not any(i.severity == "error" for i in issues),
-                    "issues": [i.as_dict() for i in issues],
-                    "attrition": attrition.suppressed(bb.executor.min_cell) if attrition else None,
-                    "explanation": bb.explainer.explain(req.ir), "semantic_hash": req.ir.semantic_hash()}
+            return {
+                "valid": not any(i.severity == "error" for i in issues),
+                "issues": [i.as_dict() for i in issues],
+                "attrition": attrition.suppressed(bb.executor.min_cell) if attrition else None,
+                "explanation": bb.explainer.explain(req.ir),
+                "semantic_hash": req.ir.semantic_hash(),
+            }
 
     @app.post("/cohorts")
     def submit(req: SubmitIRRequest, p: Principal = Depends(need_author)) -> dict:
@@ -261,8 +278,7 @@ def create_app(builder: CohortBuilder | None = None, security: SecurityConfig | 
             return b().replay(run_id, scope(p), actor=p.subject)
 
     @app.get("/concepts/search")
-    def search(q: str, domain: str | None = None, limit: int = 10,
-               _: Principal = Depends(any_role)) -> list[dict]:
+    def search(q: str, domain: str | None = None, limit: int = 10, _: Principal = Depends(any_role)) -> list[dict]:
         with lock:
             return b().vocab.search_concepts(q[:200], domain, limit=max(1, min(limit, 25)))
 

@@ -1,4 +1,5 @@
 """Small-cell suppression as a privacy control, plus execution limits and least-privilege hardening."""
+
 from __future__ import annotations
 
 import copy
@@ -26,7 +27,7 @@ def small_ir(age_min: int, age_max: int) -> CohortDefinition:
 
 # ---- the suppression rule ----------------------------------------------------------------
 def test_primary_suppression_thresholds():
-    assert suppress_count(0, K) == 0          # zero describes nobody
+    assert suppress_count(0, K) == 0  # zero describes nobody
     assert suppress_count(1, K) == "<10"
     assert suppress_count(9, K) == "<10"
     assert suppress_count(10, K) == 10
@@ -36,7 +37,7 @@ def test_complementary_suppression_hides_small_differences():
     assert suppress_series([500, 497, 300, 296, 296], K) == [500, COMPLEMENTARY, 300, COMPLEMENTARY, COMPLEMENTARY]
     assert suppress_series([30, 30, 21, 21], K) == [30, 30, COMPLEMENTARY, COMPLEMENTARY]
     assert suppress_series([25, 12, 9, 0], K) == [25, 12, "<10", 0]
-    assert suppress_series([100, 90, 80], K) == [100, 90, 80]           # differences of exactly k are fine
+    assert suppress_series([100, 90, 80], K) == [100, 90, 80]  # differences of exactly k are fine
 
 
 def _disclosed(shown: list) -> list[int]:
@@ -53,7 +54,7 @@ def test_no_small_count_is_derivable_from_disclosed_values():
         shown = _disclosed(suppress_series(series, K))
         assert all(v == 0 or v >= K for v in shown), series
         for i, a in enumerate(shown):
-            for b in shown[i + 1:]:
+            for b in shown[i + 1 :]:
                 assert not (0 < abs(a - b) < K), (series, shown)
 
 
@@ -68,7 +69,7 @@ def test_execute_returns_suppressed_counts(builder):
     builder.review(def_id, "bob", "approved")
     out = builder.execute(def_id, "carol")
     raw = builder.con.execute("SELECT person_count FROM meta.cohort_generation").fetchone()[0]
-    assert 0 < raw < K                                   # the raw count exists only inside the database
+    assert 0 < raw < K  # the raw count exists only inside the database
     assert out["person_count"] == "<10"
     assert out["attrition"][-1]["remaining"] == "<10"
     assert str(raw) not in json.dumps([r["remaining"] for r in out["attrition"][-2:]])
@@ -78,7 +79,7 @@ def test_final_count_follows_complementary_suppression(builder):
     def_id, _ = builder.submit_ir(small_ir(30, 40), "alice")
     builder.review(def_id, "bob", "approved")
     out = builder.execute(def_id, "carol")
-    assert out["person_count"] == COMPLEMENTARY          # would otherwise reveal a removed group of < 10
+    assert out["person_count"] == COMPLEMENTARY  # would otherwise reveal a removed group of < 10
 
 
 def test_validation_dry_run_and_ask_are_suppressed(builder):
@@ -150,12 +151,16 @@ def test_query_timeout_cancels_long_queries(builder):
     ex = Executor(builder.con, timeout_seconds=0.2)
     with pytest.raises(QueryTimeout, match="time limit"):
         ex._run("SELECT count(*) FROM range(100000000000) a")
-    assert builder.con.execute("SELECT 1").fetchone() == (1,)   # connection still usable afterwards
+    assert builder.con.execute("SELECT 1").fetchone() == (1,)  # connection still usable afterwards
 
 
 def test_sql_cannot_reach_files_or_extensions_after_startup(builder):
-    for sql in ("SELECT * FROM read_csv('/etc/passwd')", "ATTACH '/tmp/x.duckdb' AS x", "INSTALL httpfs",
-                "COPY (SELECT 1) TO '/tmp/x.csv'"):
+    for sql in (
+        "SELECT * FROM read_csv('/etc/passwd')",
+        "ATTACH '/tmp/x.duckdb' AS x",
+        "INSTALL httpfs",
+        "COPY (SELECT 1) TO '/tmp/x.csv'",
+    ):
         with pytest.raises(duckdb.PermissionException):
             builder.con.execute(sql)
     with pytest.raises(duckdb.Error):

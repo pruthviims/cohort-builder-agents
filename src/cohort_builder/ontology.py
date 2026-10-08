@@ -1,4 +1,5 @@
 """Loads the semantic ontology (YAML in git) and exposes it to agents, validator and compiler."""
+
 from __future__ import annotations
 
 import hashlib
@@ -41,7 +42,7 @@ class Ontology:
     version: str
     content_hash: str
     domain: dict[str, Any]
-    dataset: dict[str, Any]          # active dataset profile (capabilities, mapping, semantic views)
+    dataset: dict[str, Any]  # active dataset profile (capabilities, mapping, semantic views)
     curated: dict[str, Any]
     units: dict[int, dict[str, Any]]
     analytes: dict[int, dict[str, Any]]

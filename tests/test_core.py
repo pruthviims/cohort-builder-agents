@@ -1,4 +1,5 @@
 """IR hashing, vocabulary tools, compiler correctness and validator rules (no LLM)."""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -49,9 +50,12 @@ def test_search_and_mapping(builder):
     assert {d["concept_id"] for d in v.get_descendants(201826)} == {2000003001, 2000003002}
     # deprecated / non-standard concepts are not returned by default search
     assert all(r["standard_concept"] in ("S", "C") for r in v.search_concepts("diabetes"))
-    assert v.expand([{"concept_id": 201820, "include_descendants": True},
-                     {"concept_id": 201254, "include_descendants": True, "is_excluded": True}]) == \
-        {201820, 201826, 2000003001, 2000003002}
+    assert v.expand(
+        [
+            {"concept_id": 201820, "include_descendants": True},
+            {"concept_id": 201254, "include_descendants": True, "is_excluded": True},
+        ]
+    ) == {201820, 201826, 2000003001, 2000003002}
 
 
 def test_search_is_deterministic(builder):
@@ -72,21 +76,26 @@ def _reference_cohort(con, ir_vocab) -> set[int]:
     t1dm = ir_vocab.expand([{"concept_id": 201254, "include_descendants": True}])
     person = {p: y for p, y in con.execute("SELECT person_id, year_of_birth FROM cdm.person").fetchall()}
     op = defaultdict(list)
-    for p, s, e in con.execute("SELECT person_id, observation_period_start_date, observation_period_end_date "
-                               "FROM cdm.observation_period").fetchall():
+    for p, s, e in con.execute(
+        "SELECT person_id, observation_period_start_date, observation_period_end_date FROM cdm.observation_period"
+    ).fetchall():
         op[p].append((s, e))
     first_met: dict[int, date] = {}
-    for p, cid, d in con.execute("SELECT person_id, drug_concept_id, drug_exposure_start_date "
-                                 "FROM cdm.drug_exposure").fetchall():
+    for p, cid, d in con.execute(
+        "SELECT person_id, drug_concept_id, drug_exposure_start_date FROM cdm.drug_exposure"
+    ).fetchall():
         if cid in metformin and (p not in first_met or d < first_met[p]):
             first_met[p] = d
     conds = defaultdict(list)
-    for p, cid, d in con.execute("SELECT person_id, condition_concept_id, condition_start_date "
-                                 "FROM cdm.condition_occurrence").fetchall():
+    for p, cid, d in con.execute(
+        "SELECT person_id, condition_concept_id, condition_start_date FROM cdm.condition_occurrence"
+    ).fetchall():
         conds[p].append((cid, d))
     a1c = defaultdict(list)
-    for p, d, v, u in con.execute("SELECT person_id, measurement_date, value_as_number, unit_concept_id "
-                                  "FROM cdm.measurement WHERE measurement_concept_id = 3004410").fetchall():
+    for p, d, v, u in con.execute(
+        "SELECT person_id, measurement_date, value_as_number, unit_concept_id "
+        "FROM cdm.measurement WHERE measurement_concept_id = 3004410"
+    ).fetchall():
         norm = v if u == 8554 else (v * 0.09148 + 2.152 if u == 2000001001 else None)
         a1c[p].append((d, norm))
 
@@ -140,8 +149,8 @@ def test_validator_accepts_example(builder, example_ir_path):
 
 def test_validator_rejects_bad_concepts_and_values(builder, example_ir_path):
     data = load(example_ir_path).model_dump()
-    data["concept_sets"][1]["items"][0]["concept_id"] = 2000003099         # deprecated concept
-    data["concept_sets"][0]["items"].append({"concept_id": 201826})       # condition inside a drug set
+    data["concept_sets"][1]["items"][0]["concept_id"] = 2000003099  # deprecated concept
+    data["concept_sets"][0]["items"].append({"concept_id": 201826})  # condition inside a drug set
     data["exclusion"][0]["value_filter"] = {"op": ">", "value": 1, "unit_concept_id": 8554}  # value on condition
     issues, _ = validate(CohortDefinition.model_validate(data), builder.ontology, builder.vocab, builder.executor)
     messages = " | ".join(i.message for i in issues if i.severity == "error")

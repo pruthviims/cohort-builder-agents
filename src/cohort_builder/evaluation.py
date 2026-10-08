@@ -2,6 +2,7 @@
 
 Run it in CI whenever a prompt, model, ontology or compiler version changes.
 """
+
 from __future__ import annotations
 
 import json
@@ -52,8 +53,12 @@ def compare(builder: CohortBuilder, gold: CohortDefinition, got: CohortDefinitio
     got_crits = _criteria(got)
     for role, g in _criteria(gold):
         candidates = [c for r, c in got_crits if r == role and c.entity == g.entity]
-        crit_j.append(max((jaccard(expanded(gold, g.concept_set_id), expanded(got, c.concept_set_id))
-                           for c in candidates), default=0.0))
+        crit_j.append(
+            max(
+                (jaccard(expanded(gold, g.concept_set_id), expanded(got, c.concept_set_id)) for c in candidates),
+                default=0.0,
+            )
+        )
         struct.append(any(_criterion_match(g, c) for c in candidates))
     extra = max(0, len(got_crits) - len(_criteria(gold)))
     gold_people = builder.executor.person_ids(builder.compiler.compile(gold))
@@ -71,8 +76,13 @@ def compare(builder: CohortBuilder, gold: CohortDefinition, got: CohortDefinitio
     }
 
 
-def run_eval(builder: CohortBuilder, cases_file: Path, repeats: int = 3, case_ids: list[str] | None = None,
-             thresholds: dict | None = None) -> dict:
+def run_eval(
+    builder: CohortBuilder,
+    cases_file: Path,
+    repeats: int = 3,
+    case_ids: list[str] | None = None,
+    thresholds: dict | None = None,
+) -> dict:
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     cases_file = Path(cases_file)
     cases = yaml.safe_load(cases_file.read_text())["cases"]
@@ -96,30 +106,51 @@ def run_eval(builder: CohortBuilder, cases_file: Path, repeats: int = 3, case_id
             else:
                 hashes.append(None)
             metrics.append(m)
-            builder.con.execute("INSERT INTO meta.eval_result VALUES (?,?,?,?)",
-                                [eval_run_id, case["id"], r, dumps(m)])
+            builder.con.execute("INSERT INTO meta.eval_result VALUES (?,?,?,?)", [eval_run_id, case["id"], r, dumps(m)])
         present = Counter(h for h in hashes if h is not None)
         modal = present.most_common(1)[0][1] if present else 0
         ok = [m for m in metrics if "patient_jaccard" in m]
-        per_case.append({
-            "case_id": case["id"],
-            "therapeutic_area": case.get("therapeutic_area"),
-            "valid_rate": sum(m["status"] == "draft" for m in metrics) / repeats,
-            "consistency": round(modal / repeats, 4),  # share of repeats producing the modal semantic hash
-            "patient_jaccard": round(statistics.mean(m["patient_jaccard"] for m in ok), 4) if ok else 0.0,
-            "index_concept_jaccard": round(statistics.mean(m["index_concept_jaccard"] for m in ok), 4) if ok else 0.0,
-            "criteria_concept_jaccard": round(statistics.mean(m["criteria_concept_jaccard"] for m in ok), 4)
-            if ok else 0.0,
-            "structure_match": round(statistics.mean(m["structure_match"] for m in ok), 4) if ok else 0.0,
-            "runs": metrics,
-        })
+        per_case.append(
+            {
+                "case_id": case["id"],
+                "therapeutic_area": case.get("therapeutic_area"),
+                "valid_rate": sum(m["status"] == "draft" for m in metrics) / repeats,
+                "consistency": round(modal / repeats, 4),  # share of repeats producing the modal semantic hash
+                "patient_jaccard": round(statistics.mean(m["patient_jaccard"] for m in ok), 4) if ok else 0.0,
+                "index_concept_jaccard": round(statistics.mean(m["index_concept_jaccard"] for m in ok), 4)
+                if ok
+                else 0.0,
+                "criteria_concept_jaccard": round(statistics.mean(m["criteria_concept_jaccard"] for m in ok), 4)
+                if ok
+                else 0.0,
+                "structure_match": round(statistics.mean(m["structure_match"] for m in ok), 4) if ok else 0.0,
+                "runs": metrics,
+            }
+        )
 
-    summary = {k: round(statistics.mean(c[k] for c in per_case), 4) if per_case else 0.0
-               for k in ("valid_rate", "consistency", "patient_jaccard", "index_concept_jaccard",
-                         "criteria_concept_jaccard", "structure_match")}
+    summary = {
+        k: round(statistics.mean(c[k] for c in per_case), 4) if per_case else 0.0
+        for k in (
+            "valid_rate",
+            "consistency",
+            "patient_jaccard",
+            "index_concept_jaccard",
+            "criteria_concept_jaccard",
+            "structure_match",
+        )
+    }
     failures = [k for k, t in thresholds.items() if summary.get(k, 0.0) < t]
-    report = {"eval_run_id": eval_run_id, "versions": versions, "repeats": repeats, "summary": summary,
-              "thresholds": thresholds, "passed": not failures, "failed_metrics": failures, "cases": per_case}
-    builder.con.execute("UPDATE meta.eval_run SET summary_json=? WHERE eval_run_id=?",
-                        [json.dumps(report["summary"]), eval_run_id])
+    report = {
+        "eval_run_id": eval_run_id,
+        "versions": versions,
+        "repeats": repeats,
+        "summary": summary,
+        "thresholds": thresholds,
+        "passed": not failures,
+        "failed_metrics": failures,
+        "cases": per_case,
+    }
+    builder.con.execute(
+        "UPDATE meta.eval_run SET summary_json=? WHERE eval_run_id=?", [json.dumps(report["summary"]), eval_run_id]
+    )
     return report

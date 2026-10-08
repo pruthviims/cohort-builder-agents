@@ -1,4 +1,5 @@
 """IR model validation (structural rules) and validator rules (units, genders, vocabulary). Positive + negative."""
+
 from __future__ import annotations
 
 import copy
@@ -45,10 +46,15 @@ def test_valid_age_ranges(age_min, age_max):
     assert Demographics(age_min=age_min, age_max=age_max)
 
 
-@pytest.mark.parametrize("age_min,age_max,msg", [(-1, None, "greater than or equal to 0"),
-                                                 (None, -5, "greater than or equal to 0"),
-                                                 (70, 18, "age_min (70) must be <= age_max (18)"),
-                                                 (200, None, "less than or equal to 150")])
+@pytest.mark.parametrize(
+    "age_min,age_max,msg",
+    [
+        (-1, None, "greater than or equal to 0"),
+        (None, -5, "greater than or equal to 0"),
+        (70, 18, "age_min (70) must be <= age_max (18)"),
+        (200, None, "less than or equal to 150"),
+    ],
+)
 def test_invalid_age_ranges(age_min, age_max, msg):
     with pytest.raises(ValidationError, match=msg.replace("(", r"\(").replace(")", r"\)")):
         Demographics(age_min=age_min, age_max=age_max)
@@ -58,30 +64,41 @@ def test_gender_ids_normalized_and_validated(builder):
     assert Demographics(gender_concept_ids=[8532, 8507, 8532]).gender_concept_ids == [8507, 8532]
     with pytest.raises(ValidationError):
         Demographics(gender_concept_ids=[0])
-    issues, _ = validate(CohortDefinition.model_validate(ir_with(demographics__gender_concept_ids=[8551])),
-                         builder.ontology, builder.vocab)
+    issues, _ = validate(
+        CohortDefinition.model_validate(ir_with(demographics__gender_concept_ids=[8551])),
+        builder.ontology,
+        builder.vocab,
+    )
     assert any("gender concept 8551" in i.message for i in issues if i.severity == "error")
 
 
 # ---- value filters -------------------------------------------------------------------
-@pytest.mark.parametrize("vf", [{"op": ">", "value": 8, "unit_concept_id": 8554},
-                                {"op": "between", "value": 7, "value_high": 9, "unit_concept_id": 8554},
-                                {"op": "between", "value": 7, "value_high": 7, "unit_concept_id": 8554},
-                                {"op": "=", "value": 0, "unit_concept_id": 8554}])
+@pytest.mark.parametrize(
+    "vf",
+    [
+        {"op": ">", "value": 8, "unit_concept_id": 8554},
+        {"op": "between", "value": 7, "value_high": 9, "unit_concept_id": 8554},
+        {"op": "between", "value": 7, "value_high": 7, "unit_concept_id": 8554},
+        {"op": "=", "value": 0, "unit_concept_id": 8554},
+    ],
+)
 def test_valid_value_filters(vf):
     assert ValueFilter(**vf)
 
 
-@pytest.mark.parametrize("vf,msg", [
-    ({"op": "between", "value": 7, "unit_concept_id": 8554}, "requires value_high"),
-    ({"op": "between", "value": 9, "value_high": 7, "unit_concept_id": 8554}, "greater than upper bound"),
-    ({"op": ">", "value": 8, "value_high": 9, "unit_concept_id": 8554}, "only used with op 'between'"),
-    ({"op": ">", "value": math.nan, "unit_concept_id": 8554}, "finite number"),
-    ({"op": ">", "value": math.inf, "unit_concept_id": 8554}, "finite number"),
-    ({"op": ">", "value": 8, "unit_concept_id": 0}, "greater than 0"),
-    ({"op": "like", "value": 8, "unit_concept_id": 8554}, "Input should be"),
-    ({"op": ">", "value": "8; DROP TABLE x", "unit_concept_id": 8554}, "valid number"),
-])
+@pytest.mark.parametrize(
+    "vf,msg",
+    [
+        ({"op": "between", "value": 7, "unit_concept_id": 8554}, "requires value_high"),
+        ({"op": "between", "value": 9, "value_high": 7, "unit_concept_id": 8554}, "greater than upper bound"),
+        ({"op": ">", "value": 8, "value_high": 9, "unit_concept_id": 8554}, "only used with op 'between'"),
+        ({"op": ">", "value": math.nan, "unit_concept_id": 8554}, "finite number"),
+        ({"op": ">", "value": math.inf, "unit_concept_id": 8554}, "finite number"),
+        ({"op": ">", "value": 8, "unit_concept_id": 0}, "greater than 0"),
+        ({"op": "like", "value": 8, "unit_concept_id": 8554}, "Input should be"),
+        ({"op": ">", "value": "8; DROP TABLE x", "unit_concept_id": 8554}, "valid number"),
+    ],
+)
 def test_invalid_value_filters(vf, msg):
     with pytest.raises(ValidationError, match=msg):
         ValueFilter(**vf)
@@ -93,16 +110,19 @@ def test_valid_windows(s, e):
     assert Window(start_days=s, end_days=e)
 
 
-@pytest.mark.parametrize("s,e,msg", [(10, -10, "must be <= end_days"), (-40000, 0, "greater than or equal"),
-                                     (0, 99999, "less than or equal")])
+@pytest.mark.parametrize(
+    "s,e,msg",
+    [(10, -10, "must be <= end_days"), (-40000, 0, "greater than or equal"), (0, 99999, "less than or equal")],
+)
 def test_invalid_windows(s, e, msg):
     with pytest.raises(ValidationError, match=msg):
         Window(start_days=s, end_days=e)
 
 
 # ---- observation requirements and exit -------------------------------------------------
-@pytest.mark.parametrize("field,value", [("prior_observation_days", -1), ("post_observation_days", -30),
-                                         ("prior_observation_days", 100000)])
+@pytest.mark.parametrize(
+    "field,value", [("prior_observation_days", -1), ("post_observation_days", -30), ("prior_observation_days", 100000)]
+)
 def test_invalid_observation_requirements(field, value):
     assert field in errors_of(ir_with(**{field: value}))
 
@@ -118,23 +138,33 @@ def test_exit_rules():
 
 
 # ---- occurrence rules -------------------------------------------------------------------
-@pytest.mark.parametrize("kw", [{"occurrence": "at_least", "count": 1}, {"occurrence": "at_most", "count": 0},
-                                {"occurrence": "exactly", "count": 0}, {"occurrence": "exactly", "count": 3},
-                                {"occurrence": "at_least", "count": 2, "min_span_days": 30}])
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"occurrence": "at_least", "count": 1},
+        {"occurrence": "at_most", "count": 0},
+        {"occurrence": "exactly", "count": 0},
+        {"occurrence": "exactly", "count": 3},
+        {"occurrence": "at_least", "count": 2, "min_span_days": 30},
+    ],
+)
 def test_valid_occurrence_rules(kw):
     assert Criterion(**crit(**kw))
 
 
-@pytest.mark.parametrize("kw,msg", [
-    ({"occurrence": "at_least", "count": 0}, "always true"),
-    ({"count": -1}, "greater than or equal to 0"),
-    ({"count": 10**6}, "less than or equal"),
-    ({"occurrence": "at_most", "count": 2, "min_span_days": 30}, "min_span_days needs"),
-    ({"occurrence": "at_least", "count": 1, "min_span_days": 30}, "min_span_days needs"),
-    ({"occurrence": "at_least", "count": 2, "min_span_days": 0}, "greater than or equal to 1"),
-    ({"occurrence": "sometimes"}, "Input should be"),
-    ({"claim_status": []}, "at least one status"),
-])
+@pytest.mark.parametrize(
+    "kw,msg",
+    [
+        ({"occurrence": "at_least", "count": 0}, "always true"),
+        ({"count": -1}, "greater than or equal to 0"),
+        ({"count": 10**6}, "less than or equal"),
+        ({"occurrence": "at_most", "count": 2, "min_span_days": 30}, "min_span_days needs"),
+        ({"occurrence": "at_least", "count": 1, "min_span_days": 30}, "min_span_days needs"),
+        ({"occurrence": "at_least", "count": 2, "min_span_days": 0}, "greater than or equal to 1"),
+        ({"occurrence": "sometimes"}, "Input should be"),
+        ({"claim_status": []}, "at least one status"),
+    ],
+)
 def test_invalid_occurrence_rules(kw, msg):
     with pytest.raises(ValidationError, match=msg):
         Criterion(**crit(**kw))
@@ -197,29 +227,33 @@ def test_unknown_and_wrong_domain_concepts(builder):
 
 def test_classification_concept_needs_descendants(builder):
     ir = CohortDefinition.model_validate(
-        ir_with(concept_sets__0__items=[{"concept_id": 2000006001, "include_descendants": False}]))
+        ir_with(concept_sets__0__items=[{"concept_id": 2000006001, "include_descendants": False}])
+    )
     issues, _ = validate(ir, builder.ontology, builder.vocab)
     assert any("classification concept" in i.message for i in issues if i.severity == "error")
 
 
 def test_threshold_in_non_canonical_unit_is_rejected_with_conversion_hint(builder):
-    ir = CohortDefinition.model_validate(ir_with(inclusion__1__value_filter={
-        "op": ">", "value": 64, "unit_concept_id": 2000001001}))
+    ir = CohortDefinition.model_validate(
+        ir_with(inclusion__1__value_filter={"op": ">", "value": 64, "unit_concept_id": 2000001001})
+    )
     issues, _ = validate(ir, builder.ontology, builder.vocab)
     msg = next(i.message for i in issues if "canonical unit" in i.message)
     assert "mmol/mol" in msg and "= 8.007 %" in msg
 
 
 def test_unit_not_in_ontology_is_rejected(builder):
-    ir = CohortDefinition.model_validate(ir_with(inclusion__1__value_filter={
-        "op": ">", "value": 8, "unit_concept_id": 999}))
+    ir = CohortDefinition.model_validate(
+        ir_with(inclusion__1__value_filter={"op": ">", "value": 8, "unit_concept_id": 999})
+    )
     issues, _ = validate(ir, builder.ontology, builder.vocab)
     assert any("not declared in ontology" in i.message for i in issues)
 
 
 def test_value_filter_spanning_analytes_with_different_units(builder):
-    ir = CohortDefinition.model_validate(ir_with(concept_sets__3__items=[{"concept_id": 3004410},
-                                                                         {"concept_id": 3016723}]))
+    ir = CohortDefinition.model_validate(
+        ir_with(concept_sets__3__items=[{"concept_id": 3004410}, {"concept_id": 3016723}])
+    )
     issues, _ = validate(ir, builder.ontology, builder.vocab)
     assert any("spans analytes with different units" in i.message for i in issues)
 
@@ -244,11 +278,26 @@ def test_composer_reports_invalid_intent_as_issues(builder):
     from cohort_builder.agents.resolver import ResolvedConceptSet
     from cohort_builder.ir import ConceptSetItem
 
-    intent = CohortIntent.model_validate({
-        "name": "x", "description": "", "index_mention_key": "met", "age_min": 70, "age_max": 18,
-        "mentions": [{"key": "met", "text": "metformin", "entity": "DrugExposure"}], "criteria": []})
-    resolved = {"met": ResolvedConceptSet(mention_key="met", name="metformin", domain="Drug", source="resolved",
-                                          items=[ConceptSetItem(concept_id=1503297)])}
+    intent = CohortIntent.model_validate(
+        {
+            "name": "x",
+            "description": "",
+            "index_mention_key": "met",
+            "age_min": 70,
+            "age_max": 18,
+            "mentions": [{"key": "met", "text": "metformin", "entity": "DrugExposure"}],
+            "criteria": [],
+        }
+    )
+    resolved = {
+        "met": ResolvedConceptSet(
+            mention_key="met",
+            name="metformin",
+            domain="Drug",
+            source="resolved",
+            items=[ConceptSetItem(concept_id=1503297)],
+        )
+    }
     ir, issues = compose(intent, resolved, builder.ontology, builder.vocab)
     assert ir is None
     assert any(i.stage == "intent" and "age_min (70) must be <= age_max (18)" in i.message for i in issues)

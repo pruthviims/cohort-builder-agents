@@ -3,6 +3,7 @@
 The IR is the artifact of record: it is stored, reviewed, diffed, hashed and
 compiled. Agents produce it; the deterministic compiler consumes it.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -17,10 +18,10 @@ Entity = Literal["ConditionOccurrence", "DrugExposure", "Measurement", "Procedur
 ClaimStatus = Literal["paid", "rejected", "reversed"]
 Domain = Literal["Condition", "Drug", "Measurement", "Procedure", "Visit"]
 
-MAX_DAYS = 36_600          # ~100 years: bound for windows and observation requirements
+MAX_DAYS = 36_600  # ~100 years: bound for windows and observation requirements
 MAX_AGE = 150
 MAX_COUNT = 10_000
-ID_PATTERN = r"^[A-Za-z0-9_\-]{1,64}$"   # concept set / criterion ids end up in SQL literals
+ID_PATTERN = r"^[A-Za-z0-9_\-]{1,64}$"  # concept set / criterion ids end up in SQL literals
 
 
 class _IRModel(BaseModel):
@@ -54,6 +55,7 @@ class ConceptSet(_IRModel):
 
 class ValueFilter(_IRModel):
     """Numeric filter on a measurement value, in `unit_concept_id`. Bounds of `between` are inclusive."""
+
     model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
     op: Literal[">", ">=", "<", "<=", "=", "between"]
     value: float
@@ -79,6 +81,7 @@ class Window(_IRModel):
     null start/end = bounded by the person's observation period that contains the index date.
     Example: {start_days: -365, end_days: 0} = the 365 days before index plus the index day itself.
     """
+
     start_days: int | None = Field(default=None, ge=-MAX_DAYS, le=MAX_DAYS)
     end_days: int | None = Field(default=None, ge=-MAX_DAYS, le=MAX_DAYS)
 
@@ -104,19 +107,25 @@ class Criterion(_IRModel):
     concept_set_id: str = Field(pattern=ID_PATTERN)
     window: Window = Field(default_factory=Window)
     occurrence: Literal["at_least", "at_most", "exactly"] = "at_least"
-    count: int = Field(default=1, ge=0, le=MAX_COUNT,
-                       description="Number of qualifying events; at_most/exactly 0 = 'none'")
+    count: int = Field(
+        default=1, ge=0, le=MAX_COUNT, description="Number of qualifying events; at_most/exactly 0 = 'none'"
+    )
     count_by: Literal["records", "dates"] = Field(
-        default="records", description="What `count` counts: every qualifying record (default, OHDSI-style), or "
-                                       "distinct event dates (several records on one day count once)")
+        default="records",
+        description="What `count` counts: every qualifying record (default, OHDSI-style), or "
+        "distinct event dates (several records on one day count once)",
+    )
     value_filter: ValueFilter | None = None
     # claims attributes (only on datasets whose profile supports them)
     claim_status: list[ClaimStatus] | None = Field(
-        default=None, description="DrugExposure on claims data: which adjudication outcomes count")
+        default=None, description="DrugExposure on claims data: which adjudication outcomes count"
+    )
     dx_position: Literal["primary", "any"] | None = Field(
-        default=None, description="ConditionOccurrence on claims data: primary = first-listed diagnosis")
+        default=None, description="ConditionOccurrence on claims data: primary = first-listed diagnosis"
+    )
     min_span_days: int | None = Field(
-        default=None, ge=1, le=MAX_DAYS, description="With at_least N: qualifying events must span >= this many days")
+        default=None, ge=1, le=MAX_DAYS, description="With at_least N: qualifying events must span >= this many days"
+    )
 
     @field_validator("claim_status")
     @classmethod
@@ -149,6 +158,7 @@ class IndexEvent(_IRModel):
 
 class Demographics(_IRModel):
     """Age at index = calendar year of index minus year of birth. Bounds are inclusive; null = open-ended."""
+
     age_min: int | None = Field(default=None, ge=0, le=MAX_AGE)
     age_max: int | None = Field(default=None, ge=0, le=MAX_AGE)
     gender_concept_ids: list[int] = Field(default_factory=list)
@@ -194,8 +204,9 @@ class CohortDefinition(_IRModel):
     inclusion: list[Criterion] = Field(default_factory=list, max_length=50)
     exclusion: list[Criterion] = Field(default_factory=list, max_length=50)
     exit: CohortExit = Field(default_factory=CohortExit)
-    assumptions: list[str] = Field(default_factory=list,
-                                   description="Interpretation choices made while building, for reviewers")
+    assumptions: list[str] = Field(
+        default_factory=list, description="Interpretation choices made while building, for reviewers"
+    )
 
     @model_validator(mode="after")
     def _references(self) -> "CohortDefinition":
@@ -225,8 +236,12 @@ class CohortDefinition(_IRModel):
         """Full canonical form: sorted keys, sorted concept-set items."""
         data = self.model_dump(mode="json")
         data["concept_sets"] = sorted(
-            [{**cs, "items": sorted(cs["items"], key=lambda i: (i["concept_id"], i["is_excluded"]))}
-             for cs in data["concept_sets"]], key=lambda c: c["id"])
+            [
+                {**cs, "items": sorted(cs["items"], key=lambda i: (i["concept_id"], i["is_excluded"]))}
+                for cs in data["concept_sets"]
+            ],
+            key=lambda c: c["id"],
+        )
         return json.dumps(data, sort_keys=True, separators=(",", ":"))
 
     def content_hash(self) -> str:
@@ -235,14 +250,18 @@ class CohortDefinition(_IRModel):
     def semantic_form(self) -> dict:
         """Logic only: labels, ids, assumptions and criterion order removed; concept sets inlined.
         Two definitions with the same semantic hash select the same patients."""
+
         def items(cs_id: str) -> list:
             cs = self.concept_set(cs_id)
             return sorted([[i.concept_id, i.include_descendants, i.is_excluded] for i in cs.items])
 
         def crit(c: Criterion) -> dict:
             return {
-                "entity": c.entity, "concepts": items(c.concept_set_id), "window": c.window.model_dump(),
-                "occurrence": c.occurrence, "count": c.count,
+                "entity": c.entity,
+                "concepts": items(c.concept_set_id),
+                "window": c.window.model_dump(),
+                "occurrence": c.occurrence,
+                "count": c.count,
                 "value": c.value_filter.model_dump(exclude={"original_text"}) if c.value_filter else None,
                 **claims(c),
             }
@@ -264,21 +283,29 @@ class CohortDefinition(_IRModel):
 
         return {
             "index": {
-                "entity": self.index_event.entity, "concepts": items(self.index_event.concept_set_id),
+                "entity": self.index_event.entity,
+                "concepts": items(self.index_event.concept_set_id),
                 "first_only": self.index_event.first_occurrence_only,
                 "value": self.index_event.value_filter.model_dump(exclude={"original_text"})
-                if self.index_event.value_filter else None,
+                if self.index_event.value_filter
+                else None,
                 **claims(self.index_event),
             },
             "prior_obs": self.prior_observation_days,
             "post_obs": self.post_observation_days,
-            "demographics": {**self.demographics.model_dump(),
-                             "gender_concept_ids": sorted(self.demographics.gender_concept_ids)},
+            "demographics": {
+                **self.demographics.model_dump(),
+                "gender_concept_ids": sorted(self.demographics.gender_concept_ids),
+            },
             "inclusion": sorted((crit(c) for c in self.inclusion), key=key),
             "exclusion": sorted((crit(c) for c in self.exclusion), key=key),
             "exit": self.exit.model_dump(),
         }
 
     def semantic_hash(self) -> str:
-        return "sha256:" + hashlib.sha256(
-            json.dumps(self.semantic_form(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(self.semantic_form(), sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
