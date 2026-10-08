@@ -300,7 +300,7 @@ Each rule above has a test on a small hand-built dataset in `tests/test_compiler
 pip install -e ".[api,mcp,dev]"
 pytest                                    # synthetic data and a scripted fake LLM; no network, no API key
 pytest --cov                              # with coverage (CI gate: 80%)
-CB_TEST_POSTGRES_DSN=postgresql://user:pass@localhost:5432/postgres pytest   # also run compiled SQL on PostgreSQL
+CB_TEST_POSTGRES_DSN=postgresql://user:pass@localhost:5432/postgres pytest   # also run compiled SQL on PostgreSQL   # pragma: allowlist secret
 ruff check src tests && ruff format --check src tests && mypy
 pip-audit --skip-editable                 # dependency vulnerabilities (run in a clean virtualenv)
 git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline   # secret scan

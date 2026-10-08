@@ -8,3 +8,8 @@ __pycache__/
 .venv/
 .env
 eval_report.json
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+tokens.yaml
