@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -12,6 +13,27 @@ import yaml
 
 def _norm(text: str) -> str:
     return " ".join(text.lower().replace("-", " ").replace("_", " ").split())
+
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,2}$")
+
+
+def _validate_profile(profile: dict[str, Any], where: str) -> None:
+    """Table/column names from a profile are interpolated into SQL: allow plain identifiers only."""
+    mapping = profile.get("mapping") or {}
+    for key in ("name",):
+        if not _IDENT.match(str(profile.get(key, ""))):
+            raise ValueError(f"{where}: invalid profile {key}")
+    if not _IDENT.match(str(mapping.get("vocab_schema", "vocab"))):
+        raise ValueError(f"{where}: invalid vocab_schema")
+    sections = {k: v for k, v in mapping.items() if k in ("person", "observation_period") and v}
+    sections.update({f"entities.{k}": v for k, v in (mapping.get("entities") or {}).items()})
+    for sec, cols in sections.items():
+        for k, v in cols.items():
+            ok = _TABLE.match(str(v)) if k == "table" else _IDENT.match(str(v))
+            if not ok:
+                raise ValueError(f"{where}: mapping {sec}.{k} = {v!r} is not a plain SQL identifier")
 
 
 @dataclass
@@ -45,6 +67,7 @@ class Ontology:
             digest.update(f.name.encode())
             digest.update(f.read_bytes())
         profile = yaml.safe_load(dataset_path.read_text())
+        _validate_profile(profile, dataset_path.name)
         curated = yaml.safe_load(files[2].read_text())["concept_sets"]
         units_doc = yaml.safe_load(files[3].read_text())
         return cls(

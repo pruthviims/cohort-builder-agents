@@ -217,16 +217,23 @@ class Compiler:
             end_expr = "op_end"
         cohort_sql = (prefix + ", ranked AS (\n"
                       f"  SELECT person_id, index_date, op_end,\n"
-                      f"         ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY index_date) AS rn\n"
+                      # deterministic: earliest qualifying index; if observation periods overlap, the one
+                      # starting earliest (longest history), then the one ending latest
+                      f"         ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY index_date, op_start, "
+                      f"op_end DESC) AS rn\n"
                       f"  FROM flags WHERE {all_pass}\n)\n"
                       f"SELECT person_id AS subject_id, index_date AS cohort_start_date, {end_expr} AS cohort_end_date\n"
                       f"FROM ranked WHERE rn = 1\nORDER BY subject_id")
 
-        cols = ["  COUNT(DISTINCT person_id) AS rule_0"]
+        # rule 0 counts people with a qualifying index event *before* the observation-period join, so people
+        # lost for missing/non-covering observation periods (or missing person records) are visible
+        cols = ["  (SELECT COUNT(DISTINCT person_id) FROM index_events) AS rule_0",
+                "  COUNT(DISTINCT person_id) AS rule_1"]
         for i in range(len(rules)):
             cond = " AND ".join(f"r{j + 1}" for j in range(i + 1))
-            cols.append(f"  COUNT(DISTINCT person_id) FILTER (WHERE {cond}) AS rule_{i + 1}")
+            cols.append(f"  COUNT(DISTINCT person_id) FILTER (WHERE {cond}) AS rule_{i + 2}")
         attrition_sql = prefix + "SELECT\n" + ",\n".join(cols) + "\nFROM flags"
 
-        names = ["Index event within an observation period"] + [r[0] for r in rules]
+        names = ["Persons with a qualifying index event",
+                 "Index event within an observation period"] + [r[0] for r in rules]
         return CompiledCohort(cohort_sql=cohort_sql, attrition_sql=attrition_sql, rule_names=names)
