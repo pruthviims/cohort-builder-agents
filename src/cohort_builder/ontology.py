@@ -128,7 +128,10 @@ class Ontology:
         return bool(self.entities[entity].get("has_value"))
 
     def table_mapping(self, entity: str) -> dict[str, Any]:
-        return self.mappings["entities"][entity]
+        try:
+            return self.mappings["entities"][entity]
+        except KeyError:
+            raise ValueError(f"dataset {self.dataset_name!r} has no data for {entity}") from None
 
     def vocab_schema(self) -> str:
         return self.mappings.get("vocab_schema", "vocab")

@@ -358,3 +358,17 @@ def test_database_errors_return_safe_message(api, builder, monkeypatch):
     assert "secret_table_xyz" not in r.text and r.json()["error_id"]
     failed = [e for e in builder.store.audit_events() if e["outcome"] == "failed"]
     assert failed and failed[0]["action"] == "definition.execute"
+
+
+def test_sql_for_definition_the_active_dataset_cannot_answer(builder, tokens, settings, laad_llm):
+    """A definition saved on OMOP that needs lab values: asking a LAAD server for its SQL is a clear 409."""
+    import dataclasses
+
+    from cohort_builder.orchestrator import CohortBuilder
+
+    path, toks = tokens
+    omop_client = make_client(builder, path)
+    def_id = _draft(omop_client, toks)
+    laad = CohortBuilder(dataclasses.replace(settings, dataset="iqvia_laad"), backend=laad_llm, con=builder.con)
+    r = make_client(laad, path).get(f"/cohorts/{def_id}/sql", headers=h(toks["victor"]))
+    assert r.status_code == 409 and "no data for Measurement" in r.json()["detail"]

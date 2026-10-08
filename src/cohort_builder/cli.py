@@ -258,7 +258,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{i.severity}/{i.stage}] {i.message}")
         print(f"\ncontent hash  {ir.content_hash()}\nsemantic hash {ir.semantic_hash()}")
     elif a.cmd == "compile":
-        print(b.compile_sql(a.definition_id))
+        try:
+            print(b.compile_sql(a.definition_id))
+        except (KeyError, ValueError) as exc:
+            sys.exit(f"cannot compile: {str(exc).strip(chr(39))}")
     elif a.cmd == "execute":
         from .orchestrator import GovernanceError
 

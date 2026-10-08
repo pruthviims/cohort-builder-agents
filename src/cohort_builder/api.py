@@ -234,6 +234,8 @@ def create_app(
                 return {"sql": b().compile_sql(def_id, scope(p))}
             except KeyError as exc:
                 raise HTTPException(404, f"cohort definition {def_id} not found") from exc
+            except ValueError as exc:  # e.g. the definition needs data the active dataset does not have
+                raise HTTPException(409, str(exc)) from exc
 
     @app.post("/cohorts/{def_id}/review")
     def review(def_id: int, req: ReviewRequest, p: Principal = Depends(need_reviewer)) -> dict:

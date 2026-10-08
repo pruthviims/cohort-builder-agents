@@ -249,8 +249,8 @@ def create_server(
         with lock:
             try:
                 return {"sql": b().compile_sql(definition_id, tenant)}
-            except KeyError as exc:
-                return {"error": str(exc)}
+            except (KeyError, ValueError) as exc:
+                return {"error": str(exc).strip("'\"")}
 
     @mcp.tool(annotations=WRITES)
     def execute_approved_cohort(definition_id: int) -> dict:
