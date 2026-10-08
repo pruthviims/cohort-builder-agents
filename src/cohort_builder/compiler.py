@@ -132,14 +132,15 @@ class Compiler:
                f"      JOIN cs_expanded c ON c.cs_id = {_lit(c.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
                f"{join}\n"
                f"      WHERE e.person_id = b.person_id AND {start} >= {lo} AND {start} <= {hi}{cond}")
+        counted = f"COUNT(DISTINCT {start})" if c.count_by == "dates" else "COUNT(*)"
         if c.min_span_days is not None:
             if c.occurrence != "at_least":
                 raise ValueError("min_span_days requires occurrence at_least")
             # at least N qualifying events whose first and last dates are >= min_span_days apart
-            return (f"((SELECT CASE WHEN COUNT(*) >= {int(c.count)} AND MAX({start}) - MIN({start}) >= "
+            return (f"((SELECT CASE WHEN {counted} >= {int(c.count)} AND MAX({start}) - MIN({start}) >= "
                     f"{int(c.min_span_days)} THEN 1 ELSE 0 END {frm}) = 1)")
         op = {"at_least": ">=", "at_most": "<=", "exactly": "="}[c.occurrence]
-        return f"((SELECT COUNT(*) {frm}) {op} {int(c.count)})"
+        return f"((SELECT {counted} {frm}) {op} {int(c.count)})"
 
     # ---- main ---------------------------------------------------------------
     def compile(self, ir: CohortDefinition) -> CompiledCohort:

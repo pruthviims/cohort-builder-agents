@@ -145,7 +145,7 @@ def compose(intent: CohortIntent, resolved: dict[str, ResolvedConceptSet], ont: 
         crit = _build(issues, where, lambda c=c, cs=cs, window=window, vf=vf, entity=entity, target=target,
                       prefix=prefix: Criterion(
             id=f"{prefix}_{len(target) + 1}", name=c.name, entity=entity, concept_set_id=cs.id, window=window,
-            occurrence=c.occurrence, count=c.count, value_filter=vf,
+            occurrence=c.occurrence, count=c.count, count_by=c.count_by, value_filter=vf,
             claim_status=_claim_status(entity, c.claim_status, ont),
             dx_position=c.dx_position if c.dx_position == "primary" else None, min_span_days=c.min_span_days))
         if crit is not None:

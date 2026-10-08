@@ -105,7 +105,10 @@ class Criterion(_IRModel):
     window: Window = Field(default_factory=Window)
     occurrence: Literal["at_least", "at_most", "exactly"] = "at_least"
     count: int = Field(default=1, ge=0, le=MAX_COUNT,
-                       description="Number of qualifying events (rows); at_most/exactly 0 = 'none'")
+                       description="Number of qualifying events; at_most/exactly 0 = 'none'")
+    count_by: Literal["records", "dates"] = Field(
+        default="records", description="What `count` counts: every qualifying record (default, OHDSI-style), or "
+                                       "distinct event dates (several records on one day count once)")
     value_filter: ValueFilter | None = None
     # claims attributes (only on datasets whose profile supports them)
     claim_status: list[ClaimStatus] | None = Field(
@@ -252,6 +255,8 @@ class CohortDefinition(_IRModel):
                 out["dx_position"] = x.dx_position
             if getattr(x, "min_span_days", None) is not None:
                 out["min_span_days"] = x.min_span_days
+            if getattr(x, "count_by", "records") != "records":
+                out["count_by"] = x.count_by
             return out
 
         def key(d: dict) -> str:

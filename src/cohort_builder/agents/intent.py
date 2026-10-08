@@ -41,6 +41,9 @@ class IntentCriterion(BaseModel):
     min_span_days: int | None = Field(
         default=None, description="With at_least N (N >= 2): first and last qualifying events must be at least "
                                   "this many days apart, e.g. '2 claims at least 30 days apart'")
+    count_by: Literal["records", "dates"] = Field(
+        default="records", description="'dates' when the user counts visits/days ('on 2 different days'); "
+                                       "otherwise 'records'")
 
 
 class CohortIntent(BaseModel):

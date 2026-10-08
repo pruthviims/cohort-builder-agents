@@ -17,7 +17,7 @@
 #   concepts through the OMOP vocabularies, so the rest of the system is unchanged.
 # - No lab values and no visit table.
 name: iqvia_laad
-version: 1.0.0
+version: 1.1.0
 description: IQVIA LAAD-style open US claims (synthetic). Pharmacy claims with adjudication status, medical claims with diagnoses and procedures. No enrollment, no lab values.
 data_type: claims_open
 
@@ -90,7 +90,7 @@ setup_sql:
     CREATE OR REPLACE VIEW sem.drug_exposure AS
     WITH reversed AS (
       SELECT DISTINCT orig_claim_id FROM laad.rx_claims WHERE txn_type = 'REVERSAL')
-    SELECT r.claim_id, r.patient_id AS person_id,
+    SELECT DISTINCT r.claim_id, r.patient_id AS person_id,
            coalesce(m.concept_id, 0) AS drug_concept_id,
            r.svc_dt AS drug_exposure_start_date,
            r.svc_dt + (greatest(coalesce(r.days_supply, 1), 1) - 1) AS drug_exposure_end_date,
@@ -101,7 +101,11 @@ setup_sql:
            r.reject_code, r.ndc AS source_value
     FROM laad.rx_claims r
     LEFT JOIN sem.source_code_map m ON m.vocabulary_id = 'NDC' AND m.code = upper(r.ndc)
-    WHERE r.txn_type <> 'REVERSAL'
+    WHERE r.txn_type <> 'REVERSAL' AND r.patient_id IS NOT NULL
+  # one row per (claim, diagnosis code): duplicate claim lines and the same code listed twice on one
+  # claim count once; dx_position is the highest-priority (lowest) position the code appears in.
+  # Identical duplicate pharmacy/procedure rows are collapsed (SELECT DISTINCT); rows without a
+  # patient id are dropped (they cannot be attributed to anyone).
   - >-
     CREATE OR REPLACE VIEW sem.condition_occurrence AS
     WITH dx AS (
@@ -111,25 +115,27 @@ setup_sql:
       UNION ALL SELECT claim_id, patient_id, svc_dt, 4, dx4 FROM laad.dx_claims)
     SELECT dx.claim_id, dx.patient_id AS person_id, coalesce(m.concept_id, 0) AS condition_concept_id,
            dx.svc_dt AS condition_start_date, dx.svc_dt AS condition_end_date,
-           dx.dx_position, dx.code AS source_value
+           min(dx.dx_position) AS dx_position, upper(replace(dx.code, '.', '')) AS source_value
     FROM dx
     LEFT JOIN sem.source_code_map m ON m.vocabulary_id = 'ICD10CM' AND m.code = upper(replace(dx.code, '.', ''))
-    WHERE dx.code IS NOT NULL AND dx.code <> ''
+    WHERE dx.code IS NOT NULL AND dx.code <> '' AND dx.patient_id IS NOT NULL
+    GROUP BY dx.claim_id, dx.patient_id, coalesce(m.concept_id, 0), dx.svc_dt, upper(replace(dx.code, '.', ''))
   - >-
     CREATE OR REPLACE VIEW sem.procedure_occurrence AS
-    SELECT p.claim_id, p.patient_id AS person_id, coalesce(m.concept_id, 0) AS procedure_concept_id,
+    SELECT DISTINCT p.claim_id, p.patient_id AS person_id, coalesce(m.concept_id, 0) AS procedure_concept_id,
            p.svc_dt AS procedure_date, p.px_code AS source_value
     FROM laad.px_claims p
     LEFT JOIN sem.source_code_map m
       ON m.vocabulary_id = CASE p.px_code_type WHEN 'CPT' THEN 'CPT4' ELSE p.px_code_type END
      AND m.code = upper(p.px_code)
+    WHERE p.patient_id IS NOT NULL
   # activity-based observation periods: any transaction counts as activity
   - >-
     CREATE OR REPLACE VIEW sem.observation_period AS
     WITH act AS (
-      SELECT patient_id, svc_dt FROM laad.rx_claims
-      UNION SELECT patient_id, svc_dt FROM laad.dx_claims
-      UNION SELECT patient_id, svc_dt FROM laad.px_claims),
+      SELECT patient_id, svc_dt FROM laad.rx_claims WHERE patient_id IS NOT NULL
+      UNION SELECT patient_id, svc_dt FROM laad.dx_claims WHERE patient_id IS NOT NULL
+      UNION SELECT patient_id, svc_dt FROM laad.px_claims WHERE patient_id IS NOT NULL),
     gaps AS (
       SELECT patient_id, svc_dt,
              CASE WHEN svc_dt - lag(svc_dt) OVER (PARTITION BY patient_id ORDER BY svc_dt)

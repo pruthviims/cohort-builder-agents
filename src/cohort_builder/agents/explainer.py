@@ -80,7 +80,8 @@ class Explainer:
 
     def _criterion(self, ir: CohortDefinition, c: Criterion) -> str:
         occ = {"at_least": "at least", "at_most": "at most", "exactly": "exactly"}[c.occurrence]
-        times = "time" if c.count == 1 else "times"
+        times = ("day" if c.count == 1 else "distinct days") if c.count_by == "dates" else \
+            ("time" if c.count == 1 else "times")
         span = f", with the first and last at least {c.min_span_days} days apart" if c.min_span_days else ""
         return (f"{occ} {c.count} {times}: {self._noun(c.entity, c.claim_status)} {self._concepts(ir, c.concept_set_id)}"
                 f"{self._value(c.value_filter)}{self._claims(c.entity, c.claim_status, c.dx_position)}, "
