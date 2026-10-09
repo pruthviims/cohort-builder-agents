@@ -403,6 +403,9 @@ cohort-builder proxy approve ID --reviewer bob                            # not 
 cohort-builder proxy execute ID --user carol                              # approved definitions only
 cohort-builder proxy results ID                                           # suppressed evidence summary
 cohort-builder proxy compare GEN1 GEN2                                    # suppressed overlaps
+cohort-builder proxy validate-reference ID --reference NAME --intended-use USE   # evaluation + criteria check
+cohort-builder proxy review-evaluation ID VALIDATION_ID --reviewer dana --decision accepted --rationale "..."
+cohort-builder proxy status ID                                            # every status, side by side
 ```
 
 The same steps are available over the HTTP API (`/proxy-cohorts`, `/proxy-cohorts/{id}/validate|review|
@@ -419,15 +422,100 @@ evidence funnel, all small-cell suppressed. Per-patient explanations (which evid
 tier rule held, the score) need an admin principal **and** `CB_ALLOW_PATIENT_LEVEL=true`, and every
 access is audited.
 
-### Validation against a reference standard
+### Definition validation, identifiers and hashing
 
-Sensitivity, specificity, PPV, NPV and F1 are computed **only** against an external, labelled reference
-standard (e.g. chart review or a registry) that an admin loads (`cohort-builder proxy load-reference
-NAME labels.csv --source "..."` or `POST /proxy-references`). They are computed over the labelled
-population, never from the proxy cohort itself, and withheld if a confusion-matrix cell is below the
-minimum cell count or the reference lacks cases or non-cases. A recorded validation can then back a new
-version classified `clinically_validated`, but only if its logic (semantic hash) is identical to the
-validated one. No validation data is shipped with this repository.
+- **Strict identifiers.** Concept-set ids must be unique (identical or conflicting copies are both
+  rejected, because the compiler expands concept sets by id and duplicates would merge code lists).
+  Evidence, group and temporal-rule ids, tier names and conflict names are unique too, and every
+  reference must resolve. YAML and JSON files with a repeated mapping key at any depth are rejected
+  instead of silently keeping the last value. (A JSON body sent to the HTTP API is parsed by the web
+  framework first, so prefer the `yaml` field or files when authoring by hand.)
+- **Content hash** = the exact definition. **Semantic hash** = the selection logic only, under a
+  versioned contract (`proxy-semantic-v2`, see `ProxyDefinition.semantic_form`):
+  - *included:* index event, observation, demographics, every evidence rule (inlined concept items,
+    window, counts, spans, filters, category, required), evidence/group/temporal ids (they name output
+    columns), temporal bounds, entry/exclusion, conflicts, score weights, tiers **in order** (first match
+    wins) and funnel steps **in order**, exit;
+  - *excluded:* names, labels, descriptions, notes, target, classification, version, dataset profile,
+    assumptions, provenance, acceptance criteria and concept-set ids/names/sources;
+  - *canonicalized:* concept items (sorted, de-duplicated), concept sets, evidence, temporal rules,
+    conflicts and weights (sorted), AND/OR children (sorted, de-duplicated), N-of-M items (sorted; duplicates
+    kept because they count), and temporal relations (reduced to their day bounds).
+  Equivalent definitions therefore hash identically; a changed rule, window, threshold, concept set or tier
+  priority changes the hash. Approvals and evaluations are tied to a definition id and its semantic hash, so
+  they never carry over to changed logic.
+
+### Evaluation against a reference standard
+
+Metrics are computed **only** against an external, labelled reference standard (chart review, a
+registry, ...) that an admin loads: `cohort-builder proxy load-reference NAME labels.csv --source "..."`
+(columns `person_id`, `label` = case / non_case / unknown or the older `is_case`, optional
+`reference_date`) or `POST /proxy-references`. Never from the proxy cohort itself. No reference data
+ships with this repository; the test labels are synthetic.
+
+**Evaluation population.** Records collapse to one row per patient (duplicates count once; `case` plus
+`non_case` for one patient = `conflicting`; only `unknown` = indeterminate). A patient is *eligible*, and
+then evaluated, only with a definite label, presence in the active dataset, enough observation (an
+observation period covering the reference date with the algorithm's prior/post observation, or without a
+date one lasting at least `min_observation_days`, default prior + post) and, if configured
+(`require_data`, e.g. `Measurement`), at least one record of each required data type. Everyone else is
+**excluded and counted by reason**, never as a negative. Predicted positive = member of the generation in
+one of the positive tiers. Reports give reference patients, labels, eligible, evaluated, excluded (by
+reason), eligible cases/non-cases and cohort members without a label, all small-cell suppressed.
+
+*Impact:* excluding unobservable patients prevents spurious false negatives (sensitivity biased down) and
+spurious true negatives (specificity and NPV biased up). Requiring a data type can bias the evaluated
+population towards patients with more complete records; report it with the result. On activity-based
+claims data observation is inferred from claim activity, a weaker guarantee than enrollment.
+
+**Metric definitions** (`cohort_builder/metrics.py`, the only implementation): sensitivity TP/(TP+FN),
+specificity TN/(TN+FP), PPV TP/(TP+FP), NPV TN/(TN+FN), F1 = 2·PPV·sensitivity/(PPV+sensitivity). A
+metric is `null` (**undefined**) exactly when its denominator is zero (no reference positives, nothing
+predicted positive, ...); F1 is `null` when PPV or sensitivity is undefined and **0.0** when both are
+defined and TP = 0. 95% (or 90/99%) Wilson intervals accompany each proportion. Metrics are withheld if a
+confusion-matrix cell is below the minimum cell count or the eligible population lacks cases or non-cases.
+
+### Evaluation status, acceptance criteria and approval are separate
+
+| Status | Meaning | Set by |
+|---|---|---|
+| definition validation `passed` / `failed` | structural and logical checks on the active dataset | validator (code) |
+| execution approval `approved` | this exact version may run | reviewer (not the author) |
+| evaluation `completed` / `inconclusive` | ran against a reference; inconclusive if metrics are withheld or the data snapshot changed since the run | system |
+| acceptance criteria `criteria_met` / `criteria_not_met` / `inconclusive` / `not_assessed` | automatic check of prespecified criteria; inconclusive if a sample-size minimum is missed or a needed metric is undefined | system |
+| acceptance review `accepted` / `rejected` / `pending` | a reviewer accepts the evaluation for its intended use, with a rationale; recorded once | reviewer (not the algorithm's or evaluation's author) |
+| lifecycle `superseded` | a newer version of the same algorithm is approved; running the old one adds a caveat | system |
+
+Acceptance criteria (`min_sensitivity`, `min_ppv`, `min_specificity`, `min_npv`, `min_evaluated`,
+`min_reference_positive`, `min_reference_negative`, optionally judged on the lower confidence bound) have
+**no defaults**: they depend on the disease, reference standard and intended use. Prespecify them per
+intended use in the definition (`acceptance_criteria:`; they cannot be replaced at evaluation time) or
+pass them with the evaluation request; either way they are recorded with the result. Only a
+`completed` evaluation with `criteria_met` can be accepted. A version may be classified
+`clinically_validated` only with a `validation_reference` to such an **accepted** evaluation of the
+**same logic** (semantic hash recomputed from the evaluated definition), and only with complete,
+non-placeholder provenance. `GET /proxy-cohorts/{id}/status` (and `cohort-builder proxy status ID`, MCP
+`get_proxy_status`) shows every status side by side. Acceptance is recorded for one intended use,
+reference standard and data snapshot; it is not regulatory or clinical approval.
+
+### Evidence provenance
+
+Concept sets may carry `code_system`, `code_system_version`, `version`, `effective_from` /
+`effective_to` (metadata; they do not filter events) and `provenance`; evidence items may carry
+`provenance` (`source_reference`, `clinical_rationale`, `limitations`). Provenance is never invented: the
+validator reports missing rationale, missing concept-set versions or code systems, and any text marked
+`PLACEHOLDER` (errors for `clinically_validated`, warnings otherwise). Provenance and each evidence item's
+role (entry = mandatory for every member, exclusion, conflict, tier, score, temporal, funnel) appear in the
+review packet, the compiled SQL's metadata and every evaluation report. Supporting evidence is never
+treated as mandatory unless the definition says so (`entry` or a required temporal rule).
+
+Claims-based proxies infer that a patient's data match a pattern; they do not independently establish a
+clinical diagnosis. Claims and lab data have known gaps (unbilled tests, missing results, coding drift,
+care outside the network), which is why absence warnings and eligibility rules exist.
+
+**Examples are synthetic.** `examples/proxy/escc_proxy_example.yaml` uses placeholder concepts,
+placeholder provenance and an `acceptance_criteria.synthetic_demo` block whose thresholds are illustrative
+only; the test-suite labels are invented. Nothing in this repository is a clinically validated algorithm.
 
 ## Running tests and checks
 
@@ -439,9 +527,10 @@ CB_TEST_POSTGRES_DSN=postgresql://user:pass@localhost:5432/postgres pytest   # a
 ruff check src tests && ruff format --check src tests && mypy
 pip-audit --skip-editable                 # dependency vulnerabilities (run in a clean virtualenv)
 git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline   # secret scan
+python -m build && twine check dist/*       # package builds and metadata is valid (local check)
 ```
 
-CI runs all of these on Python 3.11–3.13, against a PostgreSQL 16 service, using synthetic data and
+CI runs all of these except the package build on Python 3.11–3.13, against a PostgreSQL 16 service, using synthetic data and
 throwaway credentials only.
 
 ## Configuration
@@ -479,7 +568,9 @@ src/cohort_builder/
   compiler.py        deterministic IR -> SQL with attrition
   proxy.py           proxy algorithm model (evidence, logic, temporal rules, tiers, versions)
   proxy_compiler.py  deterministic proxy -> SQL (assignment, evidence, attrition, summary)
-  proxy_service.py   proxy workflow: versions, review packet, execution, results, comparison, reference validation
+  proxy_service.py   proxy workflow: versions, review packet, execution, results, comparison, evaluation, status
+  proxy_evaluation.py  reference-standard evaluation population, eligibility, acceptance-criteria check
+  metrics.py         sensitivity/specificity/PPV/NPV/F1 + Wilson intervals (single implementation)
   executor.py        runs SQL, small-cell suppression, results tables
   llm.py             Anthropic client, request hashing, cache/replay
   agents/            intent parser, concept resolver, critic, proxy parser (LLM); composer, validators,

@@ -19,7 +19,7 @@ import dataclasses
 import hashlib
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -39,8 +39,19 @@ from .executor import (
 )
 from .llm import LLMError
 from .metadata import now
-from .proxy import Expr, ProxyDefinition
+from .metrics import DEFINITIONS, rounded
+from .proxy import CLASSIFICATION_LABELS, AcceptanceCriteria, Expr, ProxyDefinition, provenance_summary
 from .proxy_compiler import CompiledProxy, ProxyCompiler
+from .proxy_evaluation import (
+    EligibilityRules,
+    ReferenceRecord,
+    assess_acceptance,
+    classify,
+    collapse_records,
+    compute_metrics,
+    eligibility_sql,
+    normalize_label,
+)
 from .security import DEFAULT_TENANT, GovernanceError
 
 if TYPE_CHECKING:  # attributes provided by CohortBuilder
@@ -176,7 +187,9 @@ class ProxyMixin:
         }
 
     def _check_validation_reference(self, p: ProxyDefinition, tenant: str) -> None:
-        """'clinically_validated' needs a recorded reference validation of the SAME logic in this tenant."""
+        """'clinically_validated' needs, in this tenant, an evaluation of the SAME logic (semantic hash recomputed
+        from the evaluated definition) that completed, met its prespecified acceptance criteria and was accepted
+        by a human reviewer. A record merely existing is not enough."""
         if p.classification != "clinically_validated":
             return
         rec = self.store.get_validation(p.validation_reference or "")
@@ -186,15 +199,31 @@ class ProxyMixin:
                 "validation in this tenant; 'clinically_validated' cannot be claimed"
             )
         validated = self.store.get_definition(rec["cohort_definition_id"]) or {}
-        if validated.get("algorithm_name") != p.algorithm_name or validated.get("semantic_hash") != p.semantic_hash():
+        same = False
+        if validated.get("algorithm_name") == p.algorithm_name:
+            try:
+                same = ProxyDefinition.model_validate(validated["ir"]).semantic_hash() == p.semantic_hash()
+            except Exception:  # an unreadable stored definition never supports a claim
+                same = False
+        if not same:
             raise GovernanceError(
                 "the referenced validation was run on different algorithm logic; validate this "
                 "exact logic against the reference standard first"
             )
-        if not rec["metrics"].get("reported"):
+        if rec.get("evaluation_status") != "completed":
             raise GovernanceError(
-                "the referenced validation did not report metrics (cells below the minimum or "
-                "missing classes); it cannot support 'clinically_validated'"
+                f"the referenced evaluation is {rec.get('evaluation_status') or 'a legacy record without status'}, "
+                "not completed; it cannot support 'clinically_validated'"
+            )
+        if rec.get("acceptance_status") != "criteria_met":
+            raise GovernanceError(
+                f"the referenced evaluation's acceptance status is {rec.get('acceptance_status') or 'not_assessed'}; "
+                "prespecified acceptance criteria must be met"
+            )
+        if rec.get("review_decision") != "accepted":
+            raise GovernanceError(
+                "the referenced evaluation has not been accepted by a human reviewer "
+                f"(decision: {rec.get('review_decision') or 'pending'})"
             )
 
     def next_version(self, tenant: str, algorithm_name: str) -> str:
@@ -451,6 +480,16 @@ class ProxyMixin:
                 f"{self.ontology.dataset_name!r}: " + "; ".join(errors)
             )
         caveats = [i.as_dict() for i in issues if i.severity == "warning"]
+        life = self._lifecycle(row, p)
+        if life["superseded"]:
+            caveats.append(
+                {
+                    "severity": "warning",
+                    "stage": "governance",
+                    "message": f"version {p.version} is superseded by approved version(s) "
+                    f"{', '.join(life['superseded_by_approved_versions'])}",
+                }
+            )
         compiled: CompiledProxy = ProxyCompiler(self.ontology).compile_proxy(p)
         try:
             generation_id, attrition = self.executor.generate(compiled, def_id)
@@ -668,17 +707,32 @@ class ProxyMixin:
             ],
         }
 
-    # ---- reference-standard validation --------------------------------------------------------------
+    # ---- reference-standard evaluation -----------------------------------------------------------------
     def load_reference(
-        self, name: str, labels: list[tuple[int, bool]], source: str, actor: str, tenant: str = DEFAULT_TENANT
+        self,
+        name: str,
+        labels: Sequence[Any],
+        source: str,
+        actor: str,
+        tenant: str = DEFAULT_TENANT,
     ) -> dict:
         """Patient-level labels from an EXTERNAL reference standard (e.g. chart review, registry). Admin input
-        only; the labels are never returned by any interface."""
+        only; never returned by any interface. Each label is a ReferenceRecord or a tuple
+        (person_id, label[, reference_date]) where label is case / non_case / unknown (or True / False / None).
+        Duplicate records collapse to one patient; case + non_case for one patient becomes 'conflicting'."""
         if not source.strip():
             raise ValueError("source must describe the external reference standard (e.g. 'chart review 2026')")
-        if len({pid for pid, _ in labels}) != len(labels):
-            raise ValueError("duplicate person ids in reference labels")
-        n = self.store.load_reference(name, tenant, labels, source.strip(), actor)
+        records = []
+        for item in labels:
+            if isinstance(item, ReferenceRecord):
+                records.append(item)
+                continue
+            pid, value, *rest = item
+            records.append(ReferenceRecord(int(pid), normalize_label(value), rest[0] if rest else None))
+        if not records:
+            raise ValueError("a reference standard needs at least one labelled patient")
+        rows, collapse = collapse_records(records)
+        n = self.store.load_reference(name, tenant, rows, source.strip(), actor)
         self.store.audit(
             actor,
             "reference.load",
@@ -686,18 +740,35 @@ class ProxyMixin:
             name,
             "success",
             tenant,
-            {"labelled": n, "source": source.strip()},
+            {"patients": n, "records": collapse["records"], "source": source.strip()},
         )
         info = self.store.reference_info(name, tenant) or {}
         k = self.executor.min_cell
+        labels_shown = suppress_partition(
+            {c: info.get(c, 0) for c in ("cases", "non_cases", "unknown", "conflicting")}, k
+        )
         return {
-            **info,
-            "labelled": suppress_count(info.get("labelled", 0), k),
-            "cases": suppress_with_total(info.get("cases", 0), info.get("labelled", 0), k),
-            "non_cases": suppress_with_total(info.get("non_cases", 0), info.get("labelled", 0), k),
+            "reference_name": name,
+            "source": info.get("source"),
+            "loaded_by": actor,
+            "patients": suppress_count(info.get("patients", 0), k),
+            "records": suppress_count(info.get("records", 0), k),
+            **labels_shown,
+            "patients_with_duplicate_records": suppress_count(collapse["patients_with_duplicate_records"], k),
+            "patients_with_several_reference_dates": suppress_count(
+                collapse["patients_with_several_reference_dates"], k
+            ),
+            "notes": [
+                "Duplicate records were collapsed to one per patient; patients labelled both case and "
+                "non_case are 'conflicting' and, like 'unknown', are never evaluated."
+            ],
         }
 
-    def validate_against_reference(
+    def validate_against_reference(self, *args: Any, **kwargs: Any) -> dict:
+        """Backward-compatible name for `evaluate_against_reference`."""
+        return self.evaluate_against_reference(*args, **kwargs)
+
+    def evaluate_against_reference(
         self,
         def_id: int,
         reference_name: str,
@@ -705,7 +776,13 @@ class ProxyMixin:
         tenant: str | None = None,
         generation_id: str | None = None,
         positive_tiers: list[str] | None = None,
+        intended_use: str | None = None,
+        criteria: AcceptanceCriteria | None = None,
+        eligibility: EligibilityRules | None = None,
     ) -> dict:
+        """Empirical evaluation of one generation against a reference standard, over the eligible
+        evaluation population (see proxy_evaluation.py), plus an AUTOMATIC check of acceptance criteria.
+        Neither is an approval: a reviewer records acceptance separately (`review_evaluation`)."""
         row, p = self.load_proxy(def_id, tenant)
         row_tenant = row.get("tenant") or DEFAULT_TENANT
         gen = self._generation(def_id, generation_id)
@@ -715,40 +792,60 @@ class ProxyMixin:
         tiers = sorted(set(positive_tiers or [t.name for t in p.tiers]))
         if unknown := sorted(set(tiers) - {t.name for t in p.tiers}):
             raise ValueError(f"unknown tiers: {unknown}")
-        placeholders = ",".join("?" for _ in tiers)
-        tp, fp, fn, tn = self.store.con.execute(
-            "SELECT count(*) FILTER (WHERE r.is_case AND c.subject_id IS NOT NULL), "
-            "count(*) FILTER (WHERE NOT r.is_case AND c.subject_id IS NOT NULL), "
-            "count(*) FILTER (WHERE r.is_case AND c.subject_id IS NULL), "
-            "count(*) FILTER (WHERE NOT r.is_case AND c.subject_id IS NULL) "
-            "FROM meta.reference_label r LEFT JOIN (SELECT DISTINCT subject_id FROM results.proxy_assignment "
-            f"WHERE generation_id = ? AND tier IN ({placeholders})) c ON c.subject_id = r.person_id "
-            "WHERE r.tenant = ? AND r.reference_name = ?",
-            [gen["generation_id"], *tiers, row_tenant, reference_name],
-        ).fetchone()
-        k = self.executor.min_cell
-        counts = {"TP": int(tp), "FP": int(fp), "FN": int(fn), "TN": int(tn)}
-        reasons = []
-        if tp + fn == 0 or fp + tn == 0:
-            reasons.append("the reference standard must contain both cases and non-cases")
-        if any(0 < v < k for v in counts.values()):
-            reasons.append(f"a confusion-matrix cell is below the minimum cell count ({k})")
-
-        def ratio(a: int, b: int) -> float | None:
-            return round(a / b, 4) if b else None
-
-        metrics: dict[str, Any] = {"reported": not reasons, "withheld_reasons": reasons}
-        if not reasons:
-            sens, ppv = ratio(tp, tp + fn), ratio(tp, tp + fp)
-            metrics.update(
-                {
-                    "sensitivity": sens,
-                    "specificity": ratio(tn, tn + fp),
-                    "ppv": ppv,
-                    "npv": ratio(tn, tn + fn),
-                    "f1": round(2 * sens * ppv / (sens + ppv), 4) if sens and ppv else None,
-                }
+        prespecified = p.acceptance_criteria.get(intended_use) if intended_use else None
+        if prespecified is not None and criteria is not None and criteria != prespecified:
+            raise ValueError(
+                f"acceptance criteria for intended use {intended_use!r} are prespecified in version {p.version}; "
+                "they cannot be replaced at evaluation time (create a new version to change them)"
             )
+        crit = criteria or prespecified
+        crit_source = (
+            None
+            if crit is None
+            else (
+                "prespecified in the definition" if prespecified is not None else "supplied with the evaluation request"
+            )
+        )
+        rules = eligibility or EligibilityRules()
+        for entity in rules.require_data:
+            if not self.ontology.supports_entity(entity):
+                raise ValueError(
+                    f"eligibility requires {entity} data, which dataset {self.ontology.dataset_name!r} "
+                    "does not provide; patients cannot be checked for it"
+                )
+        sql = eligibility_sql(self.ontology, p, rules, len(tiers))
+        con = self.store.con
+        rows = con.execute(sql, [gen["generation_id"], *tiers, row_tenant, reference_name]).fetchall()
+        pop = classify(rows, rules.require_data)
+        unlabelled = int(
+            con.execute(
+                "SELECT count(DISTINCT a.subject_id) FROM results.proxy_assignment a WHERE a.generation_id = ? AND "
+                f"a.tier IN ({', '.join('?' for _ in tiers)}) AND NOT EXISTS (SELECT 1 FROM meta.reference_label r "
+                "WHERE r.tenant = ? AND r.reference_name = ? AND r.person_id = a.subject_id)",
+                [gen["generation_id"], *tiers, row_tenant, reference_name],
+            ).fetchone()[0]
+        )
+        k = self.executor.min_cell
+        counts = pop["confusion"]
+        level = crit.confidence_level if crit else 0.95
+        raw = compute_metrics(counts, level)
+        withheld = []
+        if pop["eligible_reference_positive"] == 0 or pop["eligible_reference_negative"] == 0:
+            withheld.append("the eligible population must contain both reference cases and non-cases")
+        if any(0 < v < k for v in counts.values()):
+            withheld.append(f"a confusion-matrix cell is below the minimum cell count ({k})")
+        inconclusive = list(withheld)
+        snapshot = self.data_snapshot()
+        if gen["data_snapshot"] != snapshot:
+            inconclusive.append(
+                f"the data snapshot changed since this generation ran ({gen['data_snapshot']!r} -> "
+                f"{snapshot!r}); re-run the algorithm before evaluating"
+            )
+        evaluation_status = "inconclusive" if inconclusive else "completed"
+        acceptance = assess_acceptance(crit, pop, None if withheld else raw, evaluation_status)
+        metrics: dict[str, Any] = {"reported": not withheld, "withheld_reasons": withheld, "definitions": DEFINITIONS}
+        if not withheld:
+            metrics.update(rounded(raw))
         validation_id = str(uuid.uuid4())
         self.store.record_validation(
             {
@@ -761,35 +858,86 @@ class ProxyMixin:
                 "metrics": metrics,
                 "created_by": actor,
                 "tenant": row_tenant,
+                "evaluation_status": evaluation_status,
+                "acceptance_status": acceptance["status"],
+                "intended_use": intended_use,
+                "criteria": None if crit is None else {**crit.model_dump(mode="json"), "source": crit_source},
+                "acceptance": acceptance,
+                "population": {**pop, "cohort_members_without_reference_label": unlabelled},
+                "eligibility": rules.model_dump(mode="json"),
+                "semantic_hash": p.semantic_hash(),
+                "data_snapshot": snapshot,
             }
         )
         self.store.audit(
             actor,
-            "proxy.validate_reference",
+            "proxy.evaluate_reference",
             "cohort_definition",
             def_id,
             "success",
             row_tenant,
-            {"validation_id": validation_id, "reference": reference_name, "reported": not reasons},
+            {
+                "validation_id": validation_id,
+                "reference": reference_name,
+                "evaluation_status": evaluation_status,
+                "acceptance_status": acceptance["status"],
+            },
         )
         return {
             "validation_id": validation_id,
             "cohort_definition_id": def_id,
+            "algorithm": {"name": p.algorithm_name, "version": p.version, "semantic_hash": p.semantic_hash()},
             "generation_id": gen["generation_id"],
+            "data_snapshot": snapshot,
             "reference": {
                 "name": reference_name,
                 "source": info["source"],
-                "labelled": suppress_count(info["labelled"], k),
+                "patients": suppress_count(info["patients"], k),
             },
             "positive_tiers": tiers,
+            "intended_use": intended_use,
+            "status": {
+                "evaluation": evaluation_status,
+                "evaluation_reasons": inconclusive,
+                "acceptance_criteria": acceptance["status"],
+                "human_review": "pending",
+                "note": "Evaluation and the automatic criteria check are not approvals. A reviewer must accept "
+                "this evaluation before the version may be described as clinically validated.",
+            },
+            "population": self._population_view(pop, unlabelled, k),
+            "eligibility_rules": rules.model_dump(mode="json"),
             "confusion_matrix": self._confusion_cells(counts, k),
             "metrics": metrics,
-            "population": "metrics are computed over the labelled reference population only (cases and non-cases "
-            "from the external reference standard), never from the proxy cohort itself",
+            "acceptance": {
+                "criteria": None if crit is None else crit.model_dump(mode="json"),
+                "criteria_source": crit_source,
+                **acceptance,
+            },
+            "provenance": self.provenance_summary(p),
             "notes": [
-                "Metrics describe agreement with this reference standard on this dataset and data snapshot; "
-                "they do not transfer to other datasets or populations."
+                "Metrics are computed over the eligible, evaluated reference population only - never from the "
+                "proxy cohort itself. Excluded patients are not counted as negatives.",
+                "Metrics describe agreement with this reference standard on this dataset and data snapshot; they "
+                "do not transfer to other datasets, populations or intended uses.",
+                "Claims-based proxies infer that data match a pattern; they do not establish a clinical diagnosis.",
             ],
+        }
+
+    @staticmethod
+    def _population_view(pop: dict, unlabelled: int, k: int) -> dict:
+        total, excluded = pop["reference_patients"], pop["excluded"]
+        return {
+            "definition": "eligible = definite reference label + present in the dataset + observable + required "
+            "data present; every eligible patient is evaluated",
+            "reference_patients": suppress_count(total, k),
+            "labels": suppress_partition(pop["labels"], k),
+            "eligible": suppress_with_total(pop["eligible"], total, k),
+            "evaluated": suppress_with_total(pop["evaluated"], total, k),
+            "eligible_reference_positive": suppress_with_total(pop["eligible_reference_positive"], pop["eligible"], k),
+            "eligible_reference_negative": suppress_with_total(pop["eligible_reference_negative"], pop["eligible"], k),
+            "excluded": suppress_with_total(excluded, total, k),
+            "excluded_by_reason": suppress_partition(pop["excluded_by_reason"], k),
+            "cohort_members_without_reference_label": suppress_count(unlabelled, k),
         }
 
     @staticmethod
@@ -798,6 +946,188 @@ class ProxyMixin:
         if not any(0 < v < k for v in counts.values()):
             return dict(counts)
         return {c: (suppress_count(v, k) if v < k else COMPLEMENTARY) for c, v in counts.items()}
+
+    # ---- human acceptance review of an evaluation ----------------------------------------------------
+    def review_evaluation(
+        self, def_id: int, validation_id: str, reviewer: str, decision: str, rationale: str, tenant: str | None = None
+    ) -> dict:
+        """A reviewer accepts or rejects ONE evaluation for its intended use. Recorded once, audited.
+        Acceptance needs a completed evaluation whose prespecified criteria were met."""
+        row, p = self.load_proxy(def_id, tenant)
+        row_tenant = row.get("tenant") or DEFAULT_TENANT
+        rec = self.store.get_validation(validation_id)
+        if rec is None or rec["cohort_definition_id"] != def_id:
+            raise KeyError(f"evaluation {validation_id} not found for definition {def_id}")
+        details = {"validation_id": validation_id, "decision": decision}
+
+        def deny(reason: str) -> None:
+            self.store.audit(
+                reviewer,
+                "proxy.evaluation_review",
+                "cohort_definition",
+                def_id,
+                "denied",
+                row_tenant,
+                {**details, "reason": reason},
+            )
+
+        if decision not in ("accepted", "rejected"):
+            raise ValueError("decision must be 'accepted' or 'rejected'")
+        if len(rationale.strip()) < 10:
+            raise ValueError("a decision rationale (at least 10 characters) is required")
+        if rec.get("review_decision"):
+            deny("already reviewed")
+            raise ValueError(
+                f"evaluation {validation_id} was already {rec['review_decision']} by "
+                f"{rec['reviewed_by']}; run a new evaluation instead"
+            )
+        if reviewer in (row["created_by"], rec["created_by"]) and not self.policy.allow_self_approval:
+            deny("self-review")
+            raise GovernanceError("the author of the algorithm or of the evaluation cannot review it")
+        if decision == "accepted":
+            if rec.get("evaluation_status") != "completed":
+                deny(f"evaluation {rec.get('evaluation_status') or 'legacy'}")
+                raise ValueError(
+                    "only a completed evaluation can be accepted (this one is "
+                    f"{rec.get('evaluation_status') or 'a legacy record without status'})"
+                )
+            if rec.get("acceptance_status") != "criteria_met":
+                deny(f"acceptance {rec.get('acceptance_status')}")
+                raise ValueError(
+                    "only an evaluation whose prespecified acceptance criteria were met can be accepted "
+                    f"(status: {rec.get('acceptance_status')})"
+                )
+            if rec.get("semantic_hash") != p.semantic_hash():
+                deny("logic changed")
+                raise ValueError("the evaluation was recorded for different algorithm logic")
+        self.store.record_validation_review(validation_id, decision, reviewer, rationale.strip())
+        self.store.audit(
+            reviewer, "proxy.evaluation_review", "cohort_definition", def_id, "success", row_tenant, details
+        )
+        return {
+            "validation_id": validation_id,
+            "cohort_definition_id": def_id,
+            "decision": decision,
+            "reviewer": reviewer,
+            "scope": f"intended use {rec.get('intended_use')!r} of {p.algorithm_name} logic "
+            f"{p.semantic_hash()[:19]}..., this reference standard and data snapshot only",
+        }
+
+    # ---- lifecycle / status -----------------------------------------------------------------------------
+    @staticmethod
+    def _vkey(v: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in v.split("."))
+
+    def _lifecycle(self, row: dict, p: ProxyDefinition) -> dict:
+        versions = self.store.find_algorithm(row.get("tenant") or DEFAULT_TENANT, p.algorithm_name)
+        newer = [v for v in versions if self._vkey(v["algorithm_version"]) > self._vkey(p.version)]
+        superseded_by = sorted((v["algorithm_version"] for v in newer if v["status"] == "approved"), key=self._vkey)
+        latest = max((v["algorithm_version"] for v in versions), key=self._vkey) if versions else p.version
+        return {
+            "latest_version": latest,
+            "is_latest": latest == p.version,
+            "superseded": bool(superseded_by),
+            "superseded_by_approved_versions": superseded_by,
+            "newer_unapproved_versions": sorted(
+                (v["algorithm_version"] for v in newer if v["status"] != "approved"), key=self._vkey
+            ),
+        }
+
+    def proxy_status(self, def_id: int, tenant: str | None = None) -> dict:
+        """Every status of one version, kept separate: definition validation, execution approval,
+        evaluations, automatic acceptance checks, human acceptance reviews, lifecycle and the claim
+        this version may make."""
+        row, p = self.load_proxy(def_id, tenant)
+        issues, _, _ = validate_proxy(p, self.ontology, self.vocab)
+        errors = [i for i in issues if i.severity == "error"]
+        current = p.semantic_hash()
+        evaluations = []
+        for rec in self.store.validations(def_id):
+            evaluations.append(
+                {
+                    "validation_id": rec["validation_id"],
+                    "generation_id": rec["generation_id"],
+                    "reference_name": rec["reference_name"],
+                    "intended_use": rec.get("intended_use"),
+                    "created_by": rec["created_by"],
+                    "created_at": rec["created_at"],
+                    "evaluation_status": rec.get("evaluation_status") or "legacy (no status recorded)",
+                    "acceptance_status": rec.get("acceptance_status") or "not_assessed",
+                    "human_review": {
+                        "decision": rec.get("review_decision") or "pending",
+                        "reviewed_by": rec.get("reviewed_by"),
+                        "reviewed_at": rec.get("reviewed_at"),
+                        "rationale": rec.get("review_rationale"),
+                    },
+                    "same_logic_as_this_version": rec.get("semantic_hash") == current,
+                    "data_snapshot": rec.get("data_snapshot"),
+                }
+            )
+        lifecycle = self._lifecycle(row, p)
+        claim_ok, claim_reason = True, "backed by an accepted evaluation of this logic"
+        if p.classification == "clinically_validated":
+            try:
+                self._check_validation_reference(p, row.get("tenant") or DEFAULT_TENANT)
+            except GovernanceError as exc:
+                claim_ok, claim_reason = False, str(exc)
+        accepted = [
+            e for e in evaluations if e["human_review"]["decision"] == "accepted" and e["same_logic_as_this_version"]
+        ]
+        return {
+            "cohort_definition_id": def_id,
+            "algorithm": {
+                "name": p.algorithm_name,
+                "version": p.version,
+                "semantic_hash": current,
+                "content_hash": p.content_hash(),
+            },
+            "classification": {
+                "value": p.classification,
+                "label": CLASSIFICATION_LABELS[p.classification],
+                "claim_supported": claim_ok if p.classification == "clinically_validated" else None,
+                "reason": claim_reason if p.classification == "clinically_validated" else None,
+            },
+            "definition_validation": {
+                "status": "passed" if not errors else "failed",
+                "errors": len(errors),
+                "warnings": len(issues) - len(errors),
+                "meaning": "structural and logical checks on the active dataset; says nothing about accuracy",
+            },
+            "execution_approval": {
+                "status": row["status"],
+                "approved_by": row.get("approved_by"),
+                "approved_at": row.get("approved_at"),
+                "scope": "running this exact version (content hash); not clinical acceptance",
+            },
+            "evaluations": evaluations,
+            "accepted_for_intended_uses": sorted({e["intended_use"] or "(unspecified)" for e in accepted}),
+            "lifecycle": lifecycle,
+            "summary": self._status_summary(p, row, errors, evaluations, accepted, lifecycle),
+        }
+
+    @staticmethod
+    def _status_summary(
+        p: ProxyDefinition, row: dict, errors: list, evaluations: list, accepted: list, lifecycle: dict
+    ) -> str:
+        parts = [
+            f"{p.algorithm_name} v{p.version}: definition {'invalid' if errors else 'valid'}",
+            f"execution {row['status']}",
+        ]
+        if not evaluations:
+            parts.append("not evaluated against a reference standard")
+        elif accepted:
+            parts.append(f"evaluation accepted for {', '.join(sorted({e['intended_use'] or '?' for e in accepted}))}")
+        else:
+            parts.append("no accepted evaluation")
+        if lifecycle["superseded"]:
+            parts.append(f"superseded by v{lifecycle['superseded_by_approved_versions'][-1]}")
+        return "; ".join(parts)
+
+    def list_evaluations(self, def_id: int, tenant: str | None = None) -> list[dict]:
+        return self.proxy_status(def_id, tenant)["evaluations"]
+
+    def provenance_summary(self, p: ProxyDefinition) -> dict:
+        return provenance_summary(p)
 
     # ---- patient-level explanation (authorized access only) ---------------------------------------------
     def patient_explanation(

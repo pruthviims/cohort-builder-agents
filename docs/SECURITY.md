@@ -69,7 +69,10 @@ Tokens are never logged; authentication failures are logged without the credenti
 Proxy cohort endpoints use the same roles: authors create, validate and draft (`/proxy-cohorts`,
 `/proxy-cohorts/ask`, `/proxy-cohorts/validate`); any role reads definitions, versions, review packets and
 the SQL preview; reviewers approve or reject and run reference validations; executors run approved
-definitions; executors and reviewers read suppressed results, evidence summaries and comparisons; admins
+definitions; executors and reviewers read suppressed results, evidence summaries, evaluations and
+comparisons; any role reads `/proxy-cohorts/{id}/status`; a reviewer records the human acceptance decision for an
+evaluation (`/evaluations/{validation_id}/review`; never the algorithm's or the evaluation's author, identity from
+the token, recorded once); admins
 load reference-standard labels (`/proxy-references`) and, only when `CB_ALLOW_PATIENT_LEVEL=true`, read
 per-patient explanations.
 
@@ -109,7 +112,7 @@ Events recorded:
 - `definition.review`
 - `definition.execute`
 - `authz.denied`
-- `proxy.ask`, `proxy.submit`, `proxy.compare`, `proxy.validate_reference`, `reference.load`
+- `proxy.ask`, `proxy.submit`, `proxy.compare`, `proxy.evaluate_reference`, `proxy.evaluation_review`, `reference.load`
 - `proxy.patient_explanation` (success and denied; the patient is recorded only as a hash of
   generation id and subject id, never the id itself)
 
@@ -133,6 +136,8 @@ default threshold is `min_cell_count: 10`, set in `ontology/domain.yaml`.
   hidden if the count *or its complement* is small (`suppress_with_total`).
 - **Partitions** (proxy tiers, which sum to the candidates): if exactly one cell is hidden, the smallest
   other non-zero cell is hidden too, so it cannot be recovered by subtraction (`suppress_partition`).
+- **Evaluation reports** show only aggregate, suppressed counts (reference patients, labels, eligible,
+  excluded by reason, confusion matrix). Excluded or labelled patients are never listed.
 - **Overlaps** between two generations: small cells, and any cell recoverable from a disclosed cohort size,
   are hidden. **Confusion matrices:** if any cell is small, all non-zero cells are hidden and the metrics are
   withheld.

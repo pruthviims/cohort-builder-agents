@@ -138,17 +138,32 @@ def main(argv: list[str] | None = None) -> int:
     t = px.add_parser("compare", help="privacy-safe overlap of 2-6 generations")
     t.add_argument("generation_ids", nargs="+")
     t.add_argument("--user", default="cli")
-    t = px.add_parser("load-reference", help="load EXTERNAL reference-standard labels (CSV: person_id,is_case)")
+    t = px.add_parser(
+        "load-reference",
+        help="load EXTERNAL reference-standard labels (CSV: person_id, label or is_case, optional reference_date)",
+    )
     t.add_argument("name")
     t.add_argument("csv", type=Path)
     t.add_argument("--source", required=True, help="what the reference standard is, e.g. 'chart review 2026'")
     t.add_argument("--user", default="cli")
-    t = px.add_parser("validate-reference", help="sensitivity/specificity/PPV/NPV against a loaded reference")
+    t = px.add_parser("validate-reference", help="evaluate against a loaded reference (metrics + criteria check)")
     t.add_argument("definition_id", type=int)
     t.add_argument("--reference", required=True)
     t.add_argument("--generation")
     t.add_argument("--tiers", help="comma-separated tiers counted as positive (default: all)")
+    t.add_argument("--intended-use", help="intended use; uses criteria prespecified in the definition")
+    t.add_argument("--criteria", type=Path, help="JSON/YAML acceptance criteria (if not prespecified)")
+    t.add_argument("--require-data", default="", help="comma-separated entities patients must have, e.g. Measurement")
+    t.add_argument("--min-observation-days", type=int)
     t.add_argument("--user", default="cli")
+    t = px.add_parser("status", help="definition, approval, evaluation, acceptance and lifecycle status")
+    t.add_argument("definition_id", type=int)
+    t = px.add_parser("review-evaluation", help="human acceptance decision for one evaluation")
+    t.add_argument("definition_id", type=int)
+    t.add_argument("validation_id")
+    t.add_argument("--reviewer", required=True)
+    t.add_argument("--decision", required=True, choices=["accepted", "rejected"])
+    t.add_argument("--rationale", required=True)
     t = px.add_parser("explain-patient", help="per-patient evidence (needs CB_ALLOW_PATIENT_LEVEL=true)")
     t.add_argument("definition_id", type=int)
     t.add_argument("subject_id", type=int)
@@ -341,6 +356,7 @@ def _proxy(b, a) -> int:  # noqa: C901 - flat command dispatch
     from pydantic import ValidationError
 
     from .agents.composer import format_validation_error
+    from .proxy import DuplicateKeyError, load_json_strict
     from .proxy_service import VersionConflict
     from .security import GovernanceError
 
@@ -349,7 +365,9 @@ def _proxy(b, a) -> int:  # noqa: C901 - flat command dispatch
         if c in ("validate", "submit"):
             text = a.file.read_text()
             try:
-                p = b.parse_proxy_payload(text if a.file.suffix in (".yaml", ".yml") else json.loads(text))
+                p = b.parse_proxy_payload(text if a.file.suffix in (".yaml", ".yml") else load_json_strict(text))
+            except DuplicateKeyError as exc:
+                sys.exit(f"invalid proxy definition: {exc}")
             except ValidationError as exc:
                 sys.exit("invalid proxy definition:\n- " + "\n- ".join(format_validation_error(exc)))
             if c == "validate":
@@ -392,11 +410,36 @@ def _proxy(b, a) -> int:  # noqa: C901 - flat command dispatch
         elif c == "load-reference":
             with a.csv.open(newline="") as fh:
                 rows = list(csv.DictReader(fh))
-            labels = [(int(r["person_id"]), str(r["is_case"]).strip().lower() in ("1", "true", "yes")) for r in rows]
+            from datetime import date as _date
+
+            labels = [
+                (
+                    int(r["person_id"]),
+                    r.get("label") if r.get("label") not in (None, "") else r.get("is_case"),
+                    _date.fromisoformat(r["reference_date"]) if r.get("reference_date") else None,
+                )
+                for r in rows
+            ]
             _print(b.load_reference(a.name, labels, a.source, a.user))
         elif c == "validate-reference":
+            from .proxy import AcceptanceCriteria, load_yaml_strict
+            from .proxy_evaluation import EligibilityRules
+
             tiers = [t.strip() for t in a.tiers.split(",")] if a.tiers else None
-            _print(b.validate_against_reference(a.definition_id, a.reference, a.user, None, a.generation, tiers))
+            crit = AcceptanceCriteria.model_validate(load_yaml_strict(a.criteria.read_text())) if a.criteria else None
+            rules = EligibilityRules(
+                min_observation_days=a.min_observation_days,
+                require_data=[x.strip() for x in a.require_data.split(",") if x.strip()],
+            )
+            _print(
+                b.evaluate_against_reference(
+                    a.definition_id, a.reference, a.user, None, a.generation, tiers, a.intended_use, crit, rules
+                )
+            )
+        elif c == "status":
+            _print(b.proxy_status(a.definition_id))
+        elif c == "review-evaluation":
+            _print(b.review_evaluation(a.definition_id, a.validation_id, a.reviewer, a.decision, a.rationale))
         elif c == "explain-patient":
             # the CLI runs with direct database access (operator = admin); the policy flag still applies
             _print(b.patient_explanation(a.definition_id, a.subject_id, a.user, True, None, a.generation))

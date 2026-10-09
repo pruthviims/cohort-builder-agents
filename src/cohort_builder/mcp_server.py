@@ -41,7 +41,7 @@ from .agents.validator import validate
 from .executor import ExecutionError
 from .ir import CohortDefinition
 from .orchestrator import CohortBuilder
-from .proxy import ProxyDefinition
+from .proxy import DuplicateKeyError, ProxyDefinition
 from .proxy_service import VersionConflict
 from .security import DEFAULT_TENANT
 
@@ -287,6 +287,8 @@ def create_server(
             return b().parse_proxy_payload(definition_yaml if definition_yaml is not None else definition or {})
         except ValidationError as exc:
             return {"schema_errors": _j(exc.errors(include_url=False))}
+        except DuplicateKeyError as exc:
+            return {"error": str(exc)}
         except Exception as exc:  # malformed YAML
             return {"error": f"invalid proxy definition: {type(exc).__name__}"}
 
@@ -352,6 +354,18 @@ def create_server(
                 return {"error": str(exc).strip("'\"")}
             packet["approval"] = "Approval is only possible for a human reviewer via the CLI or HTTP API."
             return _j(packet)
+
+    @mcp.tool(annotations=READ_ONLY)
+    def get_proxy_status(definition_id: int) -> dict:
+        """All statuses of a proxy algorithm version, kept separate: definition validation, execution
+        approval, reference evaluations, automatic acceptance-criteria checks, human acceptance reviews,
+        lifecycle (superseded) and whether a 'clinically_validated' claim is supported. Read-only:
+        evaluations are accepted only by a human reviewer via the CLI or HTTP API."""
+        with lock:
+            try:
+                return _j(b().proxy_status(definition_id, tenant))
+            except KeyError as exc:
+                return {"error": str(exc).strip("'\"")}
 
     @mcp.tool(annotations=WRITES)
     def execute_proxy_cohort(definition_id: int) -> dict:

@@ -143,6 +143,38 @@ def validate_proxy(
         for where in negated:
             warn("data", f"{where}: {basis}.")
 
+    # ---- provenance ---------------------------------------------------------------------------
+    # Missing provenance is reported, never filled in. For a 'clinically_validated' claim it is an error.
+    strict = p.classification == "clinically_validated"
+    no_rationale = [e.name for e in p.evidence if not (e.provenance and e.provenance.clinical_rationale)]
+    if no_rationale:
+        (err if strict else warn)(
+            "provenance",
+            f"missing provenance: no clinical rationale recorded for evidence {sorted(no_rationale)}"
+            + (" (required for a 'clinically_validated' classification)" if strict else ""),
+        )
+    unversioned = [cs.id for cs in p.concept_sets if not (cs.version or cs.source.startswith("curated:"))]
+    no_system = [cs.id for cs in p.concept_sets if not cs.code_system]
+    texts = [(e.name, e.provenance) for e in p.evidence] + [(cs.id, cs.provenance) for cs in p.concept_sets]
+    placeholder = sorted(
+        {
+            name
+            for name, prov in texts
+            if prov
+            and "PLACEHOLDER"
+            in (" ".join([prov.source_reference or "", prov.clinical_rationale or "", *prov.limitations]).upper())
+        }
+    )
+    placeholder += sorted(cs.id for cs in p.concept_sets if "PLACEHOLDER" in (cs.code_system or "").upper())
+    if placeholder:
+        (err if strict else warn)(
+            "provenance", f"placeholder provenance must be replaced by clinical experts: {sorted(set(placeholder))}"
+        )
+    if unversioned:
+        (err if strict else warn)("provenance", f"missing provenance: no concept-set version for {sorted(unversioned)}")
+    if no_system:
+        warn("provenance", f"missing provenance: no code system recorded for concept sets {sorted(no_system)}")
+
     # ---- shared checks (concepts, units, dataset entities, coverage, dry run) ----------------
     criteria = [("evidence", e) for e in p.evidence if e.id not in unavailable]
     exempt = {e.concept_set_id for e in p.evidence if e.id in unavailable}

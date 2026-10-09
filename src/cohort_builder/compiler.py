@@ -175,6 +175,9 @@ class Compiler:
         self, concept_sets: Sequence[ConceptSet], ie: IndexEvent, needs_value: bool
     ) -> tuple[list[str], bool]:
         """cs_expanded, unit_norm, index_candidates, index_events and base CTEs (shared with proxies)."""
+        ids = [cs.id for cs in concept_sets]
+        if dupes := sorted({i for i in ids if ids.count(i) > 1}):  # defense in depth: models reject this first
+            raise ValueError(f"duplicate concept set ids would merge code lists in SQL: {dupes}")
         unit_norm = self._unit_norm_sql() if needs_value else None
         ctes = [
             "cs_expanded AS (\n"

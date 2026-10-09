@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from .compiler import CompiledCohort, Compiler
 from .ontology import Ontology
-from .proxy import EvidenceCriterion, Expr, ProxyDefinition
+from .proxy import EvidenceCriterion, Expr, ProxyDefinition, provenance_summary
 
 
 def evidence_support(ev: EvidenceCriterion, ont: Ontology) -> list[str]:
@@ -60,6 +60,8 @@ class CompiledProxy(CompiledCohort):
     summary_sql: str = ""
     summary_columns: tuple[str, ...] = field(default_factory=tuple)
     unavailable_evidence: tuple[str, ...] = field(default_factory=tuple)
+    # provenance and roles carried with the SQL for review/reporting; not part of sql_hash
+    metadata: dict = field(default_factory=dict, compare=False, hash=False)
 
     @property
     def sql_hash(self) -> str:
@@ -198,6 +200,7 @@ class ProxyCompiler(Compiler):
             summary_sql=summary_sql,
             summary_columns=tuple(name for name, _ in summary),
             unavailable_evidence=tuple(sorted(unsupported)),
+            metadata={"semantic_hash": p.semantic_hash(), "provenance": provenance_summary(p)},
         )
 
     # ---- evidence events -----------------------------------------------------------------------

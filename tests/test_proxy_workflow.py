@@ -275,10 +275,22 @@ def test_reference_metrics_withheld_when_small_or_one_class(tmp_path):
     b.executor.min_cell = 1
     b.load_reference("cases_only", [(1, True), (2, True)], "synthetic", "root")
     one = b.validate_against_reference(did, "cases_only", "bob")
-    assert not one["metrics"]["reported"] and "both cases and non-cases" in one["metrics"]["withheld_reasons"][0]
+    assert (
+        not one["metrics"]["reported"] and "both reference cases and non-cases" in one["metrics"]["withheld_reasons"][0]
+    )
 
 
-def test_clinically_validated_needs_matching_validation(pb):
+def synthetic_provenance(**over) -> ProxyDefinition:
+    """The example with complete provenance, clearly marked as synthetic test text (not clinical references)."""
+    data = example(**over).to_dict()
+    for e in data["evidence"]:
+        e["provenance"] = {"clinical_rationale": "SYNTHETIC TEST FIXTURE rationale (no clinical claim)"}
+    for cs in data["concept_sets"]:
+        cs["code_system"] = "SYNTHETIC test vocabulary"
+    return ProxyDefinition.model_validate(data)
+
+
+def test_clinically_validated_needs_accepted_evaluation_of_same_logic(pb):
     did = approved(pb)
     pb.execute(did, "carol")
     with pytest.raises(GovernanceError, match="not a recorded reference validation"):
@@ -286,20 +298,39 @@ def test_clinically_validated_needs_matching_validation(pb):
             example(version="2.0", classification="clinically_validated", validation_reference="x"), "alice"
         )
     pb.load_reference("chart_review", LABELS, "synthetic chart review", "root")
-    vid = pb.validate_against_reference(did, "chart_review", "bob")["validation_id"]
-    other_logic = example(
+    unassessed = pb.evaluate_against_reference(did, "chart_review", "bob")["validation_id"]
+    with pytest.raises(GovernanceError, match="acceptance status is not_assessed"):
+        pb.submit_proxy(
+            synthetic_provenance(version="2.0", classification="clinically_validated", validation_reference=unassessed),
+            "alice",
+        )
+    ev = pb.evaluate_against_reference(did, "chart_review", "bob", intended_use="synthetic_demo")
+    assert ev["status"]["evaluation"] == "completed" and ev["status"]["acceptance_criteria"] == "criteria_met"
+    vid = ev["validation_id"]
+    claim = synthetic_provenance(version="2.0", classification="clinically_validated", validation_reference=vid)
+    with pytest.raises(GovernanceError, match="not been accepted by a human reviewer"):
+        pb.submit_proxy(claim, "alice")
+    with pytest.raises(GovernanceError, match="cannot review"):
+        pb.review_evaluation(did, vid, "alice", "accepted", "author tries to accept own algorithm")
+    with pytest.raises(GovernanceError, match="cannot review"):
+        pb.review_evaluation(did, vid, "bob", "accepted", "evaluator tries to accept own evaluation")
+    pb.review_evaluation(did, vid, "dana", "accepted", "criteria met for the synthetic demo use")
+    with pytest.raises(ValueError, match="already accepted"):
+        pb.review_evaluation(did, vid, "erin", "rejected", "second opinion arrives too late")
+    other_logic = synthetic_provenance(
         version="2.1", classification="clinically_validated", validation_reference=vid, prior_observation_days=30
     )
     with pytest.raises(GovernanceError, match="different algorithm logic"):
         pb.submit_proxy(other_logic, "alice")
-    ok = pb.submit_proxy(
-        example(version="2.0", classification="clinically_validated", validation_reference=vid), "alice"
-    )
-    assert ok["status"] == "draft"
-    assert (
-        "validated against a reference standard"
-        in pb.proxy_review_packet(ok["cohort_definition_id"])["algorithm"]["classification_label"]
-    )
+    placeholder = example(version="2.0", classification="clinically_validated", validation_reference=vid)
+    flagged = pb.submit_proxy(placeholder, "alice")  # placeholder provenance is an error for this claim
+    assert flagged["status"] == "needs_review"
+    assert any(i["stage"] == "provenance" for i in flagged["issues"])
+    ok = pb.submit_proxy(claim.model_copy(update={"version": "2.2"}), "alice")
+    assert ok["status"] == "draft", ok["issues"]
+    status = pb.proxy_status(ok["cohort_definition_id"])
+    assert status["classification"]["claim_supported"] is True
+    assert "validated against a reference standard" in status["classification"]["label"]
 
 
 # ---- comparison ---------------------------------------------------------------------------------------------

@@ -20,18 +20,28 @@ dataset_profile: escc_synthetic
 ontology_version: "1.2.0"
 vocabulary_version: "test"
 
+# Code-system provenance is truthful for this file: these are synthetic test concepts, versioned as such.
 concept_sets:
   - {id: esophageal_malignancy, name: "PLACEHOLDER esophageal malignancy", domain: Condition,
+     code_system: "PLACEHOLDER synthetic test concepts", code_system_version: synthetic-1, version: "0.1-placeholder",
      items: [{concept_id: 2100000001}]}
   - {id: squamous_histology, name: "PLACEHOLDER squamous histology finding", domain: Measurement,
+     code_system: "PLACEHOLDER synthetic test concepts", code_system_version: synthetic-1, version: "0.1-placeholder",
      items: [{concept_id: 2100000003}]}
   - {id: adeno_histology, name: "PLACEHOLDER adenocarcinoma histology finding", domain: Measurement,
+     code_system: "PLACEHOLDER synthetic test concepts", code_system_version: synthetic-1, version: "0.1-placeholder",
      items: [{concept_id: 2100000008}]}
   - {id: escc_chemotherapy, name: "PLACEHOLDER chemotherapy agents", domain: Drug,
+     code_system: "PLACEHOLDER synthetic test concepts", code_system_version: synthetic-1, version: "0.1-placeholder",
      items: [{concept_id: 2100000004}, {concept_id: 2100000005}]}
-  - {id: radiation, name: "PLACEHOLDER radiation therapy", domain: Procedure, items: [{concept_id: 2100000006}]}
-  - {id: esophagectomy, name: "PLACEHOLDER esophagectomy", domain: Procedure, items: [{concept_id: 2100000007}]}
+  - {id: radiation, name: "PLACEHOLDER radiation therapy", domain: Procedure,
+     code_system: "PLACEHOLDER synthetic test concepts", code_system_version: synthetic-1, version: "0.1-placeholder",
+     items: [{concept_id: 2100000006}]}
+  - {id: esophagectomy, name: "PLACEHOLDER esophagectomy", domain: Procedure,
+     code_system: "PLACEHOLDER synthetic test concepts", code_system_version: synthetic-1, version: "0.1-placeholder",
+     items: [{concept_id: 2100000007}]}
   - {id: competing_malignancy, name: "PLACEHOLDER competing malignancy", domain: Condition,
+     code_system: "PLACEHOLDER synthetic test concepts", code_system_version: synthetic-1, version: "0.1-placeholder",
      items: [{concept_id: 2100000009}]}
 
 # index = first qualifying esophageal malignancy diagnosis
@@ -46,7 +56,10 @@ evidence:
      entity: ConditionOccurrence, concept_set_id: esophageal_malignancy, window: {start_days: 0, end_days: 365},
      count: 2, max_span_days: 180}
   - {id: squamous_path, name: Squamous histology result, category: pathology, entity: Measurement,
-     concept_set_id: squamous_histology, window: {start_days: -30, end_days: 90}}
+     concept_set_id: squamous_histology, window: {start_days: -30, end_days: 90},
+     provenance: {clinical_rationale: "PLACEHOLDER - illustrative only; to be written and referenced by clinical experts",
+                  limitations: ["Pathology results are often missing from claims data",
+                                "Coding of histology varies between laboratories"]}}
   - {id: chemo, name: Chemotherapy consistent with the target, category: treatment, entity: DrugExposure,
      concept_set_id: escc_chemotherapy, window: {start_days: 0, end_days: 180}}
   - {id: radiation_tx, name: Radiation therapy, category: procedure, entity: ProcedureOccurrence,
@@ -103,3 +116,17 @@ funnel:
 
 assumptions:
   - Placeholder concept sets; windows and weights are illustrative.
+
+# Clinical rationale is deliberately NOT filled in for most evidence: the validator reports it as missing
+# provenance rather than accepting invented text.
+
+# ILLUSTRATIVE acceptance criteria for the synthetic test only. These numbers are not clinically justified
+# and are not recommendations; real criteria depend on the disease, reference standard and intended use.
+acceptance_criteria:
+  synthetic_demo:
+    description: ILLUSTRATIVE thresholds for the synthetic fixture only - not clinically justified
+    min_sensitivity: 0.5
+    min_ppv: 0.5
+    min_evaluated: 5
+    min_reference_positive: 2
+    min_reference_negative: 2

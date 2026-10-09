@@ -60,6 +60,24 @@ CREATE TABLE IF NOT EXISTS meta.proxy_validation (
   validation_id VARCHAR PRIMARY KEY, generation_id VARCHAR, cohort_definition_id BIGINT, reference_name VARCHAR,
   positive_tiers VARCHAR, counts_json VARCHAR, metrics_json VARCHAR, created_by VARCHAR, created_at TIMESTAMP,
   tenant VARCHAR);
+-- reference labels: one row per patient after collapsing (label case|non_case|unknown|conflicting)
+ALTER TABLE meta.reference_label ADD COLUMN IF NOT EXISTS label VARCHAR;
+ALTER TABLE meta.reference_label ADD COLUMN IF NOT EXISTS reference_date DATE;
+ALTER TABLE meta.reference_label ADD COLUMN IF NOT EXISTS n_records INTEGER;
+-- evaluation (empirical) vs acceptance (criteria) vs human acceptance review: separate columns
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS evaluation_status VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS acceptance_status VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS intended_use VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS criteria_json VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS acceptance_json VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS population_json VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS eligibility_json VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS semantic_hash VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS data_snapshot VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS review_decision VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP;
+ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS review_rationale VARCHAR;
 CREATE TABLE IF NOT EXISTS meta.audit_event (
   event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
   resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);
@@ -389,22 +407,32 @@ class MetadataStore:
 
     # ---- reference standards (patient-level labels: admin-only inputs, never returned) -------------
     def load_reference(
-        self, name: str, tenant: str, labels: list[tuple[int, bool]], source: str, loaded_by: str
+        self, name: str, tenant: str, rows: list[tuple[int, str, Any, int]], source: str, loaded_by: str
     ) -> int:
+        """`rows` are already collapsed to one per patient: (person_id, label, reference_date, n_records)."""
         if self.con.execute(
             "SELECT count(*) FROM meta.reference_label WHERE tenant=? AND reference_name=?", [tenant, name]
         ).fetchone()[0]:
             raise ValueError(f"reference {name!r} already exists; reference standards are immutable, use a new name")
         ts = now()
+        is_case = {"case": True, "non_case": False}
         self.con.executemany(
-            "INSERT INTO meta.reference_label VALUES (?,?,?,?,?,?,?)",
-            [(name, tenant, int(pid), bool(case), source, loaded_by, ts) for pid, case in labels],
+            "INSERT INTO meta.reference_label (reference_name, tenant, person_id, is_case, source, loaded_by, "
+            "loaded_at, label, reference_date, n_records) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                (name, tenant, int(pid), is_case.get(label), source, loaded_by, ts, label, ref_date, n)
+                for pid, label, ref_date, n in rows
+            ],
         )
-        return len(labels)
+        return len(rows)
 
     def reference_info(self, name: str, tenant: str) -> dict | None:
         row = self.con.execute(
-            "SELECT count(*), count(*) FILTER (WHERE is_case), min(source), min(loaded_by), min(loaded_at) "
+            "SELECT count(*), coalesce(sum(coalesce(n_records, 1)), 0), "
+            "count(*) FILTER (WHERE coalesce(label, CASE WHEN is_case THEN 'case' ELSE 'non_case' END) = 'case'), "
+            "count(*) FILTER (WHERE coalesce(label, CASE WHEN is_case THEN 'case' ELSE 'non_case' END) = 'non_case'), "
+            "count(*) FILTER (WHERE label = 'unknown'), count(*) FILTER (WHERE label = 'conflicting'), "
+            "count(*) FILTER (WHERE reference_date IS NOT NULL), min(source), min(loaded_by), min(loaded_at) "
             "FROM meta.reference_label WHERE tenant=? AND reference_name=?",
             [tenant, name],
         ).fetchone()
@@ -412,17 +440,24 @@ class MetadataStore:
             return None
         return {
             "reference_name": name,
-            "labelled": row[0],
-            "cases": row[1],
-            "non_cases": row[0] - row[1],
-            "source": row[2],
-            "loaded_by": row[3],
-            "loaded_at": row[4],
+            "patients": row[0],
+            "records": row[1],
+            "cases": row[2],
+            "non_cases": row[3],
+            "unknown": row[4],
+            "conflicting": row[5],
+            "with_reference_date": row[6],
+            "source": row[7],
+            "loaded_by": row[8],
+            "loaded_at": row[9],
         }
 
     def record_validation(self, rec: dict) -> None:
         self.con.execute(
-            "INSERT INTO meta.proxy_validation VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO meta.proxy_validation (validation_id, generation_id, cohort_definition_id, reference_name, "
+            "positive_tiers, counts_json, metrics_json, created_by, created_at, tenant, evaluation_status, "
+            "acceptance_status, intended_use, criteria_json, acceptance_json, population_json, eligibility_json, "
+            "semantic_hash, data_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 rec["validation_id"],
                 rec["generation_id"],
@@ -434,17 +469,45 @@ class MetadataStore:
                 rec["created_by"],
                 now(),
                 rec["tenant"],
+                rec["evaluation_status"],
+                rec["acceptance_status"],
+                rec.get("intended_use"),
+                dumps(rec.get("criteria")),
+                dumps(rec.get("acceptance")),
+                dumps(rec["population"]),
+                dumps(rec["eligibility"]),
+                rec["semantic_hash"],
+                rec["data_snapshot"],
             ],
         )
 
+    def record_validation_review(self, validation_id: str, decision: str, reviewer: str, rationale: str) -> None:
+        """Human acceptance decision for one evaluation; recorded once (immutable afterwards)."""
+        self.con.execute(
+            "UPDATE meta.proxy_validation SET review_decision=?, reviewed_by=?, reviewed_at=?, review_rationale=? "
+            "WHERE validation_id=? AND review_decision IS NULL",
+            [decision, reviewer, now(), rationale, validation_id],
+        )
+
+    @staticmethod
+    def _validation_row(r: dict) -> dict:
+        r["positive_tiers"] = json.loads(r["positive_tiers"] or "[]")
+        for k in ("counts", "metrics", "criteria", "acceptance", "population", "eligibility"):
+            raw = r.pop(f"{k}_json", None)
+            r[k] = json.loads(raw) if raw else None
+        return r
+
     def get_validation(self, validation_id: str) -> dict | None:
         rows = _rows(self.con.execute("SELECT * FROM meta.proxy_validation WHERE validation_id=?", [validation_id]))
-        if not rows:
-            return None
-        r = rows[0]
-        for k in ("positive_tiers", "counts", "metrics"):
-            r[k] = json.loads(r.pop(f"{k}_json") if f"{k}_json" in r else r.pop(k))
-        return r
+        return self._validation_row(rows[0]) if rows else None
+
+    def validations(self, def_id: int) -> list[dict]:
+        rows = _rows(
+            self.con.execute(
+                "SELECT * FROM meta.proxy_validation WHERE cohort_definition_id=? ORDER BY created_at DESC", [def_id]
+            )
+        )
+        return [self._validation_row(r) for r in rows]
 
     # ---- reads -----------------------------------------------------------
     def get_run(self, run_id: str) -> dict | None:

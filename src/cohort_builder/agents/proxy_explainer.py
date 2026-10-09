@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..ontology import Ontology
-from ..proxy import CLASSIFICATION_LABELS, Expr, ProxyDefinition, TemporalRule
+from ..proxy import CLASSIFICATION_LABELS, Expr, ProxyDefinition, TemporalRule, provenance_summary
 from ..vocab import Vocabulary
 from .explainer import Explainer, _window
 
@@ -264,6 +264,8 @@ class ProxyExplainer(Explainer):
             "issues": issues,
             "dry_run_attrition": attrition,
             "assumptions": p.assumptions,
+            "provenance": provenance_summary(p),
+            "acceptance_criteria": {u: c.model_dump(mode="json") for u, c in p.acceptance_criteria.items()},
             "explanation": self.explain(p),
             "governance": [
                 COHORT_NOTE.format(target=p.target.name),

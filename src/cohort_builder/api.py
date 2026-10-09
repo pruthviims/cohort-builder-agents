@@ -23,7 +23,10 @@ Proxy (indirect) cohort algorithms, same governance (see README "Proxy cohorts")
   POST /proxy-cohorts/{id}/execute                                      executor (approved definitions only)
   GET  /proxy-cohorts/{id}/results, .../evidence-summary                executor or reviewer (suppressed aggregates)
   POST /proxy-cohorts/compare                                           executor or reviewer (suppressed overlaps)
-  POST /proxy-cohorts/{id}/reference-validation                         reviewer
+  POST /proxy-cohorts/{id}/reference-validation                         reviewer (evaluation + automatic criteria check)
+  GET  /proxy-cohorts/{id}/status                                       any role (all statuses, kept separate)
+  GET  /proxy-cohorts/{id}/evaluations                                  executor or reviewer
+  POST /proxy-cohorts/{id}/evaluations/{validation_id}/review           reviewer (human acceptance; not own work)
   POST /proxy-references                                                admin (external reference labels)
   GET  /proxy-cohorts/{id}/patients/{subject_id}/explanation            admin AND CB_ALLOW_PATIENT_LEVEL=true
 """
@@ -34,19 +37,21 @@ import logging
 import threading
 import uuid
 from collections.abc import Callable
+from datetime import date
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .agents.composer import format_validation_error
 from .agents.validator import validate
 from .executor import ExecutionError, QueryTimeout
 from .ir import CohortDefinition
 from .orchestrator import CohortBuilder, GovernanceError
-from .proxy import ProxyDefinition
+from .proxy import AcceptanceCriteria, DuplicateKeyError, ProxyDefinition
+from .proxy_evaluation import EligibilityRules, ReferenceRecord, normalize_label
 from .proxy_service import VersionConflict
 from .security import (
     ADMIN,
@@ -113,11 +118,34 @@ class ReferenceValidationRequest(_Strict):
     reference_name: str = Field(min_length=1, max_length=128)
     generation_id: str | None = None
     positive_tiers: list[str] | None = None
+    intended_use: str | None = Field(default=None, max_length=64)
+    criteria: AcceptanceCriteria | None = None  # only when not prespecified in the definition
+    eligibility: EligibilityRules | None = None
+
+
+class EvaluationReviewRequest(_Strict):
+    decision: Literal["accepted", "rejected"]
+    rationale: str = Field(min_length=10, max_length=4000)
 
 
 class ReferenceLabel(_Strict):
+    """One reference record. `label` (case / non_case / unknown) or the older boolean `is_case`;
+    neither = unknown (indeterminate). Several records per patient are allowed and collapsed."""
+
     person_id: int
-    is_case: bool
+    is_case: bool | None = None
+    label: Literal["case", "non_case", "unknown"] | None = None
+    reference_date: date | None = None
+
+    @model_validator(mode="after")
+    def _one_label(self) -> ReferenceLabel:
+        if self.label is not None and self.is_case is not None:
+            raise ValueError("give either label or is_case, not both")
+        return self
+
+    def as_record(self) -> ReferenceRecord:
+        label = self.label or normalize_label(self.is_case)
+        return ReferenceRecord(self.person_id, label, self.reference_date)
 
 
 class ReferenceLoadRequest(_Strict):
@@ -347,6 +375,8 @@ def create_app(
                 return b().parse_proxy_payload(req.yaml if req.yaml is not None else req.definition or {})
         except ValidationError as exc:
             raise HTTPException(422, {"errors": format_validation_error(exc)}) from exc
+        except DuplicateKeyError as exc:
+            raise HTTPException(422, str(exc)) from exc
         except Exception as exc:  # malformed YAML
             raise HTTPException(422, f"invalid proxy definition: {type(exc).__name__}") from exc
 
@@ -450,15 +480,40 @@ def create_app(
         def_id: int, req: ReferenceValidationRequest, p: Principal = Depends(need_reviewer)
     ) -> dict:
         return proxy_call(
-            lambda: b().validate_against_reference(
-                def_id, req.reference_name, p.subject, scope(p), req.generation_id, req.positive_tiers
+            lambda: b().evaluate_against_reference(
+                def_id,
+                req.reference_name,
+                p.subject,
+                scope(p),
+                req.generation_id,
+                req.positive_tiers,
+                req.intended_use,
+                req.criteria,
+                req.eligibility,
             ),
+            def_id,
+        )
+
+    @app.get("/proxy-cohorts/{def_id}/status")
+    def proxy_status(def_id: int, p: Principal = Depends(any_role)) -> dict:
+        return proxy_call(lambda: b().proxy_status(def_id, scope(p)), def_id)
+
+    @app.get("/proxy-cohorts/{def_id}/evaluations")
+    def proxy_evaluations(def_id: int, p: Principal = Depends(need_results)) -> list[dict]:
+        return proxy_call(lambda: b().list_evaluations(def_id, scope(p)), def_id)
+
+    @app.post("/proxy-cohorts/{def_id}/evaluations/{validation_id}/review")
+    def proxy_evaluation_review(
+        def_id: int, validation_id: str, req: EvaluationReviewRequest, p: Principal = Depends(need_reviewer)
+    ) -> dict:
+        return proxy_call(
+            lambda: b().review_evaluation(def_id, validation_id, p.subject, req.decision, req.rationale, scope(p)),
             def_id,
         )
 
     @app.post("/proxy-references")
     def proxy_reference_load(req: ReferenceLoadRequest, p: Principal = Depends(need_admin)) -> dict:
-        labels = [(lab.person_id, lab.is_case) for lab in req.labels]
+        labels = [lab.as_record() for lab in req.labels]
         return proxy_call(lambda: b().load_reference(req.name, labels, req.source, p.subject, p.tenant))
 
     @app.get("/proxy-cohorts/{def_id}/patients/{subject_id}/explanation")
