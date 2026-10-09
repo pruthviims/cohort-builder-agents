@@ -3,7 +3,7 @@
 # what the source can answer (capabilities), where each entity lives (mapping),
 # how "observable" is defined, and any semantic views to install.
 name: omop_demo
-version: 1.1.0
+version: 1.2.0
 description: Synthetic EHR-style patients already in OMOP CDM v5.4 tables.
 data_type: ehr
 
@@ -13,6 +13,9 @@ capabilities:
   observation: observation_period    # explicit observation periods from the source
   # captured for only some patients/tests: a missing record is not evidence of a normal value
   partial_entities: [Measurement]
+  extra_data: []                     # e.g. pathology; none in this synthetic dataset
+  # how far "no record" can be read as "did not happen": weak | observed_period | supported
+  absence_inference: observed_period
   notes:
     - Lab values with units are available for some patients and some tests only.
 

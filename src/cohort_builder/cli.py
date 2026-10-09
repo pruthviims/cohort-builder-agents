@@ -106,6 +106,54 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--expires-days", type=int, default=90, help="0 = no expiry (not recommended)")
     t.add_argument("--id", dest="token_id", help="label shown in audit records (default: subject + random)")
     t.add_argument("--tokens-file", type=Path, help="append the hashed entry to this token file (created 0600)")
+    s = sub.add_parser("proxy", help="proxy (indirect) identification algorithms, e.g. for rare diseases")
+    px = s.add_subparsers(dest="proxy_cmd", required=True)
+    for name, hlp in (
+        ("validate", "validate + dry-run a proxy YAML/JSON file (nothing saved)"),
+        ("submit", "save a proxy YAML/JSON file as an immutable draft version"),
+    ):
+        t = px.add_parser(name, help=hlp)
+        t.add_argument("file", type=Path)
+        t.add_argument("--user", default="cli")
+        t.add_argument("--parent", type=int)
+    t = px.add_parser("ask", help="draft a proxy algorithm from natural language (never executes)")
+    t.add_argument("query")
+    t.add_argument("--user", default="cli")
+    px.add_parser("list", help="list proxy definitions")
+    for name in ("show", "review-packet", "sql", "versions"):
+        t = px.add_parser(name)
+        t.add_argument("definition_id", type=int)
+    for name in ("approve", "reject"):
+        t = px.add_parser(name)
+        t.add_argument("definition_id", type=int)
+        t.add_argument("--reviewer", required=True)
+        t.add_argument("--comments", default="")
+    t = px.add_parser("execute", help="run an approved proxy definition")
+    t.add_argument("definition_id", type=int)
+    t.add_argument("--user", default="cli")
+    t.add_argument("--allow-draft", action="store_true")
+    t = px.add_parser("results", help="suppressed attrition and evidence summary of the latest (or given) run")
+    t.add_argument("definition_id", type=int)
+    t.add_argument("--generation")
+    t = px.add_parser("compare", help="privacy-safe overlap of 2-6 generations")
+    t.add_argument("generation_ids", nargs="+")
+    t.add_argument("--user", default="cli")
+    t = px.add_parser("load-reference", help="load EXTERNAL reference-standard labels (CSV: person_id,is_case)")
+    t.add_argument("name")
+    t.add_argument("csv", type=Path)
+    t.add_argument("--source", required=True, help="what the reference standard is, e.g. 'chart review 2026'")
+    t.add_argument("--user", default="cli")
+    t = px.add_parser("validate-reference", help="sensitivity/specificity/PPV/NPV against a loaded reference")
+    t.add_argument("definition_id", type=int)
+    t.add_argument("--reference", required=True)
+    t.add_argument("--generation")
+    t.add_argument("--tiers", help="comma-separated tiers counted as positive (default: all)")
+    t.add_argument("--user", default="cli")
+    t = px.add_parser("explain-patient", help="per-patient evidence (needs CB_ALLOW_PATIENT_LEVEL=true)")
+    t.add_argument("definition_id", type=int)
+    t.add_argument("subject_id", type=int)
+    t.add_argument("--generation")
+    t.add_argument("--user", default="cli")
     s = sub.add_parser("serve", help="run the HTTP API")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8000)
@@ -208,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report["passed"] else 1
 
     b = _builder(settings)
+    if a.cmd == "proxy":
+        return _proxy(b, a)
     if a.cmd == "ask":
         r = b.ask(a.query, a.user)
         if a.json:
@@ -229,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         _print(b.store.list_definitions())
     elif a.cmd == "show":
         row, ir = b.load_definition(a.definition_id)
-        print(b.explainer.explain(ir) + "\n")
+        print(b.explain(ir) + "\n")
         _print({k: v for k, v in row.items() if k != "ir"})
     elif a.cmd in ("approve", "reject"):
         from .orchestrator import GovernanceError
@@ -282,6 +332,76 @@ def main(argv: list[str] | None = None) -> int:
         _print(b.replay(a.run_id))
     elif a.cmd == "search":
         _print(b.vocab.search_concepts(a.text, a.domain))
+    return 0
+
+
+def _proxy(b, a) -> int:  # noqa: C901 - flat command dispatch
+    import csv
+
+    from pydantic import ValidationError
+
+    from .agents.composer import format_validation_error
+    from .proxy_service import VersionConflict
+    from .security import GovernanceError
+
+    c = a.proxy_cmd
+    try:
+        if c in ("validate", "submit"):
+            text = a.file.read_text()
+            try:
+                p = b.parse_proxy_payload(text if a.file.suffix in (".yaml", ".yml") else json.loads(text))
+            except ValidationError as exc:
+                sys.exit("invalid proxy definition:\n- " + "\n- ".join(format_validation_error(exc)))
+            if c == "validate":
+                r = b.validate_proxy_definition(p)
+                print(r["explanation"] + "\n")
+                if r["attrition"]:
+                    print("Attrition (dry run, small cells suppressed):\n" + _attrition_table(r["attrition"]) + "\n")
+                for i in r["issues"]:
+                    print(f"[{i['severity']}/{i['stage']}] {i['message']}")
+                print(f"\ncontent hash  {r['content_hash']}\nsemantic hash {r['semantic_hash']}")
+                return 0 if r["valid"] else 1
+            r = b.submit_proxy(p, a.user, parent_id=a.parent)
+            _print({k: r.get(k) for k in ("cohort_definition_id", "status", "existing", "issues")})
+        elif c == "ask":
+            _print(b.ask_proxy(a.query, a.user).as_dict())
+        elif c == "list":
+            _print(b.store.list_definitions(kind="proxy"))
+        elif c == "show":
+            row, p = b.load_proxy(a.definition_id)
+            print(b.explain(p) + "\n")
+            _print({k: v for k, v in row.items() if k != "ir"})
+        elif c == "review-packet":
+            _print(b.proxy_review_packet(a.definition_id))
+        elif c == "sql":
+            for name, sql in b.compile_proxy(a.definition_id)["statements"].items():
+                print(f"-- {name}\n{sql}\n")
+        elif c == "versions":
+            _print(b.proxy_versions(a.definition_id))
+        elif c in ("approve", "reject"):
+            b.load_proxy(a.definition_id)
+            b.review(a.definition_id, a.reviewer, "approved" if c == "approve" else "rejected", a.comments)
+            print(f"proxy definition {a.definition_id} {c}d by {a.reviewer}")
+        elif c == "execute":
+            b.load_proxy(a.definition_id)
+            _print(b.execute(a.definition_id, a.user, a.allow_draft))
+        elif c == "results":
+            _print(b.proxy_results(a.definition_id, generation_id=a.generation))
+        elif c == "compare":
+            _print(b.compare_generations(a.generation_ids, a.user))
+        elif c == "load-reference":
+            with a.csv.open(newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            labels = [(int(r["person_id"]), str(r["is_case"]).strip().lower() in ("1", "true", "yes")) for r in rows]
+            _print(b.load_reference(a.name, labels, a.source, a.user))
+        elif c == "validate-reference":
+            tiers = [t.strip() for t in a.tiers.split(",")] if a.tiers else None
+            _print(b.validate_against_reference(a.definition_id, a.reference, a.user, None, a.generation, tiers))
+        elif c == "explain-patient":
+            # the CLI runs with direct database access (operator = admin); the policy flag still applies
+            _print(b.patient_explanation(a.definition_id, a.subject_id, a.user, True, None, a.generation))
+    except (GovernanceError, VersionConflict, ValueError, KeyError) as exc:
+        sys.exit(f"refused: {str(exc).strip(chr(39))}")
     return 0
 
 

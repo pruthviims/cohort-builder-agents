@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from . import COMPILER_VERSION
-from .ir import CohortDefinition, ConceptSet, Criterion, ValueFilter
+from .ir import CohortDefinition, ConceptSet, Criterion, Demographics, IndexEvent, ValueFilter
 from .ontology import Ontology
 
 _ID = re.compile(r"^[A-Za-z0-9_\-]+$")
@@ -128,8 +128,8 @@ class Compiler:
             conds.append(f"e.{m['position_col']} = 1")
         return "".join(f" AND {c}" for c in conds)
 
-    def _criterion_sql(self, c: Criterion, has_unit_norm: bool) -> str:
-        """Boolean SQL: does the person meet the criterion's occurrence rule?"""
+    def event_parts(self, c: Criterion, has_unit_norm: bool) -> dict[str, str]:
+        """SQL fragments selecting a criterion's qualifying events for base row `b` (shared with proxies)."""
         m = self.ont.table_mapping(c.entity)
         start = f"e.{m['start_col']}"
         lo = f"b.index_date + ({c.window.start_days})" if c.window.start_days is not None else "b.op_start"
@@ -139,11 +139,25 @@ class Compiler:
             join, cond = self._value_sql(c.value_filter, has_unit_norm)
             cond = f"\n        AND {cond}"
         cond += self._claims_conditions(c.entity, c.claim_status, c.dx_position)
+        return {
+            "start": start,
+            "table": m["table"],
+            "concept_join": f"JOIN cs_expanded c ON c.cs_id = {_lit(c.concept_set_id)} "
+            f"AND c.concept_id = e.{m['concept_col']}",
+            "extra_join": join,
+            "window": f"{start} >= {lo} AND {start} <= {hi}",
+            "filters": cond,
+        }
+
+    def _criterion_sql(self, c: Criterion, has_unit_norm: bool) -> str:
+        """Boolean SQL: does the person meet the criterion's occurrence rule?"""
+        p = self.event_parts(c, has_unit_norm)
+        start = p["start"]
         frm = (
-            f"FROM {m['table']} e\n"
-            f"      JOIN cs_expanded c ON c.cs_id = {_lit(c.concept_set_id)} AND c.concept_id = e.{m['concept_col']}"
-            f"{join}\n"
-            f"      WHERE e.person_id = b.person_id AND {start} >= {lo} AND {start} <= {hi}{cond}"
+            f"FROM {p['table']} e\n"
+            f"      {p['concept_join']}"
+            f"{p['extra_join']}\n"
+            f"      WHERE e.person_id = b.person_id AND {p['window']}{p['filters']}"
         )
         counted = f"COUNT(DISTINCT {start})" if c.count_by == "dates" else "COUNT(*)"
         if c.min_span_days is not None:
@@ -157,20 +171,19 @@ class Compiler:
         op = {"at_least": ">=", "at_most": "<=", "exactly": "="}[c.occurrence]
         return f"((SELECT {counted} {frm}) {op} {int(c.count)})"
 
-    # ---- main ---------------------------------------------------------------
-    def compile(self, ir: CohortDefinition) -> CompiledCohort:
-        needs_value = any(x.value_filter for x in [*ir.inclusion, *ir.exclusion]) or ir.index_event.value_filter
+    def head_ctes(
+        self, concept_sets: Sequence[ConceptSet], ie: IndexEvent, needs_value: bool
+    ) -> tuple[list[str], bool]:
+        """cs_expanded, unit_norm, index_candidates, index_events and base CTEs (shared with proxies)."""
         unit_norm = self._unit_norm_sql() if needs_value else None
-
         ctes = [
             "cs_expanded AS (\n"
-            + "\n  UNION ALL\n".join(self._concept_set_sql(cs) for cs in sorted(ir.concept_sets, key=lambda s: s.id))
+            + "\n  UNION ALL\n".join(self._concept_set_sql(cs) for cs in sorted(concept_sets, key=lambda s: s.id))
             + "\n)"
         ]
         if unit_norm:
             ctes.append(f"unit_norm AS (\n{unit_norm}\n)")
 
-        ie = ir.index_event
         m = self.ont.table_mapping(ie.entity)
         join, conds = "", []
         if ie.value_filter:
@@ -202,24 +215,20 @@ class Compiler:
             f"   AND ie.index_date BETWEEN op.{op['start_col']} AND op.{op['end_col']}\n"
             f"  JOIN {pm['table']} p ON p.{pm['person_key']} = ie.person_id\n)"
         )
+        return ctes, unit_norm is not None
 
-        # rules: (label, boolean SQL meaning "passes")
+    @staticmethod
+    def population_rules(prior: int, post: int, d: Demographics) -> list[tuple[str, str]]:
+        """Observation and demographic rules over base row `b`: (label, boolean SQL meaning 'passes')."""
         rules: list[tuple[str, str]] = []
-        if ir.prior_observation_days:
+        if prior:
             rules.append(
-                (
-                    f"At least {ir.prior_observation_days} days of observation before index",
-                    f"(b.index_date - b.op_start) >= {int(ir.prior_observation_days)}",
-                )
+                (f"At least {prior} days of observation before index", f"(b.index_date - b.op_start) >= {int(prior)}")
             )
-        if ir.post_observation_days:
+        if post:
             rules.append(
-                (
-                    f"At least {ir.post_observation_days} days of observation after index",
-                    f"(b.op_end - b.index_date) >= {int(ir.post_observation_days)}",
-                )
+                (f"At least {post} days of observation after index", f"(b.op_end - b.index_date) >= {int(post)}")
             )
-        d = ir.demographics
         if d.age_min is not None or d.age_max is not None:
             lo = d.age_min if d.age_min is not None else 0
             hi = d.age_max if d.age_max is not None else 200
@@ -233,6 +242,14 @@ class Compiler:
             rules.append((label, f"b.age_at_index BETWEEN {int(lo)} AND {int(hi)}"))
         if d.gender_concept_ids:
             rules.append(("Gender", f"b.gender_concept_id IN ({_id_list(d.gender_concept_ids)})"))
+        return rules
+
+    # ---- main ---------------------------------------------------------------
+    def compile(self, ir: CohortDefinition) -> CompiledCohort:
+        needs_value = bool(any(x.value_filter for x in [*ir.inclusion, *ir.exclusion]) or ir.index_event.value_filter)
+        ctes, has_unit_norm = self.head_ctes(ir.concept_sets, ir.index_event, needs_value)
+        unit_norm = "unit_norm" if has_unit_norm else None
+        rules = self.population_rules(ir.prior_observation_days, ir.post_observation_days, ir.demographics)
         for c in ir.inclusion:
             rules.append((f"Inclusion: {c.name}", self._criterion_sql(c, unit_norm is not None)))
         for c in ir.exclusion:

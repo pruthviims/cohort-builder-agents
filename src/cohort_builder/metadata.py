@@ -48,6 +48,18 @@ ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS tenant VARCHAR;
 ALTER TABLE meta.cohort_generation ADD COLUMN IF NOT EXISTS tenant VARCHAR;
 ALTER TABLE meta.cohort_generation ADD COLUMN IF NOT EXISTS caveats_json VARCHAR;
 ALTER TABLE meta.agent_run ADD COLUMN IF NOT EXISTS tenant VARCHAR;
+ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS kind VARCHAR;
+ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS algorithm_name VARCHAR;
+ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS algorithm_version VARCHAR;
+ALTER TABLE meta.cohort_definition ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;
+ALTER TABLE meta.cohort_generation ADD COLUMN IF NOT EXISTS summary_json VARCHAR;
+CREATE TABLE IF NOT EXISTS meta.reference_label (
+  reference_name VARCHAR, tenant VARCHAR, person_id BIGINT, is_case BOOLEAN, source VARCHAR,
+  loaded_by VARCHAR, loaded_at TIMESTAMP, PRIMARY KEY (tenant, reference_name, person_id));
+CREATE TABLE IF NOT EXISTS meta.proxy_validation (
+  validation_id VARCHAR PRIMARY KEY, generation_id VARCHAR, cohort_definition_id BIGINT, reference_name VARCHAR,
+  positive_tiers VARCHAR, counts_json VARCHAR, metrics_json VARCHAR, created_by VARCHAR, created_at TIMESTAMP,
+  tenant VARCHAR);
 CREATE TABLE IF NOT EXISTS meta.audit_event (
   event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
   resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);
@@ -227,32 +239,54 @@ class MetadataStore:
         dataset: str | None = None,
         tenant: str = "default",
     ) -> int:
-        """Definitions are immutable; an edit is a new row with parent_definition_id."""
+        """Definitions are immutable; an edit is a new row with parent_definition_id.
+
+        Proxy definitions (kind 'proxy') also carry algorithm_name + version; only the status columns
+        (status, approved_*, updated_at) ever change after insert."""
         def_id = self.con.execute("SELECT nextval('meta.cohort_definition_seq')").fetchone()[0]
+        proxy = hasattr(ir, "algorithm_name")
+        created = now()
         self.con.execute(
             "INSERT INTO meta.cohort_definition (cohort_definition_id, name, ir_json, content_hash, semantic_hash, "
             "schema_version, ontology_version, vocabulary_version, status, created_by, created_at, "
-            "parent_definition_id, run_id, issues_json, dataset, tenant) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "parent_definition_id, run_id, issues_json, dataset, tenant, kind, algorithm_name, algorithm_version, "
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 def_id,
-                ir.name,
+                ir.algorithm_name if proxy else ir.name,
                 ir.canonical_json(),
                 ir.content_hash(),
                 ir.semantic_hash(),
-                ir.schema_version,
+                ir.proxy_schema_version if proxy else ir.schema_version,
                 ir.ontology_version,
                 ir.vocabulary_version,
                 status,
                 created_by,
-                now(),
+                created,
                 parent_id,
                 run_id,
                 dumps(issues or []),
                 dataset,
                 tenant,
+                "proxy" if proxy else "cohort",
+                ir.algorithm_name if proxy else None,
+                ir.version if proxy else None,
+                created,
             ],
         )
         return int(def_id)
+
+    def find_algorithm(self, tenant: str, algorithm_name: str, version: str | None = None) -> list[dict]:
+        """Proxy algorithm versions in a tenant (newest first)."""
+        return _rows(
+            self.con.execute(
+                "SELECT cohort_definition_id, algorithm_name, algorithm_version, status, content_hash, semantic_hash, "
+                "dataset, created_by, created_at, updated_at, approved_by, approved_at, parent_definition_id "
+                "FROM meta.cohort_definition WHERE kind = 'proxy' AND coalesce(tenant, 'default') = ? "
+                "AND algorithm_name = ? AND (? IS NULL OR algorithm_version = ?) ORDER BY cohort_definition_id DESC",
+                [tenant, algorithm_name, version, version],
+            )
+        )
 
     def get_definition(self, def_id: int) -> dict | None:
         rows = _rows(self.con.execute("SELECT * FROM meta.cohort_definition WHERE cohort_definition_id=?", [def_id]))
@@ -263,13 +297,15 @@ class MetadataStore:
         row["issues"] = json.loads(row.pop("issues_json") or "[]")
         return row
 
-    def list_definitions(self, limit: int = 50, tenant: str | None = None) -> list[dict]:
+    def list_definitions(self, limit: int = 50, tenant: str | None = None, kind: str | None = None) -> list[dict]:
+        cols = "cohort_definition_id, name, status, dataset, tenant, semantic_hash, created_by, created_at"
+        if kind == "proxy":
+            cols += ", algorithm_name, algorithm_version, updated_at"
         return _rows(
             self.con.execute(
-                "SELECT cohort_definition_id, name, status, dataset, tenant, semantic_hash, created_by, created_at "
-                "FROM meta.cohort_definition WHERE (? IS NULL OR tenant = ?) "
-                "ORDER BY cohort_definition_id DESC LIMIT ?",
-                [tenant, tenant, limit],
+                f"SELECT {cols} FROM meta.cohort_definition WHERE (? IS NULL OR tenant = ?) "
+                "AND (? IS NULL OR coalesce(kind, 'cohort') = ?) ORDER BY cohort_definition_id DESC LIMIT ?",
+                [tenant, tenant, kind, kind, limit],
             )
         )
 
@@ -280,16 +316,27 @@ class MetadataStore:
             "INSERT INTO meta.review VALUES (?,?,?,?,?,?)",
             [str(uuid.uuid4()), def_id, reviewer, decision, comments, now()],
         )
+        ts = now()
         if decision == "approved":
             self.con.execute(
-                "UPDATE meta.cohort_definition SET status='approved', approved_by=?, approved_at=? "
+                "UPDATE meta.cohort_definition SET status='approved', approved_by=?, approved_at=?, updated_at=? "
                 "WHERE cohort_definition_id=?",
-                [reviewer, now(), def_id],
+                [reviewer, ts, ts, def_id],
             )
         else:
             self.con.execute(
-                "UPDATE meta.cohort_definition SET status='rejected' WHERE cohort_definition_id=?", [def_id]
+                "UPDATE meta.cohort_definition SET status='rejected', updated_at=? WHERE cohort_definition_id=?",
+                [ts, def_id],
             )
+
+    def reviews(self, def_id: int) -> list[dict]:
+        return _rows(
+            self.con.execute(
+                "SELECT reviewer, decision, comments, created_at FROM meta.review WHERE cohort_definition_id=? "
+                "ORDER BY created_at",
+                [def_id],
+            )
+        )
 
     def record_generation(
         self,
@@ -303,11 +350,13 @@ class MetadataStore:
         dataset: str | None = None,
         tenant: str = "default",
         caveats: list | None = None,
+        summary: dict | None = None,
     ) -> None:
+        """`summary` holds RAW proxy counts (internal); interfaces must suppress before showing them."""
         self.con.execute(
             "INSERT INTO meta.cohort_generation (generation_id, cohort_definition_id, data_snapshot, "
-            "compiler_version, sql_hash, person_count, executed_by, executed_at, dataset, tenant, caveats_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "compiler_version, sql_hash, person_count, executed_by, executed_at, dataset, tenant, caveats_json, "
+            "summary_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 generation_id,
                 def_id,
@@ -320,8 +369,82 @@ class MetadataStore:
                 dataset,
                 tenant,
                 dumps(caveats or []),
+                dumps(summary) if summary is not None else None,
             ],
         )
+
+    def generations(self, def_id: int | None = None, generation_id: str | None = None) -> list[dict]:
+        rows = _rows(
+            self.con.execute(
+                "SELECT * FROM meta.cohort_generation WHERE (? IS NULL OR cohort_definition_id = ?) "
+                "AND (? IS NULL OR generation_id = ?) ORDER BY executed_at DESC",
+                [def_id, def_id, generation_id, generation_id],
+            )
+        )
+        for r in rows:
+            r["caveats"] = json.loads(r.pop("caveats_json") or "[]")
+            raw = r.pop("summary_json")
+            r["summary"] = json.loads(raw) if raw else None
+        return rows
+
+    # ---- reference standards (patient-level labels: admin-only inputs, never returned) -------------
+    def load_reference(
+        self, name: str, tenant: str, labels: list[tuple[int, bool]], source: str, loaded_by: str
+    ) -> int:
+        if self.con.execute(
+            "SELECT count(*) FROM meta.reference_label WHERE tenant=? AND reference_name=?", [tenant, name]
+        ).fetchone()[0]:
+            raise ValueError(f"reference {name!r} already exists; reference standards are immutable, use a new name")
+        ts = now()
+        self.con.executemany(
+            "INSERT INTO meta.reference_label VALUES (?,?,?,?,?,?,?)",
+            [(name, tenant, int(pid), bool(case), source, loaded_by, ts) for pid, case in labels],
+        )
+        return len(labels)
+
+    def reference_info(self, name: str, tenant: str) -> dict | None:
+        row = self.con.execute(
+            "SELECT count(*), count(*) FILTER (WHERE is_case), min(source), min(loaded_by), min(loaded_at) "
+            "FROM meta.reference_label WHERE tenant=? AND reference_name=?",
+            [tenant, name],
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return {
+            "reference_name": name,
+            "labelled": row[0],
+            "cases": row[1],
+            "non_cases": row[0] - row[1],
+            "source": row[2],
+            "loaded_by": row[3],
+            "loaded_at": row[4],
+        }
+
+    def record_validation(self, rec: dict) -> None:
+        self.con.execute(
+            "INSERT INTO meta.proxy_validation VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                rec["validation_id"],
+                rec["generation_id"],
+                rec["cohort_definition_id"],
+                rec["reference_name"],
+                dumps(rec["positive_tiers"]),
+                dumps(rec["counts"]),
+                dumps(rec["metrics"]),
+                rec["created_by"],
+                now(),
+                rec["tenant"],
+            ],
+        )
+
+    def get_validation(self, validation_id: str) -> dict | None:
+        rows = _rows(self.con.execute("SELECT * FROM meta.proxy_validation WHERE validation_id=?", [validation_id]))
+        if not rows:
+            return None
+        r = rows[0]
+        for k in ("positive_tiers", "counts", "metrics"):
+            r[k] = json.loads(r.pop(f"{k}_json") if f"{k}_json" in r else r.pop(k))
+        return r
 
     # ---- reads -----------------------------------------------------------
     def get_run(self, run_id: str) -> dict | None:

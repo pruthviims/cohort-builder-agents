@@ -47,6 +47,10 @@ class ConfigError(RuntimeError):
     """Unsafe or invalid security configuration (raised at startup, never at request time)."""
 
 
+class GovernanceError(PermissionError):
+    """An action is not permitted by governance policy (self-approval, draft execution, status)."""
+
+
 class AuthError(Exception):
     """Missing, malformed, unknown or expired credentials."""
 
@@ -189,6 +193,8 @@ class SecurityConfig:
     dev_tenant: str = DEFAULT_TENANT
     allow_self_approval: bool = False
     allow_draft_execution: bool = False
+    # patient-level proxy explanations (per-patient evidence) for admins; off unless explicitly enabled
+    allow_patient_level: bool = False
 
     @property
     def is_production(self) -> bool:
@@ -211,6 +217,7 @@ class SecurityConfig:
             dev_tenant=env.get("CB_AUTH_DEV_TENANT") or DEFAULT_TENANT,
             allow_self_approval=_bool(env, "CB_ALLOW_SELF_APPROVAL"),
             allow_draft_execution=_bool(env, "CB_ALLOW_DRAFT_EXECUTION"),
+            allow_patient_level=_bool(env, "CB_ALLOW_PATIENT_LEVEL"),
         )
         cfg.check()
         return cfg
@@ -241,7 +248,8 @@ class GovernancePolicy:
 
     allow_self_approval: bool = False
     allow_draft_execution: bool = False
+    allow_patient_level: bool = False
 
     @classmethod
     def from_security(cls, cfg: SecurityConfig) -> "GovernancePolicy":
-        return cls(cfg.allow_self_approval, cfg.allow_draft_execution)
+        return cls(cfg.allow_self_approval, cfg.allow_draft_execution, cfg.allow_patient_level)

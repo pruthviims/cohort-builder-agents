@@ -14,6 +14,18 @@ Roles per endpoint (admin implies all):
   POST /cohorts/{id}/execute                                          executor (approved definitions only)
   GET  /runs/{id}, POST /runs/{id}/replay                             author (own runs), reviewer (tenant), admin
   GET  /audit                                                         admin
+
+Proxy (indirect) cohort algorithms, same governance (see README "Proxy cohorts"):
+  POST /proxy-cohorts, /proxy-cohorts/ask, /proxy-cohorts/validate      author (drafts only; nothing executes)
+  GET  /proxy-cohorts, /proxy-cohorts/{id}, .../versions, .../review-packet   any role
+  POST /proxy-cohorts/{id}/compile                                      any role (SQL preview only)
+  POST /proxy-cohorts/{id}/review                                       reviewer (not own work, unless policy allows)
+  POST /proxy-cohorts/{id}/execute                                      executor (approved definitions only)
+  GET  /proxy-cohorts/{id}/results, .../evidence-summary                executor or reviewer (suppressed aggregates)
+  POST /proxy-cohorts/compare                                           executor or reviewer (suppressed overlaps)
+  POST /proxy-cohorts/{id}/reference-validation                         reviewer
+  POST /proxy-references                                                admin (external reference labels)
+  GET  /proxy-cohorts/{id}/patients/{subject_id}/explanation            admin AND CB_ALLOW_PATIENT_LEVEL=true
 """
 
 from __future__ import annotations
@@ -27,12 +39,15 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .agents.composer import format_validation_error
 from .agents.validator import validate
 from .executor import ExecutionError, QueryTimeout
 from .ir import CohortDefinition
 from .orchestrator import CohortBuilder, GovernanceError
+from .proxy import ProxyDefinition
+from .proxy_service import VersionConflict
 from .security import (
     ADMIN,
     AUTHOR,
@@ -77,6 +92,38 @@ class SubmitIRRequest(_Strict):
 
 class ValidateIRRequest(_Strict):
     ir: CohortDefinition
+
+
+class ProxyPayload(_Strict):
+    """A proxy definition as JSON (`definition`) or as YAML text (`yaml`); exactly one."""
+
+    definition: dict[str, Any] | None = None
+    yaml: str | None = Field(default=None, max_length=500_000)
+
+
+class SubmitProxyRequest(ProxyPayload):
+    parent_definition_id: int | None = None
+
+
+class CompareRequest(_Strict):
+    generation_ids: list[str] = Field(min_length=2, max_length=6)
+
+
+class ReferenceValidationRequest(_Strict):
+    reference_name: str = Field(min_length=1, max_length=128)
+    generation_id: str | None = None
+    positive_tiers: list[str] | None = None
+
+
+class ReferenceLabel(_Strict):
+    person_id: int
+    is_case: bool
+
+
+class ReferenceLoadRequest(_Strict):
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.\-]+$")
+    source: str = Field(min_length=3, max_length=1000, description="the external reference standard")
+    labels: list[ReferenceLabel] = Field(min_length=1, max_length=1_000_000)
 
 
 def create_app(
@@ -225,7 +272,7 @@ def create_app(
                 row, ir = b().load_definition(def_id, scope(p))
             except KeyError as exc:
                 raise HTTPException(404, f"cohort definition {def_id} not found") from exc
-            return {**row, "explanation": b().explainer.explain(ir)}
+            return {**row, "explanation": b().explain(ir)}
 
     @app.get("/cohorts/{def_id}/sql")
     def get_sql(def_id: int, p: Principal = Depends(any_role)) -> dict:
@@ -288,6 +335,140 @@ def create_app(
     def audit(limit: int = 100, _: Principal = Depends(need_admin)) -> list[dict]:
         with lock:
             return b().store.audit_events(max(1, min(limit, 1000)))
+
+    # ---- proxy cohorts --------------------------------------------------------------------
+    need_results = require(EXECUTOR, REVIEWER)
+
+    def proxy_from(req: ProxyPayload) -> ProxyDefinition:
+        if (req.definition is None) == (req.yaml is None):
+            raise HTTPException(422, "provide exactly one of `definition` (JSON) or `yaml`")
+        try:
+            with lock:
+                return b().parse_proxy_payload(req.yaml if req.yaml is not None else req.definition or {})
+        except ValidationError as exc:
+            raise HTTPException(422, {"errors": format_validation_error(exc)}) from exc
+        except Exception as exc:  # malformed YAML
+            raise HTTPException(422, f"invalid proxy definition: {type(exc).__name__}") from exc
+
+    def proxy_call(fn: Callable[[], Any], def_id: int | None = None) -> Any:
+        with lock:
+            try:
+                return fn()
+            except KeyError as exc:
+                raise HTTPException(404, str(exc).strip("'\"") or f"proxy definition {def_id} not found") from exc
+            except VersionConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/proxy-cohorts/validate")
+    def proxy_validate(req: ProxyPayload, _: Principal = Depends(need_author)) -> dict:
+        p = proxy_from(req)
+        return proxy_call(lambda: b().validate_proxy_definition(p))
+
+    @app.post("/proxy-cohorts")
+    def proxy_submit(req: SubmitProxyRequest, p: Principal = Depends(need_author)) -> dict:
+        defn = proxy_from(req)
+        return proxy_call(lambda: b().submit_proxy(defn, p.subject, p.tenant, req.parent_definition_id))
+
+    @app.post("/proxy-cohorts/ask")
+    def proxy_ask(req: AskRequest, p: Principal = Depends(need_author)) -> dict:
+        return proxy_call(lambda: b().ask_proxy(req.query, p.subject, p.tenant).as_dict())
+
+    @app.get("/proxy-cohorts")
+    def proxy_list(limit: int = 50, p: Principal = Depends(any_role)) -> list[dict]:
+        with lock:
+            return b().store.list_definitions(max(1, min(limit, 500)), tenant=scope(p), kind="proxy")
+
+    @app.get("/proxy-cohorts/{def_id}")
+    def proxy_get(def_id: int, p: Principal = Depends(any_role)) -> dict:
+        def run() -> dict:
+            row, defn = b().load_proxy(def_id, scope(p))
+            return {**row, "explanation": b().explain(defn)}
+
+        return proxy_call(run, def_id)
+
+    @app.get("/proxy-cohorts/{def_id}/versions")
+    def proxy_versions(def_id: int, p: Principal = Depends(any_role)) -> list[dict]:
+        return proxy_call(lambda: b().proxy_versions(def_id, scope(p)), def_id)
+
+    @app.get("/proxy-cohorts/{def_id}/review-packet")
+    def proxy_packet(def_id: int, p: Principal = Depends(any_role)) -> dict:
+        return proxy_call(lambda: b().proxy_review_packet(def_id, scope(p)), def_id)
+
+    @app.post("/proxy-cohorts/{def_id}/review")
+    def proxy_review(def_id: int, req: ReviewRequest, p: Principal = Depends(need_reviewer)) -> dict:
+        def run() -> dict:
+            b().load_proxy(def_id, scope(p))
+            b().review(def_id, p.subject, req.decision, req.comments, scope(p))
+            return {"cohort_definition_id": def_id, "decision": req.decision, "reviewer": p.subject}
+
+        return proxy_call(run, def_id)
+
+    @app.post("/proxy-cohorts/{def_id}/compile")
+    def proxy_compile(def_id: int, p: Principal = Depends(any_role)) -> dict:
+        return proxy_call(lambda: b().compile_proxy(def_id, scope(p)), def_id)
+
+    @app.post("/proxy-cohorts/{def_id}/execute")
+    def proxy_execute(def_id: int, req: ExecuteRequest | None = None, p: Principal = Depends(need_executor)) -> dict:
+        allow_draft = (req or ExecuteRequest()).allow_draft
+
+        def run() -> dict:
+            b().load_proxy(def_id, scope(p))
+            return b().execute(def_id, p.subject, allow_draft, scope(p))
+
+        return proxy_call(run, def_id)
+
+    @app.get("/proxy-cohorts/{def_id}/results")
+    def proxy_results(def_id: int, generation_id: str | None = None, p: Principal = Depends(need_results)) -> dict:
+        return proxy_call(lambda: b().proxy_results(def_id, scope(p), generation_id), def_id)
+
+    @app.get("/proxy-cohorts/{def_id}/evidence-summary")
+    def proxy_evidence(def_id: int, generation_id: str | None = None, p: Principal = Depends(need_results)) -> dict:
+        def run() -> dict:
+            r = b().proxy_results(def_id, scope(p), generation_id)
+            return {
+                k: r[k]
+                for k in (
+                    "generation_id",
+                    "cohort_definition_id",
+                    "algorithm",
+                    "evidence_summary",
+                    "min_cell_count",
+                    "governance",
+                )
+            }
+
+        return proxy_call(run, def_id)
+
+    @app.post("/proxy-cohorts/compare")
+    def proxy_compare(req: CompareRequest, p: Principal = Depends(need_results)) -> dict:
+        return proxy_call(lambda: b().compare_generations(req.generation_ids, p.subject, scope(p)))
+
+    @app.post("/proxy-cohorts/{def_id}/reference-validation")
+    def proxy_reference_validation(
+        def_id: int, req: ReferenceValidationRequest, p: Principal = Depends(need_reviewer)
+    ) -> dict:
+        return proxy_call(
+            lambda: b().validate_against_reference(
+                def_id, req.reference_name, p.subject, scope(p), req.generation_id, req.positive_tiers
+            ),
+            def_id,
+        )
+
+    @app.post("/proxy-references")
+    def proxy_reference_load(req: ReferenceLoadRequest, p: Principal = Depends(need_admin)) -> dict:
+        labels = [(lab.person_id, lab.is_case) for lab in req.labels]
+        return proxy_call(lambda: b().load_reference(req.name, labels, req.source, p.subject, p.tenant))
+
+    @app.get("/proxy-cohorts/{def_id}/patients/{subject_id}/explanation")
+    def proxy_patient(
+        def_id: int, subject_id: int, generation_id: str | None = None, p: Principal = Depends(need_admin)
+    ) -> dict:
+        return proxy_call(
+            lambda: b().patient_explanation(def_id, subject_id, p.subject, p.is_admin, scope(p), generation_id),
+            def_id,
+        )
 
     _ = VIEWER  # every role can read; VIEWER is the role for read-only users
     return app

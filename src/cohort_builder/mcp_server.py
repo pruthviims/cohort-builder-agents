@@ -14,6 +14,10 @@ Governance:
 * `execute_approved_cohort` only runs approved definitions and returns aggregate,
   small-cell-suppressed counts. No tool returns patient-level rows.
 * The acting identity comes from server config (CB_MCP_USER), not from tool arguments.
+* Proxy (indirect) cohort algorithms follow the same rules: the create/validate/explain/compile/
+  review-packet tools only produce drafts, previews and packets. `get_proxy_review_packet` returns the
+  human review packet; it cannot approve. An AI that generated an algorithm cannot run it:
+  `execute_proxy_cohort` refuses anything a human has not approved. No patient-level output.
 
 Run:  cohort-builder mcp                      (stdio, for a local client)
       cohort-builder mcp --http --port 8765   (shared server; set CB_MCP_TOKEN)
@@ -37,6 +41,8 @@ from .agents.validator import validate
 from .executor import ExecutionError
 from .ir import CohortDefinition
 from .orchestrator import CohortBuilder
+from .proxy import ProxyDefinition
+from .proxy_service import VersionConflict
 from .security import DEFAULT_TENANT
 
 INSTRUCTIONS = """\
@@ -50,6 +56,12 @@ with `save_cohort_definition`. Only use concept IDs returned by the tools.
 
 Saved definitions are drafts. A human reviewer must approve them outside this tool
 before `execute_approved_cohort` will run them. No tool returns patient-level data.
+
+Proxy algorithms (rare diseases, subtypes without a reliable code): describe the evidence,
+logic and tiers (resource cohort://proxy-schema, example in the README), check with
+`validate_proxy_cohort`, save with `create_proxy_cohort`, show the reviewer `get_proxy_review_packet`.
+Never describe results as identifying patients who truly have the condition; the evidence
+score is a rule score, not a probability.
 """
 
 
@@ -241,7 +253,7 @@ def create_server(
                 row, ir = b().load_definition(definition_id, tenant)
             except KeyError as exc:
                 return {"error": str(exc)}
-            return _j({**row, "explanation": b().explainer.explain(ir)})
+            return _j({**row, "explanation": b().explain(ir)})
 
     @mcp.tool(annotations=READ_ONLY)
     def get_cohort_sql(definition_id: int) -> dict:
@@ -266,6 +278,108 @@ def create_server(
             except (ValueError, ExecutionError) as exc:
                 return {"error": str(exc)}
             return _j(out)  # counts are already small-cell suppressed by the core
+
+    # ---- proxy (indirect) cohort algorithms ------------------------------------------
+    def parse_proxy(definition: dict | None, definition_yaml: str | None) -> ProxyDefinition | dict:
+        if (definition is None) == (definition_yaml is None):
+            return {"error": "provide exactly one of definition (JSON object) or definition_yaml"}
+        try:
+            return b().parse_proxy_payload(definition_yaml if definition_yaml is not None else definition or {})
+        except ValidationError as exc:
+            return {"schema_errors": _j(exc.errors(include_url=False))}
+        except Exception as exc:  # malformed YAML
+            return {"error": f"invalid proxy definition: {type(exc).__name__}"}
+
+    @mcp.tool(annotations=WRITES)
+    def create_proxy_cohort(
+        request: str | None = None, definition: dict | None = None, definition_yaml: str | None = None
+    ) -> dict:
+        """Create a proxy identification algorithm as a DRAFT, either from a natural-language
+        `request` (server pipeline: draft -> grounded concepts -> validation) or from a definition
+        (JSON or YAML, see cohort://proxy-schema). Nothing is executed; a human must review and
+        approve the draft. Versions are immutable: changing an existing version needs a new version."""
+        with lock:
+            if request is not None:
+                if definition is not None or definition_yaml is not None:
+                    return {"error": "give either request or a definition, not both"}
+                return _j(b().ask_proxy(request, user_id=user, tenant=tenant).as_dict())
+            p = parse_proxy(definition, definition_yaml)
+            if isinstance(p, dict):
+                return {"saved": False, **p}
+            try:
+                out = b().submit_proxy(p, user, tenant)
+            except (VersionConflict, PermissionError, KeyError) as exc:
+                return {"saved": False, "error": str(exc).strip("'\"")}
+            return _j({"saved": True, **out, "next_step": "A human reviewer must approve this draft outside MCP."})
+
+    @mcp.tool(annotations=READ_ONLY)
+    def validate_proxy_cohort(definition: dict | None = None, definition_yaml: str | None = None) -> dict:
+        """Validate a proxy definition against the ontology, vocabulary and the active dataset's
+        capabilities, and dry-run it (suppressed attrition). Nothing is saved."""
+        with lock:
+            p = parse_proxy(definition, definition_yaml)
+            if isinstance(p, dict):
+                return {"valid": False, **p}
+            return _j(b().validate_proxy_definition(p))
+
+    @mcp.tool(annotations=READ_ONLY)
+    def explain_proxy_cohort(definition_id: int) -> dict:
+        """Plain-language explanation of a saved proxy algorithm (generated from the definition)."""
+        with lock:
+            try:
+                row, p = b().load_proxy(definition_id, tenant)
+            except KeyError as exc:
+                return {"error": str(exc).strip("'\"")}
+            return _j({"cohort_definition_id": definition_id, "status": row["status"], "explanation": b().explain(p)})
+
+    @mcp.tool(annotations=READ_ONLY)
+    def compile_proxy_cohort(definition_id: int) -> dict:
+        """Deterministic SQL preview of a saved proxy algorithm (no execution)."""
+        with lock:
+            try:
+                return _j(b().compile_proxy(definition_id, tenant))
+            except (KeyError, ValueError) as exc:
+                return {"error": str(exc).strip("'\"")}
+
+    @mcp.tool(annotations=READ_ONLY)
+    def get_proxy_review_packet(definition_id: int) -> dict:
+        """The human review packet (target, evidence, logic, temporal rules, dataset limitations,
+        expected tiers, issues). Read-only: approval is NOT possible through MCP."""
+        with lock:
+            try:
+                packet = b().proxy_review_packet(definition_id, tenant)
+            except KeyError as exc:
+                return {"error": str(exc).strip("'\"")}
+            packet["approval"] = "Approval is only possible for a human reviewer via the CLI or HTTP API."
+            return _j(packet)
+
+    @mcp.tool(annotations=WRITES)
+    def execute_proxy_cohort(definition_id: int) -> dict:
+        """Run an APPROVED proxy algorithm. Returns suppressed attrition and evidence/tier counts only."""
+        with lock:
+            try:
+                b().load_proxy(definition_id, tenant)
+                out = b().execute(definition_id, user, allow_draft=False, tenant=tenant)
+            except KeyError as exc:
+                return {"error": str(exc).strip("'\"")}
+            except PermissionError as exc:
+                return {"error": str(exc), "hint": "A human reviewer must approve this algorithm first."}
+            except (ValueError, ExecutionError) as exc:
+                return {"error": str(exc)}
+            return _j(out)
+
+    @mcp.tool(annotations=READ_ONLY)
+    def compare_proxy_cohorts(generation_ids: list[str]) -> dict:
+        """Compare 2-6 executed generations: sizes and pairwise overlaps (small cells suppressed)."""
+        with lock:
+            try:
+                return _j(b().compare_generations(generation_ids, user, tenant))
+            except (KeyError, ValueError) as exc:
+                return {"error": str(exc).strip("'\"")}
+
+    @mcp.resource("cohort://proxy-schema", name="Proxy definition JSON schema", mime_type="application/json")
+    def proxy_schema() -> str:
+        return json.dumps(ProxyDefinition.model_json_schema(by_alias=True), indent=2)
 
     # ---- resources ------------------------------------------------------------------
     def _file(name: str) -> str:

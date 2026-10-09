@@ -60,6 +60,27 @@ def suppress_series(counts: list[int], min_cell: int) -> list[int | str]:
     return out
 
 
+def suppress_with_total(n: int, total: int, min_cell: int) -> int | str:
+    """A count shown next to its total: hide it if it OR its complement (total - n) is a small group."""
+    if 0 < n < min_cell:
+        return PRIMARY.format(k=min_cell)
+    if 0 < total - n < min_cell:
+        return COMPLEMENTARY
+    return n
+
+
+def suppress_partition(cells: dict[str, int], min_cell: int, total_disclosed: bool = True) -> dict[str, int | str]:
+    """Cells that sum to a disclosed total (e.g. tiers): after primary suppression, if exactly one cell is
+    hidden its value could be recovered as total - others, so the smallest other non-zero cell is hidden too."""
+    out: dict[str, int | str] = {k: suppress_count(v, min_cell) for k, v in cells.items()}
+    hidden = [k for k, v in out.items() if isinstance(v, str)]
+    if total_disclosed and len(hidden) == 1:
+        rest = sorted((v, k) for k, v in cells.items() if k not in hidden and v > 0)
+        if rest:
+            out[rest[0][1]] = COMPLEMENTARY
+    return out
+
+
 @dataclass
 class Attrition:
     rules: list[dict] = field(default_factory=list)  # {sequence, name, remaining}
@@ -143,6 +164,17 @@ class Executor:
                 f"FROM ({cohort_sql})",
                 [cohort_definition_id, generation_id],
             )
+            if getattr(compiled, "assignment_sql", ""):  # proxy cohorts: tier, score and evidence per member
+                self._run(
+                    f"INSERT INTO results.proxy_assignment SELECT ?, ?, subject_id, tier, evidence_score "
+                    f"FROM ({guard_select(compiled.assignment_sql)})",  # type: ignore[attr-defined]
+                    [generation_id, cohort_definition_id],
+                )
+                self._run(
+                    f"INSERT INTO results.proxy_evidence SELECT ?, subject_id, evidence_key, kind, present "
+                    f"FROM ({guard_select(compiled.evidence_sql)})",  # type: ignore[attr-defined]
+                    [generation_id],
+                )
             for r in attrition.rules:
                 self.con.execute(
                     "INSERT INTO results.cohort_inclusion_stats VALUES (?,?,?,?,?)",
@@ -153,6 +185,12 @@ class Executor:
             self.con.execute("ROLLBACK")
             raise
         return generation_id, attrition
+
+    def proxy_summary(self, compiled: CompiledCohort) -> dict[str, int]:
+        """Raw evidence/tier/funnel counts among candidates (internal; suppress before showing)."""
+        cols = getattr(compiled, "summary_columns", ())
+        row = self._run(guard_select(compiled.summary_sql), fetch="one")  # type: ignore[attr-defined]
+        return {c: int(v or 0) for c, v in zip(cols, row, strict=True)}
 
     def person_ids(self, compiled: CompiledCohort) -> set[int]:
         """Patient-level ids: for internal evaluation/tests only, never returned by an interface."""

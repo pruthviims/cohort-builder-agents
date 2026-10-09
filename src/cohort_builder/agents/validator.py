@@ -28,11 +28,17 @@ def _absence_based(role: str, c: Criterion) -> bool:
 
 
 def validate(
-    ir: CohortDefinition,
+    ir: CohortDefinition | Any,
     ont: Ontology,
     vocab: Vocabulary,
     executor: Executor | None = None,
+    *,
+    criteria: list[tuple[str, Criterion]] | None = None,
+    compiled: Any = None,
+    exempt_concept_sets: set[str] | None = None,
 ) -> tuple[list[Issue], Attrition | None]:
+    """Validate a cohort definition. `criteria`/`compiled` let proxy definitions reuse every check
+    (concepts, units, dataset capabilities, coverage) with their evidence as the criteria."""
     issues: list[Issue] = []
 
     def err(stage: str, msg: str) -> None:
@@ -186,9 +192,11 @@ def validate(
     check_ref(ir.index_event.entity, ir.index_event.concept_set_id, "index event")
     check_value(ir.index_event.entity, ir.index_event.concept_set_id, ir.index_event.value_filter, "index event")
     check_dataset(ir.index_event.entity, ir.index_event, "index event")
-    crits: list[tuple[str, Criterion]] = [("inclusion", c) for c in ir.inclusion] + [
-        ("exclusion", c) for c in ir.exclusion
-    ]
+    crits: list[tuple[str, Criterion]] = (
+        criteria
+        if criteria is not None
+        else [("inclusion", c) for c in ir.inclusion] + [("exclusion", c) for c in ir.exclusion]
+    )
     for role, c in crits:
         where = f"{role} {c.name!r}"
         check_ref(c.entity, c.concept_set_id, where)
@@ -202,9 +210,9 @@ def validate(
             )
         if has_observation:
             check_coverage(role, c, where)
-    if len(ir.inclusion) > ont.rules["max_inclusion_criteria"]:
+    if criteria is None and len(ir.inclusion) > ont.rules["max_inclusion_criteria"]:
         err("intent", f"more than {ont.rules['max_inclusion_criteria']} inclusion criteria")
-    used = {ir.index_event.concept_set_id} | {c.concept_set_id for _, c in crits}
+    used = {ir.index_event.concept_set_id} | {c.concept_set_id for _, c in crits} | (exempt_concept_sets or set())
     for unused in sorted(ids - used):
         warn("intent", f"concept set {unused!r} is not used by any rule")
     allowed_genders = {int(k) for k in ont.domain["attributes"]["Person.gender"]["allowed_concepts"]}
@@ -220,7 +228,7 @@ def validate(
         return issues, None
 
     # ---- dry run (aggregate counts only) --------------------------------------
-    attrition = executor.attrition(Compiler(ont).compile(ir))
+    attrition = executor.attrition(compiled if compiled is not None else Compiler(ont).compile(ir))
     rules = attrition.rules
     if rules[0]["remaining"] == 0:
         err("concepts", "no index events found in the data: check the index concept set")

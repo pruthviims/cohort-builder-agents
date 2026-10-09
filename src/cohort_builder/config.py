@@ -38,7 +38,7 @@ class Settings:
     duckdb_threads: int | None = None
     lock_external_access: bool = True  # block file/network access from SQL after setup
     prompt_versions: dict[str, str] = field(
-        default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2"}
+        default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2", "proxy_parser": "v1"}
     )
 
     @classmethod

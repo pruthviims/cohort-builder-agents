@@ -1,0 +1,105 @@
+# Example proxy identification algorithm: ESCC-like target (esophageal squamous cell carcinoma).
+#
+# PLACEHOLDERS ONLY. Every concept id below (2,100,000,000+) is a synthetic test concept, not a real
+# clinical code, and the logic, windows and weights are illustrative. This is NOT a clinically
+# validated algorithm. A real algorithm needs clinician-curated concept sets, review, and validation
+# against an external reference standard before it may be called validated.
+#
+# Semantics (see README "Proxy cohorts"): windows are days relative to the index date, inclusive at
+# both ends; tiers are evaluated in order and the first matching tier is assigned.
+algorithm_name: escc_proxy_example
+version: "1.0"
+classification: exploratory
+target:
+  name: Esophageal squamous cell carcinoma (ESCC)
+  description: Histology-defined subtype without a reliable direct diagnosis code in claims.
+clinical_notes: >-
+  Illustrative structure only: broad esophageal malignancy diagnosis plus squamous pathology evidence
+  or a treatment pattern. Concept sets, windows and weights must be defined by clinical experts.
+dataset_profile: escc_synthetic
+ontology_version: "1.2.0"
+vocabulary_version: "test"
+
+concept_sets:
+  - {id: esophageal_malignancy, name: "PLACEHOLDER esophageal malignancy", domain: Condition,
+     items: [{concept_id: 2100000001}]}
+  - {id: squamous_histology, name: "PLACEHOLDER squamous histology finding", domain: Measurement,
+     items: [{concept_id: 2100000003}]}
+  - {id: adeno_histology, name: "PLACEHOLDER adenocarcinoma histology finding", domain: Measurement,
+     items: [{concept_id: 2100000008}]}
+  - {id: escc_chemotherapy, name: "PLACEHOLDER chemotherapy agents", domain: Drug,
+     items: [{concept_id: 2100000004}, {concept_id: 2100000005}]}
+  - {id: radiation, name: "PLACEHOLDER radiation therapy", domain: Procedure, items: [{concept_id: 2100000006}]}
+  - {id: esophagectomy, name: "PLACEHOLDER esophagectomy", domain: Procedure, items: [{concept_id: 2100000007}]}
+  - {id: competing_malignancy, name: "PLACEHOLDER competing malignancy", domain: Condition,
+     items: [{concept_id: 2100000009}]}
+
+# index = first qualifying esophageal malignancy diagnosis
+index_event: {entity: ConditionOccurrence, concept_set_id: esophageal_malignancy, first_occurrence_only: true}
+prior_observation_days: 365
+post_observation_days: 365
+
+evidence:
+  - {id: esoph_dx, name: Esophageal malignancy diagnosis, category: supporting, entity: ConditionOccurrence,
+     concept_set_id: esophageal_malignancy, window: {start_days: 0, end_days: 0}}
+  - {id: repeated_dx, name: At least 2 esophageal malignancy diagnoses within 180 days, category: supporting,
+     entity: ConditionOccurrence, concept_set_id: esophageal_malignancy, window: {start_days: 0, end_days: 365},
+     count: 2, max_span_days: 180}
+  - {id: squamous_path, name: Squamous histology result, category: pathology, entity: Measurement,
+     concept_set_id: squamous_histology, window: {start_days: -30, end_days: 90}}
+  - {id: chemo, name: Chemotherapy consistent with the target, category: treatment, entity: DrugExposure,
+     concept_set_id: escc_chemotherapy, window: {start_days: 0, end_days: 180}}
+  - {id: radiation_tx, name: Radiation therapy, category: procedure, entity: ProcedureOccurrence,
+     concept_set_id: radiation, window: {start_days: 0, end_days: 180}}
+  - {id: surgery, name: Esophagectomy, category: procedure, entity: ProcedureOccurrence,
+     concept_set_id: esophagectomy, window: {start_days: 0, end_days: 180}, required: false}
+  - {id: adeno_path, name: Adenocarcinoma histology result, category: conflicting, entity: Measurement,
+     concept_set_id: adeno_histology, window: {start_days: -30, end_days: 180}}
+  - {id: competing_cancer, name: Competing malignancy in the prior year, category: conflicting,
+     entity: ConditionOccurrence, concept_set_id: competing_malignancy, window: {start_days: -365, end_days: -1}}
+
+groups:
+  # at least 2 different treatment/procedure signals within 90 days of each other
+  strong_treatment:
+    at_least: {n: 2, within_days: 90, of: [{evidence: chemo}, {evidence: radiation_tx}, {evidence: surgery}]}
+
+temporal_rules:
+  - {id: dx_before_tx, name: Diagnosis on or before first chemotherapy (within 180 days), a: esoph_dx, b: chemo,
+     relation: before, days: 180, allow_same_day: true, required: false}
+
+entry: {evidence: esoph_dx}
+exclusion: {evidence: competing_cancer}
+conflicts:
+  - {name: adeno_histology, label: Adenocarcinoma histology recorded, rule: {evidence: adeno_path}, action: flag}
+
+scoring:
+  name: evidence score
+  weights:
+    - {ref: {evidence: esoph_dx}, points: 1}
+    - {ref: {evidence: repeated_dx}, points: 1}
+    - {ref: {evidence: chemo}, points: 2}
+    - {ref: {evidence: radiation_tx}, points: 2}
+    - {ref: {evidence: squamous_path}, points: 3}
+
+tiers:
+  - name: high
+    label: High (rule-based)
+    rule:
+      all:
+        - {evidence: esoph_dx}
+        - {evidence: squamous_path}
+        - any: [{group: strong_treatment}, {evidence: chemo}]
+  - name: moderate
+    label: Moderate (rule-based)
+    rule: {all: [{evidence: esoph_dx}, {group: strong_treatment}]}
+  - name: exploratory
+    label: Exploratory
+    rule: {all: [{evidence: esoph_dx}, {evidence: repeated_dx}]}
+
+funnel:
+  - {name: Diagnosis evidence, rule: {evidence: esoph_dx}}
+  - {name: Repeated diagnosis or treatment, rule: {any: [{evidence: repeated_dx}, {evidence: chemo}]}}
+  - {name: Pathology evidence, rule: {evidence: squamous_path}}
+
+assumptions:
+  - Placeholder concept sets; windows and weights are illustrative.

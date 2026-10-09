@@ -66,6 +66,13 @@ Tokens are never logged; authentication failures are logged without the credenti
 | `executor` | execute **approved** definitions; receives suppressed aggregate counts only |
 | `admin` | everything above, across tenants, plus `GET /audit` |
 
+Proxy cohort endpoints use the same roles: authors create, validate and draft (`/proxy-cohorts`,
+`/proxy-cohorts/ask`, `/proxy-cohorts/validate`); any role reads definitions, versions, review packets and
+the SQL preview; reviewers approve or reject and run reference validations; executors run approved
+definitions; executors and reviewers read suppressed results, evidence summaries and comparisons; admins
+load reference-standard labels (`/proxy-references`) and, only when `CB_ALLOW_PATIENT_LEVEL=true`, read
+per-patient explanations.
+
 How the rules are enforced:
 
 - **Identity comes from the token.** Request bodies that carry identity fields (`user_id`, `reviewer`) are
@@ -85,7 +92,9 @@ How the rules are enforced:
   boundary: `--reviewer` and `--user` are trusted. The governance rules (no self-approval, no draft execution,
   approval only from draft) still apply, because they live in the core.
 - **MCP.** The MCP server acts as one configured identity (`CB_MCP_USER`) in one tenant (`CB_MCP_TENANT`). It
-  has no approval tool, and it executes approved definitions only. Its HTTP mode uses one shared bearer token
+  has no approval tool, and it executes approved definitions only. The proxy tools follow the same rule:
+  `get_proxy_review_packet` is read-only, `execute_proxy_cohort` refuses anything a human has not approved,
+  and no MCP tool returns patient-level data. An AI that generated an algorithm therefore cannot run it. Its HTTP mode uses one shared bearer token
   (`CB_MCP_TOKEN`) plus a host allowlist. That is suitable for a pilot only; per-user OAuth is remaining work.
 
 ## Audit log
@@ -100,6 +109,9 @@ Events recorded:
 - `definition.review`
 - `definition.execute`
 - `authz.denied`
+- `proxy.ask`, `proxy.submit`, `proxy.compare`, `proxy.validate_reference`, `reference.load`
+- `proxy.patient_explanation` (success and denied; the patient is recorded only as a hash of
+  generation id and subject id, never the id itself)
 
 No tokens or patient data are written to the audit log. Admins read it through `GET /audit`.
 
@@ -117,6 +129,16 @@ default threshold is `min_cell_count: 10`, set in `ontology/domain.yaml`.
 - **Complementary suppression.** In an attrition table, a count is shown as `"suppressed"` if its difference
   from the last disclosed count is between 1 and k−1. Otherwise that small group could be recovered by
   subtraction. The final `person_count` always matches the suppressed table.
+- **Counts next to a disclosed total** (proxy evidence counts among candidates, reference labels) are
+  hidden if the count *or its complement* is small (`suppress_with_total`).
+- **Partitions** (proxy tiers, which sum to the candidates): if exactly one cell is hidden, the smallest
+  other non-zero cell is hidden too, so it cannot be recovered by subtraction (`suppress_partition`).
+- **Overlaps** between two generations: small cells, and any cell recoverable from a disclosed cohort size,
+  are hidden. **Confusion matrices:** if any cell is small, all non-zero cells are hidden and the metrics are
+  withheld.
+- **Patient-level proxy output** (per-patient evidence in `results.proxy_assignment` /
+  `results.proxy_evidence`) is returned only to admins when `CB_ALLOW_PATIENT_LEVEL=true`; it is off by
+  default and every access is audited.
 - **Raw counts and patient rows stay in the database:** `results.cohort` and `meta.cohort_generation`. No
   interface returns patient-level rows.
 
@@ -157,6 +179,8 @@ executors may submit. Treat suppression as one layer, not as anonymization.
 | Natural-language prompts | `meta.agent_run.user_query`, `meta.llm_call` | May describe sensitive study questions. Access is limited to the author, reviewers and admins. Define a retention period |
 | LLM requests and responses | `meta.llm_call`, `meta.llm_cache` | Contain prompts, ontology summaries and tool results (vocabulary data, suppressed counts), never patient rows. Leave `CB_LLM_MODE` as is, but consider purging `llm_call` after the retention period |
 | Cohort membership | `results.cohort` | Patient-level. Restrict database access to authorized analysts |
+| Proxy tiers, scores and per-patient evidence | `results.proxy_assignment`, `results.proxy_evidence` | Patient-level. Returned only to admins with `CB_ALLOW_PATIENT_LEVEL=true` |
+| Reference-standard labels | `meta.reference_label` | Patient-level, from an external source. Admin-only input, immutable per name, never returned |
 | Tokens | Hashes only, in the token file | Protect the file anyway (it maps identities to roles) |
 
 The LLM provider receives prompts and tool results. Check your organization's policy and agreements before

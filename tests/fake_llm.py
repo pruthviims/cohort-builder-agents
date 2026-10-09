@@ -33,8 +33,10 @@ class FakeLLM:
         intents: dict[str, list[dict]],
         critic: Callable[[str, int], dict] | None = None,
         resolver_scripts: dict[str, list[tuple]] | None = None,
+        proxies: dict[str, list[dict]] | None = None,
     ):
         self.intents = intents
+        self.proxies = proxies or {}
         self.critic = critic or (lambda user, n: {"verdict": "pass", "issues": [], "notes": ""})
         self.resolver_scripts = resolver_scripts or {}
         self.calls = 0
@@ -47,6 +49,12 @@ class FakeLLM:
         names = {t["name"] for t in request["tools"]}
         if "submit_cohort_intent" in names:
             return self._intent(request)
+        if "submit_proxy_definition" in names:
+            user = _text(request["messages"][0]["content"])
+            query = re.search(r"<request>\n(.*?)\n</request>", user, re.S).group(1)
+            options = self.proxies[query]
+            attempt = 1 if "<reviewer_feedback>" in user else 0
+            return _tool_use("submit_proxy_definition", options[min(attempt, len(options) - 1)], self.calls)
         if "submit_review" in names:
             self.critic_calls += 1
             return _tool_use(

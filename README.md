@@ -294,6 +294,141 @@ dataset profiles still need review by clinicians and data owners.
 
 Each rule above has a test on a small hand-built dataset in `tests/test_compiler_semantics.py`.
 
+## Proxy cohorts (rare diseases and subtypes without a reliable code)
+
+Some target populations have no single reliable diagnosis code in claims or EHR data, for example
+histology-defined cancer subtypes, rare metabolic diseases or molecular subtypes. For these the project
+supports **proxy identification algorithms**: named evidence combined with boolean logic, timing rules
+and evidence tiers. The engine is generic; nothing in it is disease-specific. A worked, placeholder-only
+example (an ESCC-like structure with synthetic concept ids, *not* a clinical algorithm) is in
+[`examples/proxy/escc_proxy_example.yaml`](examples/proxy/escc_proxy_example.yaml).
+
+**Wording.** A proxy cohort contains patients whose *data match the algorithm's rules*. It does not
+establish that they have the target condition. Every definition carries a classification:
+
+| Classification | Meaning |
+|---|---|
+| `direct` | a direct-diagnosis definition |
+| `proxy` | a data-based proxy definition |
+| `exploratory` | an exploratory identification algorithm (default for anything generated from natural language) |
+| `clinically_validated` | allowed only with a `validation_reference` to a recorded validation of the **same logic** against an external reference standard |
+
+The **evidence score** is a deterministic rule score (sum of configured points). It is not a
+probability, sensitivity, specificity, PPV or a measure of clinical certainty.
+
+### Definition format (YAML or JSON)
+
+```yaml
+algorithm_name: my_proxy            # lower-case identifier
+version: "1.0"                      # immutable: any change needs a new version
+classification: exploratory
+target: {name: "Target population"}
+dataset_profile: omop_demo          # dataset the algorithm was designed for
+concept_sets: [...]                 # as in cohort definitions
+index_event: {entity: ConditionOccurrence, concept_set_id: broad_dx}
+evidence:                           # each item is a criterion with an id and a category
+  - {id: dx, name: Broad diagnosis, category: supporting, entity: ConditionOccurrence,
+     concept_set_id: broad_dx, window: {start_days: 0, end_days: 0}}
+  - {id: repeat_dx, name: 2 diagnoses within 180 days, category: supporting, entity: ConditionOccurrence,
+     concept_set_id: broad_dx, window: {start_days: 0, end_days: 365}, count: 2, max_span_days: 180}
+  - {id: path, name: Pathology finding, category: pathology, entity: Measurement,
+     concept_set_id: path_finding, window: {start_days: -30, end_days: 90}, required: false}
+groups:                             # reusable named rules
+  treatment: {at_least: {n: 2, within_days: 90, of: [{evidence: chemo}, {evidence: radiation}]}}
+temporal_rules:
+  - {id: dx_first, name: Diagnosis before treatment, a: dx, b: chemo, relation: before, days: 180,
+     allow_same_day: true, required: false}
+entry: {evidence: dx}               # every member must satisfy this
+exclusion: {evidence: competing}    # members must NOT satisfy this
+conflicts: [{name: other_histology, rule: {evidence: other_path}, action: flag}]   # or exclude
+scoring: {weights: [{ref: {evidence: path}, points: 3}, {ref: {group: treatment}, points: 2}]}
+tiers:                              # ordered; first match wins; no match = not in the cohort
+  - {name: high, rule: {all: [{evidence: dx}, {evidence: path}]}}
+  - {name: moderate, rule: {all: [{evidence: dx}, {group: treatment}]}, min_score: 2}
+funnel: [{name: Diagnosis, rule: {evidence: dx}}, {name: Pathology, rule: {evidence: path}}]
+```
+
+Rules are objects with exactly one key: `evidence`, `group`, `temporal`, `all`, `any`, `not`,
+`at_least` / `at_most` / `exactly` (`{n, of, within_days?}`). Nesting is limited to 12 levels; unknown
+references, impossible N-of-M rules and group cycles are rejected when the definition is loaded.
+
+### Semantics
+
+- **Evidence windows** are inclusive at both ends, in days relative to the index (as for cohorts).
+  `null` bounds give an unbounded lookback or follow-up within the observation period.
+- **Repeats:** `count` + `max_span_days: W` = at least `count` events inside one span of at most W days;
+  `min_span_days` = first and last events at least that many days apart.
+- **Temporal rules** compare event dates of evidence A and B and hold if *some* pair satisfies
+  `min <= date_B - date_A <= max` (inclusive). `before` = [1, days] ([0, days] with `allow_same_day`),
+  `after` = [-days, -1], `within` = [-days, days], `same_day` = [0, 0], `between` = explicit bounds.
+  `required: true` makes the rule an attrition step.
+- **N-of-M** counts how many listed rules hold. With `within_days`, the counted evidence must also have
+  an event inside one window of that many days.
+- **Tiers** are assigned in order; a tier with `min_score` also needs that score. Conflicts either flag
+  (kept, counted) or exclude (an attrition step).
+- **One row per patient:** evidence is aggregated per index row, and each patient contributes at most one
+  member row (earliest qualifying index), so joins never multiply patients.
+
+Every rule above, including each boundary (day 0, ±1, the exact window edge), has a test in
+`tests/test_proxy_engine.py`, run on DuckDB and (with `CB_TEST_POSTGRES_DSN`) on PostgreSQL.
+
+### Dataset capabilities and absence
+
+Evidence is checked against the dataset profile before anything runs. Required evidence the dataset
+cannot provide is an **error** ("Proxy rule requires pathology evidence ..., but the selected dataset
+... does not provide it"). Optional evidence (`required: false`) is a **warning**: the algorithm runs on
+the remaining evidence and the missing item counts as absent. Tiers that become unreachable are
+reported. Capabilities come from `evidence_categories` in `ontology/domain.yaml` (e.g. pathology needs
+`extra_data: [pathology]`, provider evidence needs the `provider_specialty` attribute) and from each
+profile.
+
+Every `not`, `at_most`, `exactly` and exclusion rule gets a warning whose wording follows the profile's
+`absence_inference`: `weak` (open claims: "Absence of a claim does not establish absence of disease.
+This rule is limited by observation and claims coverage"), `observed_period` (OMOP observation periods)
+or `supported` (no warning).
+
+### Workflow
+
+```
+natural language ─► draft definition ─► validation ─► human review ─► SQL compile/preview ─► approval ─► execution ─► results
+```
+
+```bash
+cohort-builder proxy validate examples/proxy/escc_proxy_example.yaml     # explain + dry run, nothing saved
+cohort-builder proxy submit FILE --user alice                             # immutable draft version
+cohort-builder proxy ask "..." --user alice                               # NL -> draft only (never executes)
+cohort-builder proxy review-packet ID                                     # what the reviewer signs off
+cohort-builder proxy sql ID                                               # deterministic SQL preview
+cohort-builder proxy approve ID --reviewer bob                            # not the author
+cohort-builder proxy execute ID --user carol                              # approved definitions only
+cohort-builder proxy results ID                                           # suppressed evidence summary
+cohort-builder proxy compare GEN1 GEN2                                    # suppressed overlaps
+```
+
+The same steps are available over the HTTP API (`/proxy-cohorts`, `/proxy-cohorts/{id}/validate|review|
+compile|execute|results|evidence-summary|versions|review-packet`, `/proxy-cohorts/compare`) and MCP
+(`create_proxy_cohort`, `validate_proxy_cohort`, `explain_proxy_cohort`, `compile_proxy_cohort`,
+`get_proxy_review_packet`, `execute_proxy_cohort`, `compare_proxy_cohorts`). The LLM only drafts typed
+definitions, concept ids come from the grounded resolver, and SQL always comes from the deterministic
+compiler. MCP cannot approve, so an AI cannot run an algorithm it generated. See
+[`docs/SECURITY.md`](docs/SECURITY.md) for roles.
+
+**Results** are aggregates over *candidates* (patients passing every step except tier assignment):
+patients with each evidence item, temporal rule and conflict, the tier distribution, and the cumulative
+evidence funnel, all small-cell suppressed. Per-patient explanations (which evidence was present, which
+tier rule held, the score) need an admin principal **and** `CB_ALLOW_PATIENT_LEVEL=true`, and every
+access is audited.
+
+### Validation against a reference standard
+
+Sensitivity, specificity, PPV, NPV and F1 are computed **only** against an external, labelled reference
+standard (e.g. chart review or a registry) that an admin loads (`cohort-builder proxy load-reference
+NAME labels.csv --source "..."` or `POST /proxy-references`). They are computed over the labelled
+population, never from the proxy cohort itself, and withheld if a confusion-matrix cell is below the
+minimum cell count or the reference lacks cases or non-cases. A recorded validation can then back a new
+version classified `clinically_validated`, but only if its logic (semantic hash) is identical to the
+validated one. No validation data is shipped with this repository.
+
 ## Running tests and checks
 
 ```bash
@@ -318,6 +453,7 @@ throwaway credentials only.
 | `CB_ALLOW_SELF_APPROVAL` | `false` |
 | `CB_AUTH_DEV_BYPASS`, `CB_AUTH_DEV_SUBJECT`, `CB_AUTH_DEV_ROLES` | off; development only |
 | `CB_ALLOW_DRAFT_EXECUTION` | `false`; development only |
+| `CB_ALLOW_PATIENT_LEVEL` | `false` (per-patient proxy explanations for admins) |
 | `ANTHROPIC_API_KEY` | (required for `ask` in live/cached mode) |
 | `CB_DATASET` | `omop_demo` (or `iqvia_laad`) |
 | `CB_MODEL` | `claude-sonnet-5-5` |
@@ -341,9 +477,13 @@ src/cohort_builder/
   ir.py              cohort definition IR + canonical/semantic hashing
   vocab.py           vocabulary tools (search, hierarchy, Maps-to)
   compiler.py        deterministic IR -> SQL with attrition
+  proxy.py           proxy algorithm model (evidence, logic, temporal rules, tiers, versions)
+  proxy_compiler.py  deterministic proxy -> SQL (assignment, evidence, attrition, summary)
+  proxy_service.py   proxy workflow: versions, review packet, execution, results, comparison, reference validation
   executor.py        runs SQL, small-cell suppression, results tables
   llm.py             Anthropic client, request hashing, cache/replay
-  agents/            intent parser, concept resolver, critic (LLM); composer, validator, explainer (code)
+  agents/            intent parser, concept resolver, critic, proxy parser (LLM); composer, validators,
+                     explainers (code)
   orchestrator.py    fixed agent graph, review gate, manifests, replay
   metadata.py        audit/metadata store
   evaluation.py      golden-case evaluation
@@ -361,6 +501,10 @@ tests/               offline tests with a scripted fake LLM
 - **Live API path untested:** the agents were built against the Anthropic Messages API (forced tool use), but the live API path hasn't been run from this repo yet. The test suite uses a scripted fake LLM. Run `cohort-builder eval` with an API key to get a real accuracy baseline before trusting the agents.
 - **Placeholder LAAD layout:** the LAAD profile uses placeholder table and column names. Map it to your IQVIA data dictionary and check its claim-status conventions before use.
 - **Not compliance-assessed:** no clinical validation and no regulatory compliance assessment has been done. The demo data is synthetic, and its counts mean nothing clinically.
+
+- **Proxy algorithms are exploratory:** the proxy example uses placeholder concepts and illustrative
+  logic. No proxy algorithm here has been validated; real ones need clinician-curated concept sets and a
+  reference-standard validation.
 
 **Not implemented yet:**
 - **Single entry per person:** each person enters a cohort once, at their earliest qualifying index. Era collapsing and censoring events are not implemented.

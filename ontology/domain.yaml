@@ -2,7 +2,7 @@
 # Agents can only express cohorts using the entities, attributes and operators
 # declared here. Bump `version` (semver) on every change: it is recorded in
 # every run manifest and cohort definition.
-version: 1.1.0
+version: 1.2.0
 
 entities:
   ConditionOccurrence:
@@ -82,6 +82,22 @@ cohort_rules:
   exit_types: [end_of_observation, fixed_days]
   min_cell_count: 10          # counts below this are suppressed in outputs
   attrition_warning_ratio: 0.995  # warn if a single rule removes more than this share
+
+# Evidence categories for proxy (indirect) identification algorithms. A category groups evidence for
+# review and states what the dataset must provide. `requires_entity` / `requires_attribute` /
+# `requires_data` are checked against the dataset profile; unmet requirements are an error for
+# required evidence and a warning (evidence treated as absent) for optional evidence.
+evidence_categories:
+  direct:        {description: "Evidence that directly codes the target (often missing for rare/subtype targets)"}
+  supporting:    {description: "Broad or related diagnoses consistent with the target"}
+  treatment:     {description: "Medications or regimens consistent with the target"}
+  procedure:     {description: "Procedures consistent with the target", requires_entity: ProcedureOccurrence}
+  laboratory:    {description: "Laboratory results", requires_entity: Measurement}
+  pathology:     {description: "Pathology / histology evidence", requires_data: pathology}
+  provider:      {description: "Provider specialty", requires_attribute: provider_specialty}
+  care_setting:  {description: "Place of service / care setting", requires_attribute: place_of_service}
+  conflicting:   {description: "Evidence that argues against the target (competing diagnoses or treatments)"}
+  other:         {description: "Any other dataset-supported evidence"}
 
 # Curated concept sets are checked by the concept resolver before raw vocabulary search.
 curated_concept_sets_file: curated_concept_sets.yaml

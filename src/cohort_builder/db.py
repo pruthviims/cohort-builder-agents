@@ -63,6 +63,12 @@ CREATE SCHEMA IF NOT EXISTS results;
 CREATE TABLE IF NOT EXISTS results.cohort (
   cohort_definition_id BIGINT, subject_id BIGINT, cohort_start_date DATE,
   cohort_end_date DATE, generation_id VARCHAR);
+-- proxy cohorts: patient-level tier/score and evidence (never returned by an interface without
+-- explicit patient-level authorization; aggregated + suppressed otherwise)
+CREATE TABLE IF NOT EXISTS results.proxy_assignment (
+  generation_id VARCHAR, cohort_definition_id BIGINT, subject_id BIGINT, tier VARCHAR, evidence_score INTEGER);
+CREATE TABLE IF NOT EXISTS results.proxy_evidence (
+  generation_id VARCHAR, subject_id BIGINT, evidence_key VARCHAR, kind VARCHAR, present BOOLEAN);
 CREATE TABLE IF NOT EXISTS results.cohort_inclusion_stats (
   generation_id VARCHAR, cohort_definition_id BIGINT, rule_sequence INTEGER,
   rule_name VARCHAR, remaining_count BIGINT);

@@ -17,7 +17,7 @@
 #   concepts through the OMOP vocabularies, so the rest of the system is unchanged.
 # - No lab values and no visit table.
 name: iqvia_laad
-version: 1.1.0
+version: 1.2.0
 description: IQVIA LAAD-style open US claims (synthetic). Pharmacy claims with adjudication status, medical claims with diagnoses and procedures. No enrollment, no lab values.
 data_type: claims_open
 
@@ -26,8 +26,10 @@ params:
 
 capabilities:
   entities: [ConditionOccurrence, DrugExposure, ProcedureOccurrence]
-  attributes: [claim_status, dx_position]
+  attributes: [claim_status, dx_position, place_of_service]
   observation: activity_based
+  extra_data: []                     # no pathology, no provider specialty in this layout
+  absence_inference: weak            # open claims, no enrollment
   default_claim_status: [paid]
   notes:
     - No lab or vital-sign values (Measurement is unavailable).
@@ -57,6 +59,7 @@ mapping:
       start_col: condition_start_date
       end_col: condition_end_date
       position_col: dx_position
+      pos_col: place_of_service
     DrugExposure:
       table: sem.drug_exposure
       concept_col: drug_concept_id
@@ -109,17 +112,19 @@ setup_sql:
   - >-
     CREATE OR REPLACE VIEW sem.condition_occurrence AS
     WITH dx AS (
-      SELECT claim_id, patient_id, svc_dt, 1 AS dx_position, dx1 AS code FROM laad.dx_claims
-      UNION ALL SELECT claim_id, patient_id, svc_dt, 2, dx2 FROM laad.dx_claims
-      UNION ALL SELECT claim_id, patient_id, svc_dt, 3, dx3 FROM laad.dx_claims
-      UNION ALL SELECT claim_id, patient_id, svc_dt, 4, dx4 FROM laad.dx_claims)
+      SELECT claim_id, patient_id, svc_dt, place_of_service, 1 AS dx_position, dx1 AS code FROM laad.dx_claims
+      UNION ALL SELECT claim_id, patient_id, svc_dt, place_of_service, 2, dx2 FROM laad.dx_claims
+      UNION ALL SELECT claim_id, patient_id, svc_dt, place_of_service, 3, dx3 FROM laad.dx_claims
+      UNION ALL SELECT claim_id, patient_id, svc_dt, place_of_service, 4, dx4 FROM laad.dx_claims)
     SELECT dx.claim_id, dx.patient_id AS person_id, coalesce(m.concept_id, 0) AS condition_concept_id,
            dx.svc_dt AS condition_start_date, dx.svc_dt AS condition_end_date,
-           min(dx.dx_position) AS dx_position, upper(replace(dx.code, '.', '')) AS source_value
+           min(dx.dx_position) AS dx_position, upper(replace(dx.code, '.', '')) AS source_value,
+           dx.place_of_service
     FROM dx
     LEFT JOIN sem.source_code_map m ON m.vocabulary_id = 'ICD10CM' AND m.code = upper(replace(dx.code, '.', ''))
     WHERE dx.code IS NOT NULL AND dx.code <> '' AND dx.patient_id IS NOT NULL
-    GROUP BY dx.claim_id, dx.patient_id, coalesce(m.concept_id, 0), dx.svc_dt, upper(replace(dx.code, '.', ''))
+    GROUP BY dx.claim_id, dx.patient_id, coalesce(m.concept_id, 0), dx.svc_dt, upper(replace(dx.code, '.', '')),
+             dx.place_of_service
   - >-
     CREATE OR REPLACE VIEW sem.procedure_occurrence AS
     SELECT DISTINCT p.claim_id, p.patient_id AS person_id, coalesce(m.concept_id, 0) AS procedure_concept_id,

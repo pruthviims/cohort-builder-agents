@@ -37,7 +37,9 @@ from .ir import CohortDefinition
 from .llm import Backend, LLMClient, LLMError, Prompt
 from .metadata import MetadataStore, now
 from .ontology import Ontology
-from .security import DEFAULT_TENANT, GovernancePolicy
+from .proxy import ProxyDefinition, is_proxy_payload
+from .proxy_service import ProxyMixin, ProxyRunResult
+from .security import DEFAULT_TENANT, GovernanceError, GovernancePolicy
 from .vocab import Vocabulary
 
 _MEMORY_LIMIT = re.compile(r"^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)$")
@@ -45,10 +47,6 @@ _MEMORY_LIMIT = re.compile(r"^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)$")
 
 def _resolve(ctx: AgentContext, mention: Any, query: str, feedback: str | None) -> ResolvedConceptSet:
     return resolve_mention(ctx, mention, query, feedback)
-
-
-class GovernanceError(PermissionError):
-    """An action is not permitted by governance policy (self-approval, draft execution, status)."""
 
 
 @dataclass
@@ -69,7 +67,7 @@ class RunResult:
         return d
 
 
-class CohortBuilder:
+class CohortBuilder(ProxyMixin):
     def __init__(
         self,
         settings: Settings | None = None,
@@ -310,7 +308,7 @@ class CohortBuilder:
         concept = "\n".join(f"- {i.message}" for i in issues if i.stage == "concepts") or None
         return text, concept
 
-    def _manifest(self, run_id: str, query: str, result: RunResult, retries: int) -> dict:
+    def _manifest(self, run_id: str, query: str, result: RunResult | ProxyRunResult, retries: int) -> dict:
         calls = self.con.execute(
             "SELECT count(*), count(*) FILTER (WHERE cache_hit), coalesce(sum(input_tokens),0), "
             "coalesce(sum(output_tokens),0) FROM meta.llm_call WHERE run_id=?",
@@ -364,12 +362,27 @@ class CohortBuilder:
         )
         return def_id, [i.as_dict() for i in issues]
 
-    def load_definition(self, def_id: int, tenant: str | None = None) -> tuple[dict, CohortDefinition]:
-        """Load a definition. With `tenant`, definitions of other tenants are reported as not found."""
+    def load_definition(
+        self, def_id: int, tenant: str | None = None
+    ) -> tuple[dict, CohortDefinition | ProxyDefinition]:
+        """Load a definition (cohort or proxy). With `tenant`, other tenants' definitions are not found."""
         row = self.store.get_definition(def_id)
         if row is None or (tenant is not None and (row.get("tenant") or DEFAULT_TENANT) != tenant):
             raise KeyError(f"cohort definition {def_id} not found")
+        if row.get("kind") == "proxy" or is_proxy_payload(row["ir"]):
+            return row, ProxyDefinition.model_validate(row["ir"])
         return row, CohortDefinition.model_validate(row["ir"])
+
+    def load_cohort(self, def_id: int, tenant: str | None = None) -> tuple[dict, CohortDefinition]:
+        row, defn = self.load_definition(def_id, tenant)
+        if not isinstance(defn, CohortDefinition):
+            raise KeyError(f"cohort definition {def_id} not found (it is a proxy definition: use /proxy-cohorts)")
+        return row, defn
+
+    def explain(self, defn: CohortDefinition | ProxyDefinition) -> str:
+        if isinstance(defn, ProxyDefinition):
+            return self.proxy_explainer.explain(defn)
+        return self.explainer.explain(defn)
 
     def review(self, def_id: int, reviewer: str, decision: str, comments: str = "", tenant: str | None = None) -> None:
         if decision not in ("approved", "rejected"):
@@ -406,6 +419,8 @@ class CohortBuilder:
 
     def compile_sql(self, def_id: int, tenant: str | None = None) -> str:
         _, ir = self.load_definition(def_id, tenant)
+        if isinstance(ir, ProxyDefinition):
+            return str(self.compile_proxy(def_id, tenant)["statements"]["cohort"])
         return self.compiler.compile(ir).cohort_sql
 
     def execute(self, def_id: int, user_id: str, allow_draft: bool = False, tenant: str | None = None) -> dict:
@@ -434,6 +449,8 @@ class CohortBuilder:
         if row["status"] != "approved" and not (allow_draft and row["status"] == "draft"):
             deny(f"status {row['status']}")
             raise GovernanceError(f"definition {def_id} is {row['status']}; approve it before execution")
+        if isinstance(ir, ProxyDefinition):
+            return self._execute_proxy(def_id, row, ir, user_id, base)
         # always re-check against the active ontology and dataset: they may differ from build time
         issues, _ = validate(ir, self.ontology, self.vocab)
         errors = [i.message for i in issues if i.severity == "error"]
@@ -510,7 +527,8 @@ class CohortBuilder:
             con=self.con,
             policy=self.policy,
         )
-        new = replay_builder.ask(run["user_query"], user_id=actor, tenant=run.get("tenant") or DEFAULT_TENANT)
+        ask = replay_builder.ask_proxy if (run["manifest"] or {}).get("kind") == "proxy" else replay_builder.ask
+        new = ask(run["user_query"], user_id=actor, tenant=run.get("tenant") or DEFAULT_TENANT)
         original_hash = (run["manifest"] or {}).get("ir_semantic_hash")
         new_hash = new.manifest.get("ir_semantic_hash")
         return {
