@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from .ir import ClaimStatus, Domain, parse_claim_statuses, parse_domain
+
 
 def _norm(text: str) -> str:
     return " ".join(text.lower().replace("-", " ").replace("_", " ").split())
@@ -100,8 +102,12 @@ class Ontology:
     def supports_attribute(self, attribute: str) -> bool:
         return attribute in self.capabilities.get("attributes", [])
 
-    def default_claim_status(self) -> list[str] | None:
-        return self.capabilities.get("default_claim_status")
+    def default_claim_status(self) -> list[ClaimStatus] | None:
+        """Dataset default (e.g. paid claims only); validated, so a typo in a profile fails loudly."""
+        try:
+            return parse_claim_statuses(self.capabilities.get("default_claim_status"))
+        except ValueError as exc:
+            raise ValueError(f"dataset profile {self.dataset_name!r}: default_claim_status: {exc}") from exc
 
     def setup_statements(self) -> list[str]:
         params = self.dataset.get("params", {})
@@ -121,8 +127,11 @@ class Ontology:
     def rules(self) -> dict[str, Any]:
         return self.domain["cohort_rules"]
 
-    def entity_domain(self, entity: str) -> str:
-        return self.entities[entity]["domain_id"]
+    def entity_domain(self, entity: str) -> Domain:
+        try:
+            return parse_domain(self.entities[entity]["domain_id"])
+        except ValueError as exc:
+            raise ValueError(f"ontology entity {entity!r}: {exc}") from exc
 
     def entity_has_value(self, entity: str) -> bool:
         return bool(self.entities[entity].get("has_value"))

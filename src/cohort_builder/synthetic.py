@@ -19,7 +19,7 @@ from typing import Any
 
 import duckdb
 
-from .db import init_schemas
+from .db import fetch_count, init_schemas
 
 DEMO_VOCAB_VERSION = "DEMO-2026-10-01"
 
@@ -808,7 +808,7 @@ def build_demo_database(
     generate_patients(con, n_persons=n_persons, seed=seed)
     laad_counts = generate_laad(con, n_patients=laad_patients or n_persons, seed=seed + 1)
     counts = {
-        t: con.execute(f"SELECT count(*) FROM cdm.{t}").fetchone()[0]
+        t: fetch_count(con, f"SELECT count(*) FROM cdm.{t}")
         for t in (
             "person",
             "condition_occurrence",
@@ -818,7 +818,7 @@ def build_demo_database(
             "visit_occurrence",
         )
     }
-    counts["concepts"] = con.execute("SELECT count(*) FROM vocab.concept").fetchone()[0]
+    counts["concepts"] = fetch_count(con, "SELECT count(*) FROM vocab.concept")
     counts.update(laad_counts)
     return counts
 
@@ -846,5 +846,5 @@ def load_athena(con: duckdb.DuckDBPyConnection, athena_dir: Path) -> dict:
             f"INSERT INTO vocab.{table} SELECT {select} FROM read_csv('{path}', delim='\\t', header=true, "
             f"quote='', all_varchar=true)"
         )
-        counts[table] = con.execute(f"SELECT count(*) FROM vocab.{table}").fetchone()[0]
+        counts[table] = fetch_count(con, f"SELECT count(*) FROM vocab.{table}")
     return counts

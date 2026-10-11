@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
-from ..ir import ConceptSetItem
+from ..ir import ConceptSetItem, Domain
 from ..llm import LLMError, tool_result_text
 from . import AgentContext
 from .intent import ConceptMention
@@ -21,7 +21,7 @@ from .intent import ConceptMention
 class ResolvedConceptSet(BaseModel):
     mention_key: str
     name: str
-    domain: str
+    domain: Domain
     source: str
     items: list[ConceptSetItem]
     rationale: str = ""
@@ -95,7 +95,7 @@ def _collect_ids(obj: Any, out: set[int]) -> None:
 
 
 class _Session:
-    def __init__(self, ctx: AgentContext, domain: str):
+    def __init__(self, ctx: AgentContext, domain: Domain):
         self.ctx = ctx
         self.domain = domain
         self.seen: set[int] = set()

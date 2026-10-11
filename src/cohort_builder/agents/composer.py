@@ -14,7 +14,18 @@ from typing import TypeVar
 
 from pydantic import ValidationError
 
-from ..ir import CohortDefinition, CohortExit, ConceptSet, Criterion, Demographics, IndexEvent, ValueFilter, Window
+from ..ir import (
+    ClaimStatus,
+    CohortDefinition,
+    CohortExit,
+    ConceptSet,
+    Criterion,
+    Demographics,
+    IndexEvent,
+    ValueFilter,
+    Window,
+    parse_claim_statuses,
+)
 from ..ontology import Ontology
 from ..vocab import Vocabulary
 from .intent import CohortIntent, ValueSpec
@@ -105,13 +116,12 @@ def _build(issues: list["Issue"], where: str, fn: Callable[[], T], stage: str = 
         return None
 
 
-def _claim_status(entity: str, requested: Sequence[str] | None, ont: Ontology) -> list[str] | None:
+def _claim_status(entity: str, requested: Sequence[ClaimStatus] | None, ont: Ontology) -> list[ClaimStatus] | None:
     """Make the dataset's default claim status explicit in the IR (e.g. paid claims only)."""
     if requested is not None:
-        return sorted(set(requested))
+        return parse_claim_statuses(requested)
     if ont.supports_entity(entity) and "status_col" in ont.table_mapping(entity):
-        default = ont.default_claim_status()
-        return sorted(default) if default else None
+        return ont.default_claim_status() or None
     return None
 
 

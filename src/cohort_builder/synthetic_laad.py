@@ -19,6 +19,8 @@ from pathlib import Path
 
 import duckdb
 
+from .db import fetch_count
+
 LAAD_DDL = """
 CREATE SCHEMA IF NOT EXISTS laad;
 CREATE OR REPLACE TABLE laad.patient (patient_id BIGINT PRIMARY KEY, birth_year INTEGER, gender VARCHAR);
@@ -191,4 +193,4 @@ def generate_laad(con: duckdb.DuckDBPyConnection, n_patients: int = 4000, seed: 
                 f"INSERT INTO laad.{table} SELECT * FROM read_csv('{path}', header=false, nullstr='', "
                 f"auto_detect=true, all_varchar=true)"
             )
-    return {f"laad.{t}": con.execute(f"SELECT count(*) FROM laad.{t}").fetchone()[0] for t in rows}
+    return {f"laad.{t}": fetch_count(con, f"SELECT count(*) FROM laad.{t}") for t in rows}

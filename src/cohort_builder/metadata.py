@@ -13,6 +13,8 @@ from typing import Any
 
 import duckdb
 
+from .db import fetch_count
+
 META_DDL = """
 CREATE SCHEMA IF NOT EXISTS meta;
 CREATE SEQUENCE IF NOT EXISTS meta.cohort_definition_seq START 1;
@@ -261,7 +263,7 @@ class MetadataStore:
 
         Proxy definitions (kind 'proxy') also carry algorithm_name + version; only the status columns
         (status, approved_*, updated_at) ever change after insert."""
-        def_id = self.con.execute("SELECT nextval('meta.cohort_definition_seq')").fetchone()[0]
+        def_id = fetch_count(self.con, "SELECT nextval('meta.cohort_definition_seq')")
         proxy = hasattr(ir, "algorithm_name")
         created = now()
         self.con.execute(
@@ -410,9 +412,9 @@ class MetadataStore:
         self, name: str, tenant: str, rows: list[tuple[int, str, Any, int]], source: str, loaded_by: str
     ) -> int:
         """`rows` are already collapsed to one per patient: (person_id, label, reference_date, n_records)."""
-        if self.con.execute(
-            "SELECT count(*) FROM meta.reference_label WHERE tenant=? AND reference_name=?", [tenant, name]
-        ).fetchone()[0]:
+        if fetch_count(
+            self.con, "SELECT count(*) FROM meta.reference_label WHERE tenant=? AND reference_name=?", [tenant, name]
+        ):
             raise ValueError(f"reference {name!r} already exists; reference standards are immutable, use a new name")
         ts = now()
         is_case = {"case": True, "non_case": False}

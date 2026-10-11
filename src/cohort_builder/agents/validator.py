@@ -10,14 +10,18 @@ This module checks what needs the ontology, the vocabulary, the active dataset o
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-from ..compiler import Compiler
+from ..compiler import CompiledCohort, Compiler
 from ..executor import Attrition, Executor
-from ..ir import CohortDefinition, Criterion, ValueFilter
+from ..ir import CohortDefinition, Criterion, IndexEvent, ValueFilter
 from ..ontology import Ontology
 from ..vocab import Vocabulary
 from .composer import Issue
+
+if TYPE_CHECKING:  # only for annotations: proxy definitions reuse these checks via `criteria`
+    from ..proxy import ProxyDefinition
 
 
 def _absence_based(role: str, c: Criterion) -> bool:
@@ -28,17 +32,20 @@ def _absence_based(role: str, c: Criterion) -> bool:
 
 
 def validate(
-    ir: CohortDefinition | Any,
+    ir: CohortDefinition | ProxyDefinition,
     ont: Ontology,
     vocab: Vocabulary,
     executor: Executor | None = None,
     *,
-    criteria: list[tuple[str, Criterion]] | None = None,
-    compiled: Any = None,
+    criteria: Sequence[tuple[str, Criterion]] | None = None,
+    compiled: CompiledCohort | None = None,
     exempt_concept_sets: set[str] | None = None,
 ) -> tuple[list[Issue], Attrition | None]:
     """Validate a cohort definition. `criteria`/`compiled` let proxy definitions reuse every check
-    (concepts, units, dataset capabilities, coverage) with their evidence as the criteria."""
+    (concepts, units, dataset capabilities, coverage) with their evidence as the criteria; a proxy
+    definition must pass both (it has no inclusion/exclusion lists and needs the proxy compiler)."""
+    if not isinstance(ir, CohortDefinition) and (criteria is None or (executor is not None and compiled is None)):
+        raise TypeError("a proxy definition must be validated with explicit criteria and its compiled SQL")
     issues: list[Issue] = []
 
     def err(stage: str, msg: str) -> None:
@@ -66,20 +73,25 @@ def validate(
     info = vocab.concepts([i.concept_id for cs in ir.concept_sets for i in cs.items])
     for cs in ir.concept_sets:
         for it in cs.items:
-            c = info.get(it.concept_id)
+            concept = info.get(it.concept_id)
             where = f"concept set {cs.id!r}, concept {it.concept_id}"
-            if c is None:
+            if concept is None:
                 err("concepts", f"{where}: not in the loaded vocabulary ({vocab.version()})")
-            elif c["invalid_reason"]:
-                err("concepts", f"{where}: deprecated ({c['concept_name']}); use its replacement / Maps-to target")
-            elif c["standard_concept"] not in ("S", "C"):
-                err("concepts", f"{where}: non-standard ({c['concept_name']}); use the standard concept it maps to")
-            elif c["domain_id"] != cs.domain:
-                err("concepts", f"{where}: domain {c['domain_id']} != concept set domain {cs.domain}")
-            elif c["standard_concept"] == "C" and not it.include_descendants and not it.is_excluded:
+            elif concept["invalid_reason"]:
+                err(
+                    "concepts", f"{where}: deprecated ({concept['concept_name']}); use its replacement / Maps-to target"
+                )
+            elif concept["standard_concept"] not in ("S", "C"):
                 err(
                     "concepts",
-                    f"{where}: classification concept ({c['concept_name']}) has no records of its own; "
+                    f"{where}: non-standard ({concept['concept_name']}); use the standard concept it maps to",
+                )
+            elif concept["domain_id"] != cs.domain:
+                err("concepts", f"{where}: domain {concept['domain_id']} != concept set domain {cs.domain}")
+            elif concept["standard_concept"] == "C" and not it.include_descendants and not it.is_excluded:
+                err(
+                    "concepts",
+                    f"{where}: classification concept ({concept['concept_name']}) has no records of its own; "
                     "set include_descendants=true",
                 )
 
@@ -156,7 +168,7 @@ def validate(
                 "(not converted)",
             )
 
-    def check_dataset(entity: str, x: Any, where: str) -> None:
+    def check_dataset(entity: str, x: IndexEvent | Criterion, where: str) -> None:
         """Can the active dataset answer this? (stage 'dataset' = not fixable by rephrasing)"""
         if not ont.supports_entity(entity):
             err(
@@ -192,25 +204,31 @@ def validate(
     check_ref(ir.index_event.entity, ir.index_event.concept_set_id, "index event")
     check_value(ir.index_event.entity, ir.index_event.concept_set_id, ir.index_event.value_filter, "index event")
     check_dataset(ir.index_event.entity, ir.index_event, "index event")
-    crits: list[tuple[str, Criterion]] = (
-        criteria
-        if criteria is not None
-        else [("inclusion", c) for c in ir.inclusion] + [("exclusion", c) for c in ir.exclusion]
-    )
-    for role, c in crits:
-        where = f"{role} {c.name!r}"
-        check_ref(c.entity, c.concept_set_id, where)
-        check_value(c.entity, c.concept_set_id, c.value_filter, where)
-        check_dataset(c.entity, c, where)
-        if role == "exclusion" and c.occurrence != "at_least":
+    crits: list[tuple[str, Criterion]]
+    if criteria is not None:
+        crits = list(criteria)
+    elif isinstance(ir, CohortDefinition):
+        crits = [("inclusion", c) for c in ir.inclusion] + [("exclusion", c) for c in ir.exclusion]
+    else:  # unreachable: rejected at the top
+        raise TypeError("criteria are required for proxy definitions")
+    for role, crit in crits:
+        where = f"{role} {crit.name!r}"
+        check_ref(crit.entity, crit.concept_set_id, where)
+        check_value(crit.entity, crit.concept_set_id, crit.value_filter, where)
+        check_dataset(crit.entity, crit, where)
+        if role == "exclusion" and crit.occurrence != "at_least":
             warn(
                 "intent",
-                f"{where}: exclusion with occurrence {c.occurrence} is unusual (excludes people who "
-                f"satisfy '{c.occurrence} {c.count}')",
+                f"{where}: exclusion with occurrence {crit.occurrence} is unusual (excludes people who "
+                f"satisfy '{crit.occurrence} {crit.count}')",
             )
         if has_observation:
-            check_coverage(role, c, where)
-    if criteria is None and len(ir.inclusion) > ont.rules["max_inclusion_criteria"]:
+            check_coverage(role, crit, where)
+    if (
+        criteria is None
+        and isinstance(ir, CohortDefinition)
+        and len(ir.inclusion) > ont.rules["max_inclusion_criteria"]
+    ):
         err("intent", f"more than {ont.rules['max_inclusion_criteria']} inclusion criteria")
     used = {ir.index_event.concept_set_id} | {c.concept_set_id for _, c in crits} | (exempt_concept_sets or set())
     for unused in sorted(ids - used):
@@ -228,7 +246,11 @@ def validate(
         return issues, None
 
     # ---- dry run (aggregate counts only) --------------------------------------
-    attrition = executor.attrition(compiled if compiled is not None else Compiler(ont).compile(ir))
+    if compiled is None:
+        if not isinstance(ir, CohortDefinition):  # unreachable: rejected at the top
+            raise TypeError("a proxy definition needs its compiled SQL for the dry run")
+        compiled = Compiler(ont).compile(ir)
+    attrition = executor.attrition(compiled)
     rules = attrition.rules
     if rules[0]["remaining"] == 0:
         err("concepts", "no index events found in the data: check the index concept set")

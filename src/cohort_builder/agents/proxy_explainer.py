@@ -12,7 +12,7 @@ from typing import Any
 from ..ontology import Ontology
 from ..proxy import CLASSIFICATION_LABELS, Expr, ProxyDefinition, TemporalRule, provenance_summary
 from ..vocab import Vocabulary
-from .explainer import Explainer, _window
+from .explainer import CriterionRenderer, _window
 
 SCORE_NOTE = (
     "The evidence score is a deterministic rule score (sum of configured points). It is not a "
@@ -46,7 +46,10 @@ def temporal_text(t: TemporalRule, names: dict[str, str]) -> str:
     return f"{b} between {lo_s} and {hi_s} days relative to {a} (inclusive)"
 
 
-class ProxyExplainer(Explainer):
+class ProxyExplainer(CriterionRenderer):
+    """Proxy definitions -> plain language and the human review packet (does not override the cohort
+    Explainer: the two explain different definition types)."""
+
     def __init__(self, ont: Ontology, vocab: Vocabulary):
         super().__init__(ont, vocab)
 

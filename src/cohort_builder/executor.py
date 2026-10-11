@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import duckdb
 
 from .compiler import CompiledCohort
+from .proxy_compiler import CompiledProxy
 
 log = logging.getLogger(__name__)
 
@@ -146,8 +147,15 @@ class Executor:
             if timer:
                 timer.cancel()
 
+    def query(self, sql: str, params: list | None = None) -> list[tuple]:
+        """A read-only aggregate/evaluation query with the same guard, timeout and safe errors."""
+        rows = self._run(guard_select(sql), params)
+        return [tuple(r) for r in rows]
+
     def attrition(self, compiled: CompiledCohort) -> Attrition:
         row = self._run(guard_select(compiled.attrition_sql), fetch="one")
+        if row is None:  # an aggregate always returns one row; anything else is a broken query
+            raise ExecutionError("attrition query returned no row")
         return Attrition(
             [{"sequence": i, "name": name, "remaining": int(row[i])} for i, name in enumerate(compiled.rule_names)]
         )
@@ -164,15 +172,15 @@ class Executor:
                 f"FROM ({cohort_sql})",
                 [cohort_definition_id, generation_id],
             )
-            if getattr(compiled, "assignment_sql", ""):  # proxy cohorts: tier, score and evidence per member
+            if isinstance(compiled, CompiledProxy):  # proxy cohorts: tier, score and evidence per member
                 self._run(
                     f"INSERT INTO results.proxy_assignment SELECT ?, ?, subject_id, tier, evidence_score "
-                    f"FROM ({guard_select(compiled.assignment_sql)})",  # type: ignore[attr-defined]
+                    f"FROM ({guard_select(compiled.assignment_sql)})",
                     [generation_id, cohort_definition_id],
                 )
                 self._run(
                     f"INSERT INTO results.proxy_evidence SELECT ?, subject_id, evidence_key, kind, present "
-                    f"FROM ({guard_select(compiled.evidence_sql)})",  # type: ignore[attr-defined]
+                    f"FROM ({guard_select(compiled.evidence_sql)})",
                     [generation_id],
                 )
             for r in attrition.rules:
@@ -186,10 +194,12 @@ class Executor:
             raise
         return generation_id, attrition
 
-    def proxy_summary(self, compiled: CompiledCohort) -> dict[str, int]:
+    def proxy_summary(self, compiled: CompiledProxy) -> dict[str, int]:
         """Raw evidence/tier/funnel counts among candidates (internal; suppress before showing)."""
-        cols = getattr(compiled, "summary_columns", ())
-        row = self._run(guard_select(compiled.summary_sql), fetch="one")  # type: ignore[attr-defined]
+        cols = compiled.summary_columns
+        row = self._run(guard_select(compiled.summary_sql), fetch="one")
+        if row is None:
+            raise ExecutionError("proxy summary query returned no row")
         return {c: int(v or 0) for c, v in zip(cols, row, strict=True)}
 
     def person_ids(self, compiled: CompiledCohort) -> set[int]:

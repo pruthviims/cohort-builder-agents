@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -17,6 +18,30 @@ from . import IR_SCHEMA_VERSION
 Entity = Literal["ConditionOccurrence", "DrugExposure", "Measurement", "ProcedureOccurrence", "VisitOccurrence"]
 ClaimStatus = Literal["paid", "rejected", "reversed"]
 Domain = Literal["Condition", "Drug", "Measurement", "Procedure", "Visit"]
+DOMAINS: tuple[Domain, ...] = ("Condition", "Drug", "Measurement", "Procedure", "Visit")
+CLAIM_STATUSES: tuple[ClaimStatus, ...] = ("paid", "rejected", "reversed")
+
+
+def parse_domain(value: object) -> Domain:
+    """Validate a domain coming from configuration or model output (no silent coercion)."""
+    for domain in DOMAINS:
+        if value == domain:
+            return domain
+    raise ValueError(f"unsupported domain {value!r}; expected one of {list(DOMAINS)}")
+
+
+def parse_claim_statuses(values: Iterable[object] | None) -> list[ClaimStatus] | None:
+    """Validate claim statuses (sorted, de-duplicated); None stays None."""
+    if values is None:
+        return None
+    out: set[ClaimStatus] = set()
+    for value in values:
+        match = next((c for c in CLAIM_STATUSES if c == value), None)
+        if match is None:
+            raise ValueError(f"unsupported claim status {value!r}; expected one of {list(CLAIM_STATUSES)}")
+        out.add(match)
+    return sorted(out)
+
 
 MAX_DAYS = 36_600  # ~100 years: bound for windows and observation requirements
 MAX_AGE = 150

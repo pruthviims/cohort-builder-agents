@@ -77,8 +77,10 @@ class CohortDefinitionInput(CohortDefinition):
     )
 
 
-READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
-WRITES = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+# snake_case field names: accepted by every supported SDK version (2.2, 2.3) and serialized as the
+# protocol's camelCase readOnlyHint / destructiveHint / idempotentHint / openWorldHint
+READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
+WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 
 
 def _j(obj: Any) -> Any:

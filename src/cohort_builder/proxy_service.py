@@ -29,6 +29,7 @@ from .agents.proxy_explainer import COHORT_NOTE, SCORE_NOTE, ProxyExplainer
 from .agents.proxy_parser import ProxyDraft, compose_proxy, parse_proxy, slugify
 from .agents.proxy_validator import validate_proxy
 from .agents.resolver import ResolvedConceptSet, resolution_signature, resolve_mention
+from .db import fetch_count
 from .executor import (
     COMPLEMENTARY,
     ExecutionError,
@@ -657,23 +658,20 @@ class ProxyMixin:
         con = self.store.con
 
         def size(gid: str) -> int:
-            return int(
-                con.execute(
-                    "SELECT count(DISTINCT subject_id) FROM results.cohort WHERE generation_id=?", [gid]
-                ).fetchone()[0]
+            return fetch_count(
+                con, "SELECT count(DISTINCT subject_id) FROM results.cohort WHERE generation_id=?", [gid]
             )
 
         sizes = {g["generation_id"]: size(g["generation_id"]) for g in gens}
         pairs = []
         for i, a in enumerate(gens):
             for b in gens[i + 1 :]:
-                both = int(
-                    con.execute(
-                        "SELECT count(*) FROM (SELECT DISTINCT subject_id FROM results.cohort WHERE generation_id=?) x"
-                        " JOIN (SELECT DISTINCT subject_id FROM results.cohort WHERE generation_id=?) y"
-                        " USING (subject_id)",
-                        [a["generation_id"], b["generation_id"]],
-                    ).fetchone()[0]
+                both = fetch_count(
+                    con,
+                    "SELECT count(*) FROM (SELECT DISTINCT subject_id FROM results.cohort WHERE generation_id=?) x"
+                    " JOIN (SELECT DISTINCT subject_id FROM results.cohort WHERE generation_id=?) y"
+                    " USING (subject_id)",
+                    [a["generation_id"], b["generation_id"]],
                 )
                 pairs.append(
                     {
@@ -815,15 +813,26 @@ class ProxyMixin:
                 )
         sql = eligibility_sql(self.ontology, p, rules, len(tiers))
         con = self.store.con
-        rows = con.execute(sql, [gen["generation_id"], *tiers, row_tenant, reference_name]).fetchall()
+        try:
+            rows = self.executor.query(sql, [gen["generation_id"], *tiers, row_tenant, reference_name])
+        except ExecutionError as exc:  # a failed evaluation leaves no evaluation record, only an audit entry
+            self.store.audit(
+                actor,
+                "proxy.evaluate_reference",
+                "cohort_definition",
+                def_id,
+                "failed",
+                row_tenant,
+                {"reference": reference_name, "error": str(exc), "error_id": exc.error_id},
+            )
+            raise
         pop = classify(rows, rules.require_data)
-        unlabelled = int(
-            con.execute(
-                "SELECT count(DISTINCT a.subject_id) FROM results.proxy_assignment a WHERE a.generation_id = ? AND "
-                f"a.tier IN ({', '.join('?' for _ in tiers)}) AND NOT EXISTS (SELECT 1 FROM meta.reference_label r "
-                "WHERE r.tenant = ? AND r.reference_name = ? AND r.person_id = a.subject_id)",
-                [gen["generation_id"], *tiers, row_tenant, reference_name],
-            ).fetchone()[0]
+        unlabelled = fetch_count(
+            con,
+            "SELECT count(DISTINCT a.subject_id) FROM results.proxy_assignment a WHERE a.generation_id = ? AND "
+            f"a.tier IN ({', '.join('?' for _ in tiers)}) AND NOT EXISTS (SELECT 1 FROM meta.reference_label r "
+            "WHERE r.tenant = ? AND r.reference_name = ? AND r.person_id = a.subject_id)",
+            [gen["generation_id"], *tiers, row_tenant, reference_name],
         )
         k = self.executor.min_cell
         counts = pop["confusion"]

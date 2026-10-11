@@ -31,7 +31,7 @@ from .agents.resolver import ResolvedConceptSet, resolution_signature, resolve_m
 from .agents.validator import validate
 from .compiler import Compiler
 from .config import Settings
-from .db import connect, init_schemas
+from .db import connect, fetch_count, fetch_one, init_schemas
 from .executor import ExecutionError, Executor
 from .ir import CohortDefinition
 from .llm import Backend, LLMClient, LLMError, Prompt
@@ -309,12 +309,13 @@ class CohortBuilder(ProxyMixin):
         return text, concept
 
     def _manifest(self, run_id: str, query: str, result: RunResult | ProxyRunResult, retries: int) -> dict:
-        calls = self.con.execute(
+        calls = fetch_one(
+            self.con,
             "SELECT count(*), count(*) FILTER (WHERE cache_hit), coalesce(sum(input_tokens),0), "
             "coalesce(sum(output_tokens),0) FROM meta.llm_call WHERE run_id=?",
             [run_id],
-        ).fetchone()
-        tools = self.con.execute("SELECT count(*) FROM meta.tool_call WHERE run_id=?", [run_id]).fetchone()[0]
+        )
+        tools = fetch_count(self.con, "SELECT count(*) FROM meta.tool_call WHERE run_id=?", [run_id])
         ir = result.ir
         return {
             "run_id": run_id,

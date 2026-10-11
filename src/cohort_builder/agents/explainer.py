@@ -6,7 +6,9 @@ what will actually run.
 
 from __future__ import annotations
 
-from ..ir import CohortDefinition, Criterion, ValueFilter, Window
+from typing import Protocol
+
+from ..ir import CohortDefinition, ConceptSet, Criterion, ValueFilter, Window
 from ..ontology import Ontology
 from ..vocab import Vocabulary
 
@@ -41,7 +43,16 @@ def _window(w: Window) -> str:
     return f"between day {s:+d} and day {e:+d} relative to index"
 
 
-class Explainer:
+class ConceptSetSource(Protocol):
+    """Anything that resolves concept-set ids: cohort definitions and proxy definitions."""
+
+    def concept_set(self, cs_id: str) -> ConceptSet: ...
+
+
+class CriterionRenderer:
+    """Plain-language rendering of concept sets, values, claims filters and criteria. Shared by the
+    cohort Explainer and the ProxyExplainer (composition of helpers, not an `explain` contract)."""
+
     def __init__(self, ont: Ontology, vocab: Vocabulary):
         self.ont, self.vocab = ont, vocab
 
@@ -58,7 +69,7 @@ class Explainer:
             txt += f" (user specified {vf.original_text})"
         return txt
 
-    def _concepts(self, ir: CohortDefinition, cs_id: str) -> str:
+    def _concepts(self, ir: ConceptSetSource, cs_id: str) -> str:
         cs = ir.concept_set(cs_id)
         info = self.vocab.concepts([i.concept_id for i in cs.items])
         parts = []
@@ -86,7 +97,7 @@ class Explainer:
             return "pharmacy claim for"  # a rejected / reversed claim is not a drug exposure
         return ENTITY_NOUN[entity]
 
-    def _criterion(self, ir: CohortDefinition, c: Criterion) -> str:
+    def _criterion(self, ir: ConceptSetSource, c: Criterion) -> str:
         occ = {"at_least": "at least", "at_most": "at most", "exactly": "exactly"}[c.occurrence]
         times = (
             ("day" if c.count == 1 else "distinct days")
@@ -99,6 +110,10 @@ class Explainer:
             f"{self._value(c.value_filter)}{self._claims(c.entity, c.claim_status, c.dx_position)}, "
             f"{_window(c.window)}{span}"
         )
+
+
+class Explainer(CriterionRenderer):
+    """Cohort definitions -> plain language."""
 
     def explain(self, ir: CohortDefinition) -> str:
         ie = ir.index_event

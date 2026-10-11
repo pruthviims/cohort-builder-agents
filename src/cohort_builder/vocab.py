@@ -12,6 +12,8 @@ from typing import Any, Protocol
 
 import duckdb
 
+from .db import fetch_count, fetch_one
+
 CONCEPT_COLS = (
     "c.concept_id, c.concept_name, c.domain_id, c.vocabulary_id, c.concept_class_id, "
     "c.standard_concept, c.concept_code, c.invalid_reason"
@@ -92,9 +94,9 @@ class Vocabulary:
                 [concept_id],
             )
         )
-        concept["descendant_count"] = self.con.execute(
-            "SELECT count(*) - 1 FROM vocab.concept_ancestor WHERE ancestor_concept_id = ?", [concept_id]
-        ).fetchone()[0]
+        concept["descendant_count"] = fetch_count(
+            self.con, "SELECT count(*) - 1 FROM vocab.concept_ancestor WHERE ancestor_concept_id = ?", [concept_id]
+        )
         if concept["standard_concept"] is None:
             concept["maps_to"] = self.map_to_standard(concept_id)
         return concept
@@ -152,10 +154,11 @@ class Vocabulary:
 
     def is_descendant_or_self(self, concept_id: int, ancestor_id: int) -> bool:
         return (
-            self.con.execute(
+            fetch_count(
+                self.con,
                 "SELECT count(*) FROM vocab.concept_ancestor WHERE ancestor_concept_id=? AND descendant_concept_id=?",
                 [ancestor_id, concept_id],
-            ).fetchone()[0]
+            )
             > 0
         )
 
@@ -183,6 +186,6 @@ class Vocabulary:
     def version(self) -> str:
         rows = self.con.execute("SELECT DISTINCT vocabulary_version FROM vocab.vocabulary ORDER BY 1").fetchall()
         label = ";".join(r[0] for r in rows if r[0]) or "unknown"
-        n, mx = self.con.execute("SELECT count(*), coalesce(max(concept_id),0) FROM vocab.concept").fetchone()
+        n, mx = fetch_one(self.con, "SELECT count(*), coalesce(max(concept_id),0) FROM vocab.concept")
         fp = hashlib.sha256(f"{label}|{n}|{mx}".encode()).hexdigest()[:12]
         return f"{label} ({n} concepts, fp {fp})"

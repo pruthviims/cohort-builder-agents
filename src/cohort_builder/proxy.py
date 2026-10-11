@@ -553,6 +553,7 @@ class ProxyDefinition(_IRModel):
         tier, score, temporal (required = mandatory), funnel. Evidence used only in tiers/scores is
         supporting evidence; it is never treated as mandatory unless the definition says so."""
         roles: dict[str, set[str]] = {e.id: set() for e in self.evidence}
+        temporal_by_id: dict[str, TemporalRule] = {r.id: r for r in self.temporal_rules}
 
         def mark(expr: Expr | None, role: str, stack: tuple[str, ...] = ()) -> None:
             if expr is None:
@@ -563,24 +564,24 @@ class ProxyDefinition(_IRModel):
                 elif kind == "group" and ref not in stack:
                     mark(self.groups[ref], role, (*stack, ref))
                 elif kind == "temporal":
-                    t = next(t for t in self.temporal_rules if t.id == ref)
-                    roles[t.a].add(role)
-                    roles[t.b].add(role)
+                    linked = temporal_by_id[ref]
+                    roles[linked.a].add(role)
+                    roles[linked.b].add(role)
 
         mark(self.entry, "entry")
         mark(self.exclusion, "exclusion")
         for c in self.conflicts:
             mark(c.rule, f"conflict_{c.action}")
-        for t in self.tiers:
-            mark(t.rule, "tier")
+        for tier in self.tiers:
+            mark(tier.rule, "tier")
         if self.scoring:
             for w in self.scoring.weights:
                 mark(w.ref, "score")
         for f in self.funnel:
             mark(f.rule, "funnel")
-        for t in self.temporal_rules:
-            for side in (t.a, t.b):
-                roles[side].add("temporal_required" if t.required else "temporal")
+        for rule in self.temporal_rules:
+            for side in (rule.a, rule.b):
+                roles[side].add("temporal_required" if rule.required else "temporal")
         return {k: sorted(v) for k, v in roles.items()}
 
     def mandatory_evidence(self) -> set[str]:

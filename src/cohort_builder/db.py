@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -87,3 +89,26 @@ def init_schemas(con: duckdb.DuckDBPyConnection) -> None:
 
     for ddl in (VOCAB_DDL, CDM_DDL, RESULTS_DDL, META_DDL):
         con.execute(ddl)
+
+
+class MissingRowError(RuntimeError):
+    """A query that must return a row (an aggregate, a sequence value) returned none."""
+
+
+def fetch_one(con: duckdb.DuckDBPyConnection, sql: str, params: Sequence[Any] | None = None) -> tuple[Any, ...]:
+    """Execute and return the single result row; raise MissingRowError instead of returning None.
+
+    Use only for queries that always produce a row (aggregates without GROUP BY, nextval). Lookups that
+    may legitimately find nothing must call fetchone() and handle None themselves."""
+    row = con.execute(sql, list(params or [])).fetchone()
+    if row is None:
+        raise MissingRowError(f"query returned no row: {sql.split()[0]} ... ({len(sql)} chars)")
+    return row
+
+
+def fetch_count(con: duckdb.DuckDBPyConnection, sql: str, params: Sequence[Any] | None = None) -> int:
+    """First column of a single-row aggregate as an int (rejects NULL and non-integer values)."""
+    value = fetch_one(con, sql, params)[0]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MissingRowError(f"expected an integer count, got {value!r}")
+    return value
