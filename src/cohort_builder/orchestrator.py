@@ -79,9 +79,18 @@ class CohortBuilder(ProxyMixin):
         self.policy = policy or GovernancePolicy()  # safe defaults: no self-approval, no draft execution
         self.con = con or connect(self.settings.db_path)
         init_schemas(self.con)
-        self.ontology = Ontology.load(self.settings.ontology_dir, self.settings.dataset)
+        self.ontology = Ontology.load(
+            self.settings.ontology_dir, self.settings.dataset, [self.settings.local_datasets_dir]
+        )
         for stmt in self.ontology.setup_statements():  # install the dataset's semantic views
-            self.con.execute(stmt)
+            try:
+                self.con.execute(stmt)
+            except duckdb.Error as exc:  # e.g. a CSV-registered dataset whose staging tables are elsewhere
+                raise ValueError(
+                    f"dataset {self.ontology.dataset_name!r} cannot be activated on database {self.settings.db_path}: "
+                    f"its semantic layer failed to install ({type(exc).__name__}). Was it ingested into this "
+                    "database?"
+                ) from exc
         self._harden_connection()
         self.vocab = Vocabulary(self.con)
         self.store = MetadataStore(self.con)

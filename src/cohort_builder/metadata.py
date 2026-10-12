@@ -80,6 +80,12 @@ ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS review_decision VARCH
 ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR;
 ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP;
 ALTER TABLE meta.proxy_validation ADD COLUMN IF NOT EXISTS review_rationale VARCHAR;
+-- imported datasets (CSV): one row per ingestion attempt; only 'staged'/'registered' versions are usable
+CREATE TABLE IF NOT EXISTS meta.dataset_version (
+  ingest_id VARCHAR PRIMARY KEY, dataset VARCHAR, version INTEGER, status VARCHAR, created_by VARCHAR,
+  created_at TIMESTAMP, registered_at TIMESTAMP, staging_schema VARCHAR, semantic_schema VARCHAR,
+  files_json VARCHAR, mapping_json VARCHAR, mapping_hash VARCHAR, validation_json VARCHAR, profile_hash VARCHAR,
+  snapshot VARCHAR, software_version VARCHAR, errors_json VARCHAR);
 CREATE TABLE IF NOT EXISTS meta.audit_event (
   event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
   resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);

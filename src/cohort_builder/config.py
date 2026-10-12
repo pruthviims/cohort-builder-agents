@@ -23,6 +23,8 @@ class Settings:
     ontology_dir: Path = REPO_ROOT / "ontology"
     prompts_dir: Path = REPO_ROOT / "prompts"
     dataset: str | None = None  # dataset profile in ontology/datasets/ (None = ontology default)
+    # locally registered dataset profiles (CSV imports); data/ is git-ignored
+    local_datasets_dir: Path = REPO_ROOT / "data" / "datasets"
     model: str = "claude-sonnet-5-5"
     temperature: float | None = 0.0
     max_tokens: int = 4096
@@ -50,6 +52,7 @@ class Settings:
             ontology_dir=Path(env.get("CB_ONTOLOGY_DIR", base.ontology_dir)),
             prompts_dir=Path(env.get("CB_PROMPTS_DIR", base.prompts_dir)),
             dataset=env.get("CB_DATASET") or None,
+            local_datasets_dir=Path(env.get("CB_LOCAL_DATASETS_DIR", base.local_datasets_dir)),
             model=env.get("CB_MODEL", base.model),
             temperature=_temperature(env.get("CB_TEMPERATURE")),
             max_tokens=int(env.get("CB_MAX_TOKENS", base.max_tokens)),

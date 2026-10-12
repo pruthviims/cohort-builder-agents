@@ -29,6 +29,11 @@ Proxy (indirect) cohort algorithms, same governance (see README "Proxy cohorts")
   POST /proxy-cohorts/{id}/evaluations/{validation_id}/review           reviewer (human acceptance; not own work)
   POST /proxy-references                                                admin (external reference labels)
   GET  /proxy-cohorts/{id}/patients/{subject_id}/explanation            admin AND CB_ALLOW_PATIENT_LEVEL=true
+
+Imported datasets (CSV; content is sent in the request body, never a server path; size-capped):
+  GET  /datasets, /datasets/{name}, /datasets/{name}/versions/{version}  any role (metadata, no row values)
+  POST /datasets/csv/profile                                            author (in-memory preview, nothing stored)
+  POST /datasets/{name}/ingest                                          admin (new immutable version)
 """
 
 from __future__ import annotations
@@ -74,6 +79,27 @@ ANY_ROLE = tuple(sorted(ROLES))
 class _Strict(BaseModel):
     # Unknown fields (e.g. a legacy `reviewer` or `user_id`) are rejected, not silently trusted.
     model_config = ConfigDict(extra="forbid")
+
+
+API_MAX_CSV_CHARS = 5_000_000  # per request body file; larger imports go through the CLI
+
+
+class CsvContent(_Strict):
+    file_name: str = Field(min_length=1, max_length=128, description="bare file name, e.g. patients.csv")
+    content: str = Field(min_length=1, max_length=API_MAX_CSV_CHARS)
+    table: str | None = Field(default=None, max_length=48)
+
+
+class CsvProfileRequest(CsvContent):
+    null_values: list[str] = Field(default_factory=list, max_length=10)
+
+
+class CsvIngestRequest(_Strict):
+    files: list[CsvContent] = Field(min_length=1, max_length=20)
+    mapping_yaml: str | None = Field(default=None, max_length=200_000)
+    new_version: bool = False
+    dry_run: bool = False
+    null_values: list[str] = Field(default_factory=list, max_length=10)
 
 
 class AskRequest(_Strict):
@@ -524,6 +550,77 @@ def create_app(
             lambda: b().patient_explanation(def_id, subject_id, p.subject, p.is_admin, scope(p), generation_id),
             def_id,
         )
+
+    # ---- imported datasets (CSV) --------------------------------------------------------------
+    def registry() -> Any:
+        from .dataset_registry import DatasetRegistry
+
+        bb = b()
+        return DatasetRegistry(bb.con, bb.settings.ontology_dir, bb.settings.local_datasets_dir, bb.store)
+
+    def ingest_errors(exc: Exception) -> HTTPException:
+        from .csv_ingest import IngestError
+
+        if isinstance(exc, IngestError):
+            return HTTPException(422, {"message": str(exc), "problems": exc.problems})
+        return HTTPException(422, {"message": f"invalid input: {exc}"})
+
+    @app.get("/datasets")
+    def list_datasets(_: Principal = Depends(any_role)) -> dict:
+        with lock:
+            reg = registry()
+            return {
+                "active": b().ontology.dataset_name,
+                "built_in": sorted(reg.builtin_names()),
+                "imported": reg.list_datasets(),
+            }
+
+    @app.get("/datasets/{name}")
+    def dataset_info(name: str, _: Principal = Depends(any_role)) -> dict:
+        with lock:
+            try:
+                return registry().info(name)
+            except KeyError as exc:
+                raise HTTPException(404, "dataset not found") from exc
+
+    @app.get("/datasets/{name}/versions/{version}")
+    def dataset_version(name: str, version: int, _: Principal = Depends(any_role)) -> dict:
+        with lock:
+            try:
+                info = registry().info(name)
+            except KeyError as exc:
+                raise HTTPException(404, "dataset not found") from exc
+            rows = [v for v in info["versions"] if v["version"] == version]
+            if not rows:
+                raise HTTPException(404, "dataset version not found")
+            return {"dataset": name, **rows[0]}
+
+    @app.post("/datasets/csv/profile")
+    def profile_csv_content(req: CsvProfileRequest, _: Principal = Depends(need_author)) -> dict:
+        from .csv_ingest import profile_text
+
+        return profile_text(req.file_name, req.content, req.table, tuple(req.null_values), API_MAX_CSV_CHARS * 4)
+
+    @app.post("/datasets/{name}/ingest")
+    def ingest_csv(name: str, req: CsvIngestRequest, p: Principal = Depends(need_admin)) -> dict:
+        from .dataset_registry import Upload, load_mapping
+
+        with lock:
+            try:
+                mapping = load_mapping(req.mapping_yaml) if req.mapping_yaml else None
+                files: list[tuple[str | None, Any]] = [(f.table, Upload(f.file_name, f.content)) for f in req.files]
+                return registry().ingest(
+                    name,
+                    files,
+                    p.subject,
+                    mapping=mapping,
+                    new_version=req.new_version,
+                    dry_run=req.dry_run,
+                    null_values=tuple(req.null_values),
+                    max_bytes=API_MAX_CSV_CHARS * 4,
+                )
+            except (ValueError, ValidationError) as exc:
+                raise ingest_errors(exc) from exc
 
     _ = VIEWER  # every role can read; VIEWER is the role for read-only users
     return app

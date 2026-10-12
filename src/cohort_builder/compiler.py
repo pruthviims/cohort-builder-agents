@@ -207,7 +207,11 @@ class Compiler:
         where = "WHERE rn = 1" if ie.first_occurrence_only else ""
         ctes.append(f"index_events AS (\n  SELECT DISTINCT person_id, index_date FROM index_candidates {where}\n)")
 
-        op, pm = self.ont.mappings["observation_period"], self.ont.mappings["person"]
+        op, pm = self.ont.mappings.get("observation_period"), self.ont.mappings["person"]
+        if not op:  # the validator reports this first; guard direct compilation too
+            raise ValueError(
+                f"dataset {self.ont.dataset_name!r} defines no observation periods; cohorts cannot be compiled for it"
+            )
         ctes.append(
             f"base AS (\n"
             f"  SELECT ie.person_id, ie.index_date, op.{op['start_col']} AS op_start, op.{op['end_col']} AS op_end,\n"

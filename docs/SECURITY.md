@@ -76,6 +76,10 @@ the token, recorded once); admins
 load reference-standard labels (`/proxy-references`) and, only when `CB_ALLOW_PATIENT_LEVEL=true`, read
 per-patient explanations.
 
+Imported datasets: any role lists dataset metadata (`GET /datasets...`, no cell values); authors preview a CSV
+in memory (`POST /datasets/csv/profile`, nothing stored); only admins ingest (`POST /datasets/{name}/ingest`),
+which sends CSV content in the body (size-capped, bare file names only; server paths are never accepted).
+
 How the rules are enforced:
 
 - **Identity comes from the token.** Request bodies that carry identity fields (`user_id`, `reviewer`) are
@@ -113,6 +117,7 @@ Events recorded:
 - `definition.execute`
 - `authz.denied`
 - `proxy.ask`, `proxy.submit`, `proxy.compare`, `proxy.evaluate_reference`, `proxy.evaluation_review`, `reference.load`
+- `dataset.ingest`, `dataset.register` (success and failed; counts, table names and file hashes only)
 - `proxy.patient_explanation` (success and denied; the patient is recorded only as a hash of
   generation id and subject id, never the id itself)
 
@@ -185,6 +190,7 @@ executors may submit. Treat suppression as one layer, not as anonymization.
 | LLM requests and responses | `meta.llm_call`, `meta.llm_cache` | Contain prompts, ontology summaries and tool results (vocabulary data, suppressed counts), never patient rows. Leave `CB_LLM_MODE` as is, but consider purging `llm_call` after the retention period |
 | Cohort membership | `results.cohort` | Patient-level. Restrict database access to authorized analysts |
 | Proxy tiers, scores and per-patient evidence | `results.proxy_assignment`, `results.proxy_evidence` | Patient-level. Returned only to admins with `CB_ALLOW_PATIENT_LEVEL=true` |
+| Imported CSV data | `stg_<dataset>_v<N>` schemas, `meta.dataset_version` (metadata only) | Patient-level, untrusted input: streamed and parameterized, never executed; reports, logs, audit entries and profiles hold counts and column names only. Protect the database file |
 | Reference-standard labels | `meta.reference_label` | Patient-level, from an external source. Admin-only input, immutable per name, never returned |
 | Tokens | Hashes only, in the token file | Protect the file anyway (it maps identities to roles) |
 

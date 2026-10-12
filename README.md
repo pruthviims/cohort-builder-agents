@@ -217,6 +217,130 @@ No code changes are needed for most areas:
 
 Oncology (lines of therapy, staging, biomarkers) needs new entities and IR criterion types, built on the OMOP Oncology extension's `episode` table.
 
+## Importing CSV data
+
+You can bring your own extract as CSV files and use it as a dataset. Importing never turns a file into
+"OMOP" because of its name: every table is staged as-is, and an explicit, validated **mapping** says which
+columns are the patient id, dates, concepts, values and units. The mapping is compiled into semantic views
+(the same adapter pattern as the IQVIA LAAD profile), and the result is an ordinary dataset profile, so every
+existing check still applies: ontology validation, human approval, deterministic SQL, execution guards,
+small-cell suppression and the audit log. No new dependency is needed.
+
+**End-to-end example** (synthetic files in [`examples/csv/`](examples/csv/)):
+
+```bash
+cohort-builder init-demo                                   # demo vocabulary (codes below map to it)
+cohort-builder csv profile examples/csv/labs.csv           # types, nulls, keys, suggestions; writes nothing
+cohort-builder csv ingest --dataset clinic_extract \
+  --file examples/csv/patients.csv --file examples/csv/enrollment.csv \
+  --file examples/csv/diagnoses.csv --file examples/csv/prescriptions.csv --file examples/csv/labs.csv \
+  --mapping examples/csv/mapping.yaml --dry-run           # validate everything, keep nothing
+cohort-builder csv ingest --dataset clinic_extract --file ... --mapping examples/csv/mapping.yaml
+cohort-builder datasets                                    # built-in + imported profiles
+cohort-builder csv info clinic_extract                     # versions, files, hashes, checks, capabilities
+cohort-builder --dataset clinic_extract dry-run examples/t2dm_metformin_hba1c.json
+cohort-builder --dataset clinic_extract ask "..."          # or CB_DATASET=clinic_extract
+```
+
+`--file TABLE=PATH` names the staging table (default: from the file name). Without `--mapping` the files
+are only staged; register later with `cohort-builder csv map --dataset NAME --mapping mapping.yaml`.
+
+**Example CSV schemas (synthetic)**
+
+| File | Columns |
+|---|---|
+| `patients.csv` | `patient_id` (text, e.g. P0001), `sex` (M/F), `birth_year` |
+| `enrollment.csv` | `patient_id`, `start_date`, `end_date` (ISO dates) |
+| `diagnoses.csv` | `dx_id`, `patient_id`, `dx_date`, `icd10_code` (ICD-10-CM, e.g. E11.9) |
+| `prescriptions.csv` | `rx_id`, `patient_id`, `fill_date` (MM/DD/YYYY text), `ndc`, `days_supply` |
+| `labs.csv` | `lab_id`, `patient_id`, `lab_date`, `loinc_code`, `result_value`, `result_unit` |
+
+**What happens to each file.**
+- **Checks:** the file must exist, be `.csv` or `.tsv`, be no larger than `CB_INGEST_MAX_BYTES` (default
+  200 MB), and be strict UTF-8; the first invalid line is reported.
+- **Header and rows:** headers are normalized to SQL-safe names. Duplicate, empty or unusable names are
+  refused, and so are malformed rows. Rows are never silently dropped; errors list line numbers, never
+  values.
+- **Loading:** rows are streamed in batches with parameterized inserts. SQL never reads the file and no
+  file content is executed.
+- **Type inference** (deterministic, documented in `csv_ingest.py`):
+  - plain integers -> BIGINT, except integers with leading zeros, which stay text (codes)
+  - plain decimals -> DOUBLE
+  - ISO dates -> DATE
+  - true/false -> BOOLEAN
+  - anything else -> text; a column with mixed numeric/date values gets a warning
+- **Profile:** row count, nulls (count and %), distinct counts, duplicate records, candidate keys and
+  duplicate-key warnings, plus *suggested* patient-id, date and code columns. Suggestions are never
+  applied automatically.
+
+**Mapping file** (see [`examples/csv/mapping.yaml`](examples/csv/mapping.yaml)):
+- **`person`:**
+  - `table`, `person_column`
+  - gender: `gender_values` (e.g. `{M: 8507, F: 8532}`) or `gender_is_concept_id`
+  - `year_of_birth_column` or `birth_date_column`
+  - Text patient ids get a deterministic surrogate `person_id`.
+- **`observation`** (mode and missing-data semantics must be stated, never assumed):
+  - `mode: table` (an enrollment-like table), `activity` (inferred from records, with `max_gap_days`) or
+    `none`. With `none`, cohort definitions are refused by the validator.
+  - `absence_inference: weak | observed_period | supported` sets the absence warnings.
+- **`entities`** (one per ontology entity you map):
+  - required: `table`, `person_column`, `start_column`
+  - optional: `end_column` and `date_format` (for text dates such as `%m/%d/%Y`)
+  - concepts: either `concept_id_column` (standard concept ids) or `code_column` + `vocabulary`
+    (`ICD10CM`, `NDC`, `LOINC`, ...), mapped through the vocabulary's "Maps to"
+  - Measurement also needs a numeric `value_column`, plus `unit_concept_id_column` or `unit_column` +
+    `unit_values`.
+- **`relationships`:** declared joins between tables, checked for existence, type compatibility and
+  orphan rows.
+
+The mapping is validated against the **staged** tables (existence, types, dates, numeric values) and then
+against the data. Counts are reported for:
+- usable vs dropped rows
+- rows that don't map to a standard concept
+- patients missing from the person table
+- patients without observation
+- conflicting person records
+
+Conflicting person records, entities with no usable rows, and a missing observation definition are
+errors. Entities you don't map are listed as unavailable, so a request for them (e.g. a procedure or a
+lab value) is refused with a message naming the missing data.
+
+**Versions and registration.**
+- **Immutable versions:** each import is a new version, staged in its own schema `stg_<dataset>_v<N>`
+  with semantic views in `sem_<dataset>_v<N>`. These never collide with `cdm`, `vocab`, `sem`, `meta` or
+  `results`.
+- **No silent overwrite:** importing an existing name requires `--new-version`. Built-in and internal
+  names are reserved.
+- **All-or-nothing:** everything runs in one transaction. A failure rolls back all tables and views and
+  is recorded as a `failed` attempt with its problems.
+- **Profile files:** written only after the commit, to the git-ignored `data/datasets/`
+  (`CB_LOCAL_DATASETS_DIR`). `<dataset>.yaml` tracks the latest version; `<dataset>__v<N>.yaml` pins one.
+- **Recorded metadata** (`meta.dataset_version`): file names, SHA-256 hashes, row counts, column
+  definitions, warnings, the mapping and its hash, the data snapshot id and the software version. The
+  snapshot is recorded with every cohort generation.
+
+**API.** Remote callers send CSV **content** in the JSON body, capped at 5 MB per file. Server paths are
+never accepted, and file names must be bare names.
+- `POST /datasets/csv/profile` (author): in-memory preview; nothing is stored.
+- `POST /datasets/{name}/ingest` (admin): new version; audited.
+- `GET /datasets`, `/datasets/{name}`, `/datasets/{name}/versions/{v}` (any role): metadata only.
+
+A dataset imported over the API is selected the same way, by starting the server or CLI with
+`CB_DATASET`. Larger files go through the CLI.
+
+**Limitations and cautions.**
+- **Not OMOP certification.** Importing is not OMOP conformance checking. Concept quality depends on
+  the codes and vocabulary you load, and unmapped codes are reported, not fixed.
+- **Not supported yet:**
+  - claims attributes (claim status, diagnosis position)
+  - wide multi-column diagnosis layouts
+  - per-row code-system columns
+  - free-text dates other than one `strptime` format per table
+- **DuckDB only:** the semantic views are DuckDB SQL.
+- **Real data stays out of the repository.** Use synthetic files to try the feature. Reports, logs,
+  audit entries and profiles carry counts and column names only, never cell values. Imported data stays
+  in your local database, which you must protect like any copy of patient data.
+
 ## Moving to real data
 
 - **Vocabulary:** download the vocabularies from [OHDSI Athena](https://athena.ohdsi.org) and run `cohort-builder load-athena /path/to/athena`. This replaces the demo vocabulary.
@@ -543,6 +667,8 @@ throwaway credentials only.
 | `CB_AUTH_DEV_BYPASS`, `CB_AUTH_DEV_SUBJECT`, `CB_AUTH_DEV_ROLES` | off; development only |
 | `CB_ALLOW_DRAFT_EXECUTION` | `false`; development only |
 | `CB_ALLOW_PATIENT_LEVEL` | `false` (per-patient proxy explanations for admins) |
+| `CB_LOCAL_DATASETS_DIR` | `data/datasets` (profiles of imported CSV datasets; git-ignored) |
+| `CB_INGEST_MAX_BYTES` | `209715200` (200 MB per CSV file) |
 | `ANTHROPIC_API_KEY` | (required for `ask` in live/cached mode) |
 | `CB_DATASET` | `omop_demo` (or `iqvia_laad`) |
 | `CB_MODEL` | `claude-sonnet-5-5` |
@@ -571,6 +697,9 @@ src/cohort_builder/
   proxy_service.py   proxy workflow: versions, review packet, execution, results, comparison, evaluation, status
   proxy_evaluation.py  reference-standard evaluation population, eligibility, acceptance-criteria check
   metrics.py         sensitivity/specificity/PPV/NPV/F1 + Wilson intervals (single implementation)
+  csv_ingest.py      CSV checks, streaming load, type inference, profiling (no LLM)
+  dataset_mapping.py validated source-to-ontology mapping -> semantic views + dataset profile
+  dataset_registry.py  imported dataset versions, staging, registration, rollback
   executor.py        runs SQL, small-cell suppression, results tables
   llm.py             Anthropic client, request hashing, cache/replay
   agents/            intent parser, concept resolver, critic, proxy parser (LLM); composer, validators,
@@ -593,6 +722,8 @@ tests/               offline tests with a scripted fake LLM
 - **Placeholder LAAD layout:** the LAAD profile uses placeholder table and column names. Map it to your IQVIA data dictionary and check its claim-status conventions before use.
 - **Not compliance-assessed:** no clinical validation and no regulatory compliance assessment has been done. The demo data is synthetic, and its counts mean nothing clinically.
 
+- **CSV imports are exploratory:** mapped imports run through the same checks as other datasets, but the
+  semantic views are DuckDB-specific and not every source layout can be expressed in a mapping yet.
 - **Proxy algorithms are exploratory:** the proxy example uses placeholder concepts and illustrative
   logic. No proxy algorithm here has been validated; real ones need clinician-curated concept sets and a
   reference-standard validation.

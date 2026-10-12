@@ -50,14 +50,21 @@ class Ontology:
     analytes: dict[int, dict[str, Any]]
 
     @classmethod
-    def load(cls, ontology_dir: Path, dataset: str | None = None) -> "Ontology":
+    def load(
+        cls, ontology_dir: Path, dataset: str | None = None, extra_dataset_dirs: list[Path] | None = None
+    ) -> "Ontology":
+        """Load the ontology and one dataset profile. Built-in profiles (ontology/datasets) take precedence;
+        `extra_dataset_dirs` hold locally registered profiles (e.g. CSV imports in data/datasets)."""
         ontology_dir = Path(ontology_dir)
         domain_path = ontology_dir / "domain.yaml"
         domain = yaml.safe_load(domain_path.read_text())
         dataset = dataset or domain["default_dataset"]
-        dataset_path = ontology_dir / domain["datasets_dir"] / f"{dataset}.yaml"
-        if not dataset_path.exists():
-            available = sorted(p.stem for p in (ontology_dir / domain["datasets_dir"]).glob("*.yaml"))
+        if not _IDENT.match(str(dataset)):
+            raise ValueError(f"invalid dataset name {dataset!r}")
+        dirs = [ontology_dir / domain["datasets_dir"], *[Path(d) for d in (extra_dataset_dirs or [])]]
+        dataset_path = next((d / f"{dataset}.yaml" for d in dirs if (d / f"{dataset}.yaml").is_file()), None)
+        if dataset_path is None:
+            available = sorted({p.stem for d in dirs if d.is_dir() for p in d.glob("*.yaml")})
             raise ValueError(f"unknown dataset {dataset!r}; available: {available}")
         files = [
             domain_path,

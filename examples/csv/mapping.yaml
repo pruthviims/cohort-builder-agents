@@ -1,0 +1,53 @@
+# Mapping for the SYNTHETIC example extract in this folder (see README "Importing CSV data").
+# Column names are the normalized names reported by `cohort-builder csv profile`.
+mapping_version: 1
+description: Synthetic clinic extract (patients, enrollment, diagnoses, prescriptions, labs) - example only.
+data_type: ehr
+
+person:
+  table: patients
+  person_column: patient_id          # text ids -> deterministic surrogate person_id
+  gender_column: sex
+  gender_values: {M: 8507, F: 8532}
+  year_of_birth_column: birth_year
+
+observation:
+  mode: table                        # table | activity | none (stated explicitly, never assumed)
+  table: enrollment
+  person_column: patient_id
+  start_column: start_date
+  end_column: end_date
+  absence_inference: observed_period # weak | observed_period | supported
+
+entities:
+  ConditionOccurrence:
+    table: diagnoses
+    person_column: patient_id
+    start_column: dx_date
+    code_column: icd10_code          # source codes, mapped through the vocabulary ('Maps to')
+    vocabulary: ICD10CM
+  DrugExposure:
+    table: prescriptions
+    person_column: patient_id
+    start_column: fill_date
+    date_format: "%m/%d/%Y"          # text dates in US format
+    code_column: ndc
+    vocabulary: NDC
+  Measurement:
+    table: labs
+    person_column: patient_id
+    start_column: lab_date
+    code_column: loinc_code
+    vocabulary: LOINC
+    value_column: result_value
+    unit_column: result_unit
+    unit_values: {"%": 8554}
+
+relationships:
+  - {from_table: diagnoses, from_column: patient_id, to_table: patients, to_column: patient_id}
+  - {from_table: prescriptions, from_column: patient_id, to_table: patients, to_column: patient_id}
+  - {from_table: labs, from_column: patient_id, to_table: patients, to_column: patient_id}
+  - {from_table: enrollment, from_column: patient_id, to_table: patients, to_column: patient_id}
+
+notes:
+  - Synthetic example data; codes come from the demo vocabulary.

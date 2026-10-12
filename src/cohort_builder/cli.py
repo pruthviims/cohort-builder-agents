@@ -44,7 +44,41 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="cohort-builder", description=__doc__)
     p.add_argument("--dataset", help="dataset profile from ontology/datasets/ (default: CB_DATASET or omop_demo)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("datasets", help="list dataset profiles and what each can answer")
+    sub.add_parser("datasets", help="list dataset profiles (built-in and imported) and what each can answer")
+    s = sub.add_parser("csv", help="import CSV files as a dataset (profile, ingest, map, info)")
+    cs = s.add_subparsers(dest="csv_cmd", required=True)
+    t = cs.add_parser("profile", help="profile one CSV (types, nulls, keys, data-quality warnings); writes nothing")
+    t.add_argument("file", type=Path)
+    t.add_argument("--table", help="destination table name to validate (default: from the file name)")
+    t.add_argument("--null-value", action="append", default=[], help="extra text meaning 'missing' (repeatable)")
+    t.add_argument("--json", action="store_true")
+    t = cs.add_parser(
+        "ingest",
+        help="load CSV files into an isolated staging schema as a new immutable dataset version",
+        description="Each --file becomes one staging table. With --mapping the version is also registered as a "
+        "dataset profile selectable with --dataset. Failures roll back completely (exit code 1).",
+    )
+    t.add_argument("--dataset", required=True, help="dataset name (lower-case letters, digits, underscores)")
+    t.add_argument(
+        "--file",
+        action="append",
+        required=True,
+        metavar="[TABLE=]PATH",
+        help="CSV/TSV file, optionally prefixed with the staging table name (repeatable)",
+    )
+    t.add_argument("--mapping", type=Path, help="mapping YAML (see examples/csv/mapping.yaml)")
+    t.add_argument("--new-version", action="store_true", help="required when the dataset name already exists")
+    t.add_argument("--dry-run", action="store_true", help="validate everything, then roll back (nothing kept)")
+    t.add_argument("--null-value", action="append", default=[])
+    t.add_argument("--user", default="cli")
+    t.add_argument("--json", action="store_true")
+    t = cs.add_parser("map", help="register a mapping for a staged (unmapped) dataset version")
+    t.add_argument("--dataset", required=True)
+    t.add_argument("--mapping", type=Path, required=True)
+    t.add_argument("--version", type=int)
+    t.add_argument("--user", default="cli")
+    t = cs.add_parser("info", help="versions, files, columns, validation results and capabilities of a dataset")
+    t.add_argument("dataset")
 
     s = sub.add_parser("init-demo", help="create the demo vocabulary and synthetic patients")
     s.add_argument("--persons", type=int, default=5000, help="patients per demo source (OMOP and LAAD-style)")
@@ -207,13 +241,17 @@ def main(argv: list[str] | None = None) -> int:
             print(yaml.safe_dump([entry], sort_keys=False).rstrip())
         return 0
 
+    if a.cmd == "csv":
+        return _csv(settings, a)
     if a.cmd == "datasets":
         import yaml
 
         from .ontology import Ontology
 
         base = Ontology.load(settings.ontology_dir)
-        for path in sorted((settings.ontology_dir / base.domain["datasets_dir"]).glob("*.yaml")):
+        builtin = sorted((settings.ontology_dir / base.domain["datasets_dir"]).glob("*.yaml"))
+        local = sorted(settings.local_datasets_dir.glob("*.yaml")) if settings.local_datasets_dir.is_dir() else []
+        for path in builtin + [p for p in local if "__v" not in p.stem]:
             prof = yaml.safe_load(path.read_text())
             caps = prof["capabilities"]
             print(f"{prof['name']} (v{prof.get('version')}, {prof.get('data_type')}): {prof.get('description', '')}")
@@ -347,6 +385,91 @@ def main(argv: list[str] | None = None) -> int:
         _print(b.replay(a.run_id))
     elif a.cmd == "search":
         _print(b.vocab.search_concepts(a.text, a.domain))
+    return 0
+
+
+def _csv(settings: Settings, a) -> int:
+    from .csv_ingest import IngestError, profile_csv
+
+    if a.csv_cmd == "profile":
+        report = profile_csv(a.file, a.table, tuple(a.null_value))
+        if a.json:
+            _print(report)
+        elif not report["ok"]:
+            print(f"{report['file']}: cannot be ingested")
+            for p in report["errors"]:
+                print(f"  [{p['code']}]{' line ' + str(p['line']) if p.get('line') else ''} {p['message']}")
+        else:
+            print(
+                f"{report['file']} -> table {report['table']}: {report['rows']} rows, {len(report['columns'])} "
+                f"columns, {report['duplicate_rows']} duplicate rows\n"
+            )
+            for c in report["columns"]:
+                print(
+                    f"  {c['name']:<28} {c['type']:<8} nulls {c['null_pct']:>6}%  distinct {c['distinct_count']:>8}"
+                    f"  {','.join(c['flags'])}"
+                )
+            for w in report["warnings"]:
+                print(f"[warning] {w}")
+            print("\nSuggested roles (confirm them in a mapping file): " + json.dumps(report["suggestions"]))
+        return 0 if report["ok"] else 1
+
+    from .dataset_registry import DatasetRegistry, load_mapping
+    from .db import connect
+
+    con = connect(settings.db_path)
+    try:
+        reg = DatasetRegistry(con, settings.ontology_dir, settings.local_datasets_dir)
+        try:
+            if a.csv_cmd == "ingest":
+                files = []
+                for spec in a.file:
+                    table, sep, path = spec.partition("=")
+                    files.append((table, Path(path)) if sep else (None, Path(spec)))
+                mapping = load_mapping(a.mapping.read_text()) if a.mapping else None
+                r = reg.ingest(
+                    a.dataset,
+                    files,
+                    a.user,
+                    mapping=mapping,
+                    new_version=a.new_version,
+                    dry_run=a.dry_run,
+                    null_values=tuple(a.null_value),
+                )
+                if a.json:
+                    _print(r)
+                else:
+                    verb = "validated (dry run, nothing kept)" if a.dry_run else r["status"]
+                    print(f"dataset {r['dataset']} v{r['version']}: {verb}")
+                    for f in r["files"]:
+                        print(f"  {f['file']} -> {r['staging_schema']}.{f['table']}: {f['rows']} rows")
+                        for w in f["warnings"]:
+                            print(f"    [warning] {w}")
+                    if r["mapping"]:
+                        for w in r["mapping"]["warnings"]:
+                            print(f"  [mapping warning] {w}")
+                    if r.get("profile"):
+                        print(f"\nSelect it with: cohort-builder --dataset {r['profile']} ...")
+                    elif not a.dry_run:
+                        print(f"\nNext: cohort-builder csv map --dataset {r['dataset']} --mapping mapping.yaml")
+            elif a.csv_cmd == "map":
+                _print(reg.register_mapping(a.dataset, load_mapping(a.mapping.read_text()), a.user, a.version))
+            elif a.csv_cmd == "info":
+                _print(reg.info(a.dataset))
+        except IngestError as exc:
+            print(f"ingestion failed: {exc}", file=sys.stderr)
+            for p in exc.problems:
+                where = (f" {p['file']}" if p.get("file") else "") + (f" line {p['line']}" if p.get("line") else "")
+                print(f"  [{p['code']}]{where}: {p['message']}", file=sys.stderr)
+            return 1
+        except KeyError as exc:
+            print(str(exc).strip("'\""), file=sys.stderr)
+            return 1
+        except ValueError as exc:  # invalid mapping file (pydantic) and similar
+            print(f"invalid input: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        con.close()
     return 0
 
 
