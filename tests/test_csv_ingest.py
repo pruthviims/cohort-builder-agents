@@ -75,7 +75,9 @@ def test_profile_valid_file_reports_structure_without_values(tmp_path):
     assert r["ok"] and r["rows"] == 3 and r["table"] == "people"
     cols = {c["name"]: c for c in r["columns"]}
     assert [c["source_name"] for c in r["columns"]][0] == "Person ID"
-    assert cols["person_id"]["type"] == "BIGINT" and "patient_identifier" in cols["person_id"]["flags"]
+    # identifiers stay exact text (never numeric), whatever their values look like
+    assert cols["person_id"]["type"] == "VARCHAR" and cols["person_id"]["kind"] == "identifier"
+    assert "patient_identifier" in cols["person_id"]["flags"]
     assert cols["birth_date"]["type"] == "DATE" and cols["birth_date"]["null_count"] == 1
     assert cols["birth_date"]["null_pct"] == 33.33
     assert cols["code"]["type"] == "VARCHAR"  # leading zeros are kept as text
@@ -296,7 +298,7 @@ def test_measurement_requires_numeric_values(reg):
 
 def test_data_checks_reject_conflicting_people_and_unusable_entities(reg, tmp_path):
     people = write(tmp_path, "people.csv", "pid,sex,yob\n1,M,1970\n1,F,1971\n2,F,1980\n")
-    events = write(tmp_path, "events.csv", "pid,day,concept\n1,1/2/20x,201826\n2,,201826\n")
+    events = write(tmp_path, "events.csv", "pid,day,condition_concept_id\n1,1/2/20x,201826\n2,,201826\n")
     m = DatasetMapping.model_validate(
         {
             "person": {
@@ -313,7 +315,7 @@ def test_data_checks_reject_conflicting_people_and_unusable_entities(reg, tmp_pa
                     "person_column": "pid",
                     "start_column": "day",
                     "date_format": "%Y-%m-%d",
-                    "concept_id_column": "concept",
+                    "concept_id_column": "condition_concept_id",
                 }
             },
         }
@@ -330,7 +332,7 @@ def test_register_creates_valid_profiles_and_semantic_views(demo_reg):
     r = reg.ingest("clinic", example_files(), "alice", mapping=mapping())
     assert r["status"] == "registered" and r["profile"] == "clinic"
     checks = r["mapping"]["checks"]
-    assert checks["ConditionOccurrence"]["unmapped_concept_rows"] == 0 and checks["person"]["persons"] == 60
+    assert checks["ConditionOccurrence"]["concept_mapping"]["unmapped_rows"] == 0 and checks["person"]["persons"] == 60
     assert r["mapping"]["surrogate_person_ids"] is True
     latest = reg.local_dir / "clinic.yaml"
     pinned = reg.local_dir / "clinic__v1.yaml"

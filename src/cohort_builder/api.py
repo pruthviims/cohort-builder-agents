@@ -34,6 +34,7 @@ Imported datasets (CSV; content is sent in the request body, never a server path
   GET  /datasets, /datasets/{name}, /datasets/{name}/versions/{version}  any role (metadata, no row values)
   POST /datasets/csv/profile                                            author (in-memory preview, nothing stored)
   POST /datasets/{name}/ingest                                          admin (new immutable version)
+  POST /datasets/reconcile                                              admin (repair profile files after a failure)
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from datetime import date
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -88,6 +90,9 @@ class CsvContent(_Strict):
     file_name: str = Field(min_length=1, max_length=128, description="bare file name, e.g. patients.csv")
     content: str = Field(min_length=1, max_length=API_MAX_CSV_CHARS)
     table: str | None = Field(default=None, max_length=48)
+    column_types: dict[str, Literal["VARCHAR", "BIGINT", "DOUBLE", "DATE", "BOOLEAN"]] | None = Field(
+        default=None, max_length=500, description="explicit column types; every value must convert exactly"
+    )
 
 
 class CsvProfileRequest(CsvContent):
@@ -599,16 +604,34 @@ def create_app(
     def profile_csv_content(req: CsvProfileRequest, _: Principal = Depends(need_author)) -> dict:
         from .csv_ingest import profile_text
 
-        return profile_text(req.file_name, req.content, req.table, tuple(req.null_values), API_MAX_CSV_CHARS * 4)
+        return profile_text(
+            req.file_name,
+            req.content,
+            req.table,
+            tuple(req.null_values),
+            API_MAX_CSV_CHARS * 4,
+            dict(req.column_types) if req.column_types else None,
+        )
+
+    @app.post("/datasets/reconcile")
+    def reconcile_datasets(p: Principal = Depends(need_admin)) -> dict:
+        with lock:
+            return registry().reconcile(p.subject)
 
     @app.post("/datasets/{name}/ingest")
     def ingest_csv(name: str, req: CsvIngestRequest, p: Principal = Depends(need_admin)) -> dict:
+        from .csv_ingest import default_table_name
         from .dataset_registry import Upload, load_mapping
 
         with lock:
             try:
                 mapping = load_mapping(req.mapping_yaml) if req.mapping_yaml else None
                 files: list[tuple[str | None, Any]] = [(f.table, Upload(f.file_name, f.content)) for f in req.files]
+                types: dict[str, dict[str, str]] = {}
+                for f in req.files:
+                    if f.column_types:
+                        table = f.table or default_table_name(Path(Path(f.file_name).name))
+                        types[table] = dict(f.column_types)
                 return registry().ingest(
                     name,
                     files,
@@ -618,6 +641,7 @@ def create_app(
                     dry_run=req.dry_run,
                     null_values=tuple(req.null_values),
                     max_bytes=API_MAX_CSV_CHARS * 4,
+                    column_types=types or None,
                 )
             except (ValueError, ValidationError) as exc:
                 raise ingest_errors(exc) from exc

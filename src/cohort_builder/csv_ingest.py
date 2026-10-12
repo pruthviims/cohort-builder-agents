@@ -8,15 +8,31 @@ normalized, validated against a strict pattern and always double-quoted.
 Reports describe structure only (types, counts, percentages, flags). They never contain cell values,
 so they are safe to print, log, store in metadata or show to an agent.
 
-Type inference rules (applied to the non-missing values of a column, in this order):
-  1. no non-missing values                         -> VARCHAR  (warning: column is empty)
-  2. every value is an integer, some have a leading zero (e.g. '00123') -> VARCHAR (codes keep zeros)
-  3. every value is a plain integer (optional sign, <= 18 digits)      -> BIGINT
-  4. every value is a plain decimal number (optional exponent)        -> DOUBLE
-  5. every value is an ISO date YYYY-MM-DD         -> DATE
-  6. every value is true/false (any case)          -> BOOLEAN
-  7. otherwise                                     -> VARCHAR  (warning if >= 50% looked numeric or date-like:
-                                                                 the column has mixed / ambiguous values)
+Type inference rules (non-missing values of a column; deterministic, never an LLM). Values are never
+altered to fit a type: a column only gets a numeric or date type when EVERY value converts exactly.
+  1. no non-missing values                                   -> VARCHAR (warning: column is empty)
+  2. every value is a whole number (optional sign):
+       - some have a leading zero ('00123')                  -> VARCHAR (codes keep their zeros)
+       - some have more than 18 digits                       -> VARCHAR (beyond exact 64-bit integers)
+       - the column NAME marks an identifier or code (below) -> VARCHAR (ids and codes stay exact text)
+       - otherwise                                           -> BIGINT
+  3. every value is a plain decimal number (optional exponent):
+       - some have more than 15 significant digits           -> VARCHAR (a DOUBLE could not hold it exactly)
+       - the column name marks an identifier or code         -> VARCHAR (e.g. ICD-9 '250.00' keeps its zeros)
+       - otherwise                                           -> DOUBLE
+  4. every value is an ISO date YYYY-MM-DD                   -> DATE
+  5. every value is true / false (any case)                  -> BOOLEAN
+  6. otherwise                                               -> VARCHAR (warning when >= 50% looked numeric or
+                                                                date-like: mixed / ambiguous values)
+Name heuristic (conservative; it can only keep a column as TEXT, never make it numeric):
+  identifier: *_id, *_key, *identifier, mrn, npi, ssn, zip / postal code, or containing person / patient /
+              subject / member;  code: containing code, icd, ndc, cpt, hcpcs, loinc, snomed, rxnorm, atc,
+              drg, revenue.  Exception: *concept_id columns hold OMOP concept ids (integers by definition).
+Explicit per-column overrides (`column_types`) replace inference; they are validated the same way (every
+value must convert exactly) and recorded as type_source 'override'.
+Each column also gets a descriptive `kind`: identifier, code, concept_id, date, quantity (whole numbers),
+measurement (decimal numbers), flag or text. Kinds describe; they never change a value.
+Every staged table keeps `_source_row`: the CSV line number where the record ends (traceability).
 Missing values are empty fields plus any extra `null_values` the caller lists (none by default).
 """
 
@@ -42,12 +58,14 @@ BATCH_ROWS = 5000
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")  # table names (and dataset names, see registry)
 COLUMN_PATTERN = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 TYPES = ("BIGINT", "DOUBLE", "DATE", "BOOLEAN", "VARCHAR")
-_ID_NAME = re.compile(r"(^|_)(id|key|identifier|mrn)$")
+_ID_NAME = re.compile(r"((^|_)(id|key|identifier)$|^(mrn|npi|ssn|zip|zipcode|zip_code|postal_code)$)")
 _PATIENT_NAME = re.compile(r"(person|patient|subject|member|mrn)")
+SOURCE_ROW = "_source_row"  # system column (user columns cannot start with '_')
 _DATE_NAME = re.compile(r"(date|_dt$|_dt_|^dt_|_time$|timestamp)")
 _INT_RE = "[+-]?[0-9]{1,18}"  # fits BIGINT without overflow
 _NUM_RE = "[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]{1,3})?"
-_CODE_NAME = re.compile(r"(code|concept|icd|ndc|loinc|cpt|hcpcs|snomed|rxnorm|atc|vocabulary)")
+_CODE_NAME = re.compile(r"(code|concept|icd|ndc|loinc|cpt|hcpcs|snomed|rxnorm|atc|drg|revenue|vocabulary)")
+_CONCEPT_ID_NAME = re.compile(r"concept_id$")
 
 
 class IngestError(ValueError):
@@ -200,9 +218,20 @@ def parse_header(raw: list[str]) -> Header:
     return Header(raw, cols)
 
 
+def name_kind(col: str) -> str | None:
+    """'concept_id', 'identifier', 'code' or None, from the column name alone (documented heuristic)."""
+    if _CONCEPT_ID_NAME.search(col):
+        return "concept_id"
+    if _ID_NAME.search(col) or _PATIENT_NAME.search(col):
+        return "identifier"
+    if _CODE_NAME.search(col):
+        return "code"
+    return None
+
+
 def iter_rows(stream: TextIO, delimiter: str, null_values: Sequence[str]) -> Iterator[tuple[Header, list[list[Any]]]]:
-    """Yield (header, batch) pairs. Raises IngestError listing malformed rows (line numbers, no values);
-    nothing is yielded after the first problem is known to be fatal, and callers roll back."""
+    """Yield (header, batch) pairs; each row is [line_number, *values]. Raises IngestError listing malformed
+    rows (line numbers, no values); callers roll back everything already inserted."""
     reader = csv.reader(stream, delimiter=delimiter, strict=True)
     nulls = set(null_values) | {""}
     try:
@@ -241,7 +270,7 @@ def iter_rows(stream: TextIO, delimiter: str, null_values: Sequence[str]) -> Ite
             continue
         data_rows += 1
         if not bad:
-            batch.append([None if v in nulls else v for v in row])
+            batch.append([reader.line_num, *(None if v in nulls else v for v in row)])
             if len(batch) >= BATCH_ROWS:
                 yield header, batch
                 batch = []
@@ -264,6 +293,8 @@ class ColumnProfile:
     name: str
     source_name: str
     type: str
+    kind: str
+    type_source: str  # inferred | override
     non_null: int
     null_count: int
     null_pct: float
@@ -300,41 +331,105 @@ class TableProfile:
             "suggestions": {
                 "patient_identifier": [c.name for c in self.columns if "patient_identifier" in c.flags],
                 "date": [c.name for c in self.columns if "date" in c.flags],
-                "code": [c.name for c in self.columns if "code" in c.flags],
+                "code": [c.name for c in self.columns if c.kind in ("code", "concept_id")],
                 "note": "suggestions only: mappings are never inferred automatically",
             },
         }
 
 
-def _infer(con: duckdb.DuckDBPyConnection, raw: str, col: str) -> tuple[str, list[str]]:
+@dataclass
+class ColumnStats:
+    n: int
+    ints: int  # whole numbers with <= 18 digits
+    long_ints: int  # whole numbers with > 18 digits
+    zeros: int  # whole numbers with a leading zero
+    nums: int  # plain decimal numbers (includes whole numbers)
+    wide_nums: int  # numbers with > 15 significant digits
+    dates: int
+    bools: int
+
+
+def _stats(con: duckdb.DuckDBPyConnection, raw: str, col: str) -> ColumnStats:
     c = qi(col)
-    # strict text patterns first: DuckDB's own casts accept '7.3' as BIGINT 7, '0x1F', '1_000', ...
-    n, ints, dbls, dates, bools, zeros = con.execute(
+    # strict text patterns: DuckDB's own casts accept '7.3' as BIGINT 7, '0x1F', '1_000', ...
+    digits = f"ltrim(regexp_replace(regexp_replace({c}, '[eE].*$', ''), '[^0-9]', '', 'g'), '0')"
+    row = con.execute(
         f"SELECT count({c}), "
         f"count(*) FILTER (WHERE regexp_full_match({c}, '{_INT_RE}')), "
+        f"count(*) FILTER (WHERE regexp_full_match({c}, '[+-]?[0-9]{{19,}}')), "
+        f"count(*) FILTER (WHERE regexp_full_match({c}, '[+-]?0[0-9]+')), "
         f"count(*) FILTER (WHERE regexp_full_match({c}, '{_NUM_RE}')), "
+        f"count(*) FILTER (WHERE regexp_full_match({c}, '{_NUM_RE}') AND length({digits}) > 15), "
         f"count(*) FILTER (WHERE regexp_full_match({c}, '[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}') "
         f"AND TRY_CAST({c} AS DATE) IS NOT NULL), "
-        f"count(*) FILTER (WHERE lower({c}) IN ('true', 'false')), "
-        f"count(*) FILTER (WHERE regexp_full_match({c}, '[+-]?0[0-9]+')) FROM {raw}"
-    ).fetchone() or (0, 0, 0, 0, 0, 0)
-    notes: list[str] = []
-    if n == 0:
-        return "VARCHAR", ["column has no values"]
-    if ints == n and zeros:
-        return "VARCHAR", ["integer-like values with leading zeros kept as text (codes)"]
-    if ints == n:
-        return "BIGINT", notes
-    if dbls == n:
-        return "DOUBLE", notes
-    if dates == n:
-        return "DATE", notes
-    if bools == n:
-        return "BOOLEAN", notes
-    for label, k in (("numeric", dbls), ("ISO date", dates)):
-        if k >= n / 2:
-            notes.append(f"mixed values: {k} of {n} look {label}; kept as text (fix the source or map explicitly)")
-    return "VARCHAR", notes
+        f"count(*) FILTER (WHERE lower({c}) IN ('true', 'false')) FROM {raw}"
+    ).fetchone()
+    return ColumnStats(*(int(v) for v in (row or (0,) * 8)))
+
+
+def _infer(col: str, st: ColumnStats) -> tuple[str, str, list[str]]:
+    """(type, kind, notes) under the documented rules."""
+    nk = name_kind(col)
+    exact_text = nk in ("identifier", "code")
+    if st.n == 0:
+        return "VARCHAR", nk or "text", ["column has no values"]
+    if st.ints + st.long_ints == st.n:
+        if st.zeros:
+            return "VARCHAR", nk or "code", ["whole numbers with leading zeros kept as exact text"]
+        if st.long_ints:
+            return "VARCHAR", nk or "identifier", ["whole numbers longer than 18 digits kept as exact text"]
+        if exact_text:
+            return "VARCHAR", nk or "text", [f"{nk} column: numeric-looking values kept as exact text"]
+        return "BIGINT", "concept_id" if nk == "concept_id" else "quantity", []
+    if st.nums == st.n:
+        if st.wide_nums:
+            return "VARCHAR", nk or "text", ["numbers with more than 15 significant digits kept as exact text"]
+        if exact_text:
+            return "VARCHAR", nk or "text", [f"{nk} column: numeric-looking values kept as exact text"]
+        return "DOUBLE", "measurement", []
+    if st.dates == st.n:
+        return "DATE", "date", []
+    if st.bools == st.n:
+        return "BOOLEAN", "flag", []
+    notes = []
+    for label, k in (("numeric", st.nums), ("ISO date", st.dates)):
+        if k >= st.n / 2:
+            notes.append(f"mixed values: {k} of {st.n} look {label}; kept as text (fix the source or map explicitly)")
+    return "VARCHAR", nk or ("date" if _DATE_NAME.search(col) else "text"), notes
+
+
+def _override(col: str, wanted: str, st: ColumnStats) -> tuple[str, str, list[str]]:
+    """Validate an explicit type: every value must convert exactly, otherwise the import fails."""
+    if wanted not in TYPES:
+        raise IngestError(
+            f"column {col!r}: unknown type {wanted[:20]!r}; use one of {list(TYPES)}",
+            [{"code": "invalid_override", "message": f"unknown type for {col}"}],
+        )
+    ok = {
+        "VARCHAR": st.n,
+        "BIGINT": st.ints - st.zeros,
+        "DOUBLE": st.nums - st.wide_nums - st.zeros,
+        "DATE": st.dates,
+        "BOOLEAN": st.bools,
+    }[wanted]
+    if ok != st.n:
+        raise IngestError(
+            f"column {col!r} cannot be {wanted}: {st.n - ok} of {st.n} value(s) do not convert exactly",
+            [
+                {
+                    "code": "invalid_override",
+                    "message": f"{col}: {st.n - ok} value(s) do not convert exactly to {wanted}",
+                }
+            ],
+        )
+    kind = {
+        "VARCHAR": name_kind(col) or "text",
+        "BIGINT": name_kind(col) or "quantity",
+        "DOUBLE": name_kind(col) or "measurement",
+        "DATE": "date",
+        "BOOLEAN": "flag",
+    }[wanted]
+    return wanted, kind, [f"type set explicitly to {wanted}"]
 
 
 def stage_table(
@@ -344,20 +439,37 @@ def stage_table(
     stream: TextIO,
     info: FileInfo,
     null_values: Sequence[str] = (),
+    column_types: dict[str, str] | None = None,
 ) -> TableProfile:
-    """Load one CSV into `schema.table` (typed) and profile it. Runs inside the caller's transaction."""
+    """Load one CSV into `schema.table` (typed, plus `_source_row`) and profile it. Runs inside the caller's
+    transaction; raises IngestError (nothing kept by the caller) on any problem."""
     validate_name(table)
     raw = f"{qi(schema)}.{qi('raw_' + table)}"
     created = False
     header: Header | None = None
     for header, batch in iter_rows(stream, info.delimiter, null_values):
         if not created:
-            con.execute(f"CREATE TABLE {raw} ({', '.join(qi(c) + ' VARCHAR' for c in header.columns)})")
+            cols = ", ".join(qi(c) + " VARCHAR" for c in header.columns)
+            con.execute(f"CREATE TABLE {raw} ({qi(SOURCE_ROW)} BIGINT, {cols})")
             created = True
         if batch:
-            con.executemany(f"INSERT INTO {raw} VALUES ({', '.join('?' for _ in header.columns)})", batch)
+            con.executemany(f"INSERT INTO {raw} VALUES (?, {', '.join('?' for _ in header.columns)})", batch)
     assert header is not None  # iter_rows always yields at least once or raises
-    types: dict[str, tuple[str, list[str]]] = {c: _infer(con, raw, c) for c in header.columns}
+    overrides = dict(column_types or {})
+    if unknown := sorted(set(overrides) - set(header.columns)):
+        raise IngestError(
+            f"type overrides name unknown columns {unknown} in table {table!r}",
+            [{"code": "invalid_override", "message": f"unknown columns {unknown}"}],
+        )
+    types: dict[str, tuple[str, str, str, list[str]]] = {}
+    for c in header.columns:
+        st = _stats(con, raw, c)
+        if c in overrides:
+            t, kind, notes = _override(c, overrides[c].upper(), st)
+            types[c] = (t, kind, "override", notes)
+        else:
+            t, kind, notes = _infer(c, st)
+            types[c] = (t, kind, "inferred", notes)
 
     def cast(c: str) -> str:
         t = types[c][0]
@@ -368,7 +480,10 @@ def stage_table(
         return f"CAST({qi(c)} AS {t}) AS {qi(c)}"
 
     target = f"{qi(schema)}.{qi(table)}"
-    con.execute(f"CREATE TABLE {target} AS SELECT {', '.join(cast(c) for c in header.columns)} FROM {raw}")
+    con.execute(
+        f"CREATE TABLE {target} AS SELECT {qi(SOURCE_ROW)}, {', '.join(cast(c) for c in header.columns)} "
+        f"FROM {raw} ORDER BY {qi(SOURCE_ROW)}"
+    )
     con.execute(f"DROP TABLE {raw}")
     return profile_table(con, schema, table, header, types, info)
 
@@ -378,21 +493,25 @@ def profile_table(
     schema: str,
     table: str,
     header: Header,
-    types: dict[str, tuple[str, list[str]]],
+    types: dict[str, tuple[str, str, str, list[str]]],
     info: FileInfo,
 ) -> TableProfile:
     target = f"{qi(schema)}.{qi(table)}"
+    user_cols = ", ".join(qi(c) for c in header.columns)
     rows = int((con.execute(f"SELECT count(*) FROM {target}").fetchone() or (0,))[0])
-    distinct_rows = int((con.execute(f"SELECT count(*) FROM (SELECT DISTINCT * FROM {target})").fetchone() or (0,))[0])
+    distinct_rows = int(
+        (con.execute(f"SELECT count(*) FROM (SELECT DISTINCT {user_cols} FROM {target})").fetchone() or (0,))[0]
+    )
     warnings: list[str] = []
     columns: list[ColumnProfile] = []
     for src, col in zip(header.source, header.columns, strict=True):
         non_null, distinct = con.execute(
             f"SELECT count({qi(col)}), count(DISTINCT {qi(col)}) FROM {target}"
         ).fetchone() or (0, 0)
-        typ, notes = types[col]
+        typ, kind, type_source, notes = types[col]
+        notes = list(notes)
         flags = []
-        if _ID_NAME.search(col) or _PATIENT_NAME.search(col):
+        if kind == "identifier" or name_kind(col) == "identifier":
             flags.append("identifier")
             if _PATIENT_NAME.search(col):
                 flags.append("patient_identifier")
@@ -400,25 +519,28 @@ def profile_table(
             flags.append("date")
             if typ != "DATE":
                 notes.append("name suggests a date but values are not ISO YYYY-MM-DD (use date_format in the mapping)")
-        if _CODE_NAME.search(col):
+        if kind in ("code", "concept_id"):
             flags.append("code")
         if rows and non_null == rows and distinct == rows:
             flags.append("unique")
-        cp = ColumnProfile(
-            col,
-            src,
-            typ,
-            int(non_null),
-            rows - int(non_null),
-            round(100.0 * (rows - non_null) / rows, 2) if rows else 0.0,
-            int(distinct),
-            flags,
-            notes,
+        columns.append(
+            ColumnProfile(
+                col,
+                src,
+                typ,
+                kind,
+                type_source,
+                int(non_null),
+                rows - int(non_null),
+                round(100.0 * (rows - non_null) / rows, 2) if rows else 0.0,
+                int(distinct),
+                flags,
+                notes,
+            )
         )
-        columns.append(cp)
         if "identifier" in flags and "patient_identifier" not in flags and col.endswith("_id") and distinct < non_null:
             warnings.append(f"candidate key {col!r} has {non_null - distinct} duplicate value(s)")
-        warnings += [f"{col}: {n}" for n in notes]
+        warnings += [f"{col}: {n}" for n in notes if not n.startswith(("identifier column", "code column"))]
     if rows - distinct_rows:
         warnings.append(f"{rows - distinct_rows} duplicate record(s) (identical rows)")
     keys = [c.name for c in columns if "unique" in c.flags]
@@ -428,7 +550,11 @@ def profile_table(
 
 
 def profile_csv(
-    path: Path, table: str | None = None, null_values: Sequence[str] = (), max_bytes: int | None = None
+    path: Path,
+    table: str | None = None,
+    null_values: Sequence[str] = (),
+    max_bytes: int | None = None,
+    column_types: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Profile a CSV without touching any persistent database (in-memory DuckDB)."""
     path = Path(path)
@@ -438,7 +564,7 @@ def profile_csv(
         con = duckdb.connect(":memory:")
         con.execute("CREATE SCHEMA preview")
         with path.open("r", encoding="utf-8-sig", newline="") as fh:
-            prof = stage_table(con, "preview", validate_name(name), fh, info, null_values)
+            prof = stage_table(con, "preview", validate_name(name), fh, info, null_values, column_types)
         con.close()
         return {"ok": True, **prof.as_dict()}
     except IngestError as exc:
@@ -446,7 +572,12 @@ def profile_csv(
 
 
 def profile_text(
-    name: str, text: str, table: str | None = None, null_values: Sequence[str] = (), max_bytes: int | None = None
+    name: str,
+    text: str,
+    table: str | None = None,
+    null_values: Sequence[str] = (),
+    max_bytes: int | None = None,
+    column_types: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Profile uploaded CSV content (API) in an in-memory database."""
     table_name = table or default_table_name(Path(Path(name).name))
@@ -454,7 +585,9 @@ def profile_text(
         info = check_text(name, text, max_bytes or max_bytes_from_env())
         con = duckdb.connect(":memory:")
         con.execute("CREATE SCHEMA preview")
-        prof = stage_table(con, "preview", validate_name(table_name), text_stream(text), info, null_values)
+        prof = stage_table(
+            con, "preview", validate_name(table_name), text_stream(text), info, null_values, column_types
+        )
         con.close()
         return {"ok": True, **prof.as_dict()}
     except IngestError as exc:
@@ -466,4 +599,4 @@ def open_text(path: Path) -> TextIO:
 
 
 def text_stream(text: str) -> TextIO:
-    return io.StringIO(text.removeprefix("﻿"), newline="")
+    return io.StringIO(text.removeprefix("\ufeff"), newline="")

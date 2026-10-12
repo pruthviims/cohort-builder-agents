@@ -51,6 +51,13 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("file", type=Path)
     t.add_argument("--table", help="destination table name to validate (default: from the file name)")
     t.add_argument("--null-value", action="append", default=[], help="extra text meaning 'missing' (repeatable)")
+    t.add_argument(
+        "--type",
+        action="append",
+        default=[],
+        metavar="COLUMN=TYPE",
+        help="explicit column type (VARCHAR, BIGINT, DOUBLE, DATE, BOOLEAN); every value must convert exactly",
+    )
     t.add_argument("--json", action="store_true")
     t = cs.add_parser(
         "ingest",
@@ -70,6 +77,13 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--new-version", action="store_true", help="required when the dataset name already exists")
     t.add_argument("--dry-run", action="store_true", help="validate everything, then roll back (nothing kept)")
     t.add_argument("--null-value", action="append", default=[])
+    t.add_argument(
+        "--type",
+        action="append",
+        default=[],
+        metavar="TABLE.COLUMN=TYPE",
+        help="explicit column type, e.g. claims.member_id=VARCHAR (repeatable; validated against every value)",
+    )
     t.add_argument("--user", default="cli")
     t.add_argument("--json", action="store_true")
     t = cs.add_parser("map", help="register a mapping for a staged (unmapped) dataset version")
@@ -79,6 +93,13 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--user", default="cli")
     t = cs.add_parser("info", help="versions, files, columns, validation results and capabilities of a dataset")
     t.add_argument("dataset")
+    t = cs.add_parser(
+        "reconcile",
+        help="repair profile files after an interrupted import (publish pending versions, remove stale files)",
+        description="Run when no import is in progress. Uses only what the database recorded; never re-reads CSVs.",
+    )
+    t.add_argument("dataset", nargs="?", help="one dataset (default: all imported datasets)")
+    t.add_argument("--user", default="cli")
 
     s = sub.add_parser("init-demo", help="create the demo vocabulary and synthetic patients")
     s.add_argument("--persons", type=int, default=5000, help="patients per demo source (OMOP and LAAD-style)")
@@ -392,7 +413,18 @@ def _csv(settings: Settings, a) -> int:
     from .csv_ingest import IngestError, profile_csv
 
     if a.csv_cmd == "profile":
-        report = profile_csv(a.file, a.table, tuple(a.null_value))
+        types: dict[str, str] = {}
+        for spec in a.type:
+            col, sep, typ = spec.partition("=")
+            if not sep or not col.strip() or not typ.strip():
+                print("invalid input: --type looks like COLUMN=TYPE", file=sys.stderr)
+                return 1
+            types[col.strip()] = typ.strip().upper()
+        try:
+            report = profile_csv(a.file, a.table, tuple(a.null_value), column_types=types or None)
+        except IngestError as exc:
+            print(f"profiling failed: {exc}", file=sys.stderr)
+            return 1
         if a.json:
             _print(report)
         elif not report["ok"]:
@@ -406,15 +438,15 @@ def _csv(settings: Settings, a) -> int:
             )
             for c in report["columns"]:
                 print(
-                    f"  {c['name']:<28} {c['type']:<8} nulls {c['null_pct']:>6}%  distinct {c['distinct_count']:>8}"
-                    f"  {','.join(c['flags'])}"
+                    f"  {c['name']:<28} {c['type']:<8} {c['kind']:<11} nulls {c['null_pct']:>6}%  distinct "
+                    f"{c['distinct_count']:>8}  {','.join(c['flags'])}"
                 )
             for w in report["warnings"]:
                 print(f"[warning] {w}")
             print("\nSuggested roles (confirm them in a mapping file): " + json.dumps(report["suggestions"]))
         return 0 if report["ok"] else 1
 
-    from .dataset_registry import DatasetRegistry, load_mapping
+    from .dataset_registry import DatasetRegistry, load_mapping, parse_type_overrides
     from .db import connect
 
     con = connect(settings.db_path)
@@ -435,6 +467,7 @@ def _csv(settings: Settings, a) -> int:
                     new_version=a.new_version,
                     dry_run=a.dry_run,
                     null_values=tuple(a.null_value),
+                    column_types=parse_type_overrides(a.type) or None,
                 )
                 if a.json:
                     _print(r)
@@ -456,11 +489,15 @@ def _csv(settings: Settings, a) -> int:
                 _print(reg.register_mapping(a.dataset, load_mapping(a.mapping.read_text()), a.user, a.version))
             elif a.csv_cmd == "info":
                 _print(reg.info(a.dataset))
+            elif a.csv_cmd == "reconcile":
+                result = reg.reconcile(a.user, a.dataset)
+                _print(result)
+                return 1 if result["problems"] else 0
         except IngestError as exc:
             print(f"ingestion failed: {exc}", file=sys.stderr)
             for p in exc.problems:
                 where = (f" {p['file']}" if p.get("file") else "") + (f" line {p['line']}" if p.get("line") else "")
-                print(f"  [{p['code']}]{where}: {p['message']}", file=sys.stderr)
+                print(f"  [{p['code']}]{where}: {p.get('message', '')}", file=sys.stderr)
             return 1
         except KeyError as exc:
             print(str(exc).strip("'\""), file=sys.stderr)

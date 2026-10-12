@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS meta.dataset_version (
   created_at TIMESTAMP, registered_at TIMESTAMP, staging_schema VARCHAR, semantic_schema VARCHAR,
   files_json VARCHAR, mapping_json VARCHAR, mapping_hash VARCHAR, validation_json VARCHAR, profile_hash VARCHAR,
   snapshot VARCHAR, software_version VARCHAR, errors_json VARCHAR);
+ALTER TABLE meta.dataset_version ADD COLUMN IF NOT EXISTS profile_json VARCHAR;
 CREATE TABLE IF NOT EXISTS meta.audit_event (
   event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
   resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);

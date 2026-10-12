@@ -82,6 +82,10 @@ class CohortBuilder(ProxyMixin):
         self.ontology = Ontology.load(
             self.settings.ontology_dir, self.settings.dataset, [self.settings.local_datasets_dir]
         )
+        # a CSV-import profile must be backed by a 'registered' version in THIS database (never stale)
+        from .dataset_registry import verify_registered_profile
+
+        verify_registered_profile(self.con, self.ontology.dataset, self.ontology.dataset_name)
         for stmt in self.ontology.setup_statements():  # install the dataset's semantic views
             try:
                 self.con.execute(stmt)

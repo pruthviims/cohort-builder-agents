@@ -11,14 +11,23 @@ An imported table is NEVER treated as OMOP just because of its file or column na
     observation:  {mode: table | activity | none, absence_inference: weak | observed_period | supported,
                    table/person_column/start_column/end_column (table mode), max_gap_days (activity mode)}
     entities:     {<ontology entity>: {table, person_column, start_column, end_column?, date_format?,
-                   concept_id_column | (code_column + vocabulary), value_column?, unit_concept_id_column |
-                   (unit_column + unit_values)}}
+                   concept_id_column | (code_column + vocabulary + code_normalization?), value_column?,
+                   unit_concept_id_column | (unit_column + unit_values)}}
     relationships: [{from_table, from_column, to_table, to_column}]
 
 The mapping is checked against the ACTUAL staged schema (tables, columns, types), and it is compiled
 into semantic views (like the IQVIA LAAD profile) that give the existing compiler the column names it
 expects. Only validated identifiers, integers and strictly-filtered literals reach SQL; the mapping is
 never executed as SQL.
+
+Raw data and normalized meaning are kept apart: staged tables hold the source values exactly as imported;
+semantic views ADD derived columns (person_id, concept_id, dates) next to provenance columns
+(`source_table`, `source_row`, `source_value` = the untouched source code / concept id,
+`source_code_normalized` = the lookup key). Source-code normalization is per code system
+(`CODE_NORMALIZATION`), deterministic, and only a string-format lookup key: two source strings with the
+same key are NOT claimed to be the same clinical code; keys that are ambiguous in the vocabulary only match
+their exact spelling. Mapping to concepts depends on the vocabulary tables loaded in this database (their
+versions are recorded in the registration report).
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -40,14 +50,61 @@ _LITERAL = re.compile(r"^[A-Za-z0-9 %/\-_.^*()\[\]µ]{1,40}$")  # gender/unit so
 _DATE_FORMAT = re.compile(r"^(%[YmdyHMSbB]|[-/ .:T])+$")
 ALLOWED_GENDERS = {8507, 8532, 0}
 
+# ---- source-code normalization (lookup keys, not clinical equivalence) ---------------------------------
+CodeNormalization = Literal["exact", "trim_upper", "strip_dots", "ndc11"]
+NORMALIZATIONS: dict[str, str] = {
+    "exact": "the code string exactly as stored (no trimming, case-sensitive)",
+    "trim_upper": "surrounding whitespace removed, upper case",
+    "strip_dots": "trim_upper, then '.' removed (ICD codes are often written with or without the dot)",
+    "ndc11": (
+        "11-digit NDC: 11 digits as-is; hyphenated 5-4-2, 4-4-2, 5-3-2 and 5-4-1 are zero-padded to 5-4-2 and "
+        "the hyphens removed; anything else (e.g. 10 digits without hyphens, which is ambiguous) is unrecognized"
+    ),
+}
+# Defaults per vocabulary_id when the mapping does not set code_normalization explicitly.
+DEFAULT_NORMALIZATION: dict[str, str] = {
+    "ICD10CM": "strip_dots",
+    "ICD9CM": "strip_dots",
+    "ICD10": "strip_dots",
+    "ICD9Proc": "strip_dots",
+    "NDC": "ndc11",
+}
+
+
+def normalization_for(vocabulary: str, explicit: str | None = None) -> str:
+    return explicit or DEFAULT_NORMALIZATION.get(vocabulary, "trim_upper")
+
+
+def normalize_sql(expr: str, strategy: str) -> str:
+    """SQL expression for the lookup key of `expr` (a VARCHAR expression). NULL = unrecognized format."""
+    x = f"trim(CAST({expr} AS VARCHAR))"
+    if strategy == "exact":
+        return f"CAST({expr} AS VARCHAR)"
+    if strategy == "trim_upper":
+        return f"nullif(upper({x}), '')"
+    if strategy == "strip_dots":
+        return f"nullif(upper(replace({x}, '.', '')), '')"
+    if strategy == "ndc11":
+        part = "split_part({x}, '-', {i})"
+        p1, p2, p3 = (part.format(x=x, i=i) for i in (1, 2, 3))
+        return (
+            f"CASE WHEN regexp_full_match({x}, '[0-9]{{11}}') THEN {x} "
+            f"WHEN regexp_full_match({x}, '[0-9]{{5}}-[0-9]{{4}}-[0-9]{{2}}') THEN replace({x}, '-', '') "
+            f"WHEN regexp_full_match({x}, '[0-9]{{4}}-[0-9]{{4}}-[0-9]{{2}}') THEN '0' || replace({x}, '-', '') "
+            f"WHEN regexp_full_match({x}, '[0-9]{{5}}-[0-9]{{3}}-[0-9]{{2}}') THEN {p1} || '0' || {p2} || {p3} "
+            f"WHEN regexp_full_match({x}, '[0-9]{{5}}-[0-9]{{4}}-[0-9]{{1}}') THEN {p1} || {p2} || '0' || {p3} "
+            "ELSE NULL END"
+        )
+    raise ValueError(f"unknown code normalization {strategy!r}")
+
 
 class _M(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
 def _col(v: str | None) -> str | None:
-    if v is not None and not COLUMN_PATTERN.match(v):
-        raise ValueError(f"{v!r} is not a valid (normalized) column name")
+    if v is not None and (not COLUMN_PATTERN.match(v) or v.startswith("_")):
+        raise ValueError(f"{v!r} is not a valid (normalized) column name")  # '_' prefix = system columns
     return v
 
 
@@ -134,6 +191,9 @@ class EntityMapping(_M):
     concept_id_column: str | None = Field(default=None, description="column already holding standard concept ids")
     code_column: str | None = Field(default=None, description="source codes mapped through the vocabulary")
     vocabulary: str | None = Field(default=None, description="vocabulary_id of code_column, e.g. ICD10CM, NDC")
+    code_normalization: CodeNormalization | None = Field(
+        default=None, description="lookup-key strategy for code_column (default per vocabulary, see NORMALIZATIONS)"
+    )
     value_column: str | None = None
     unit_concept_id_column: str | None = None
     unit_column: str | None = None
@@ -164,6 +224,8 @@ class EntityMapping(_M):
             raise ValueError("give exactly one of concept_id_column or code_column (+ vocabulary)")
         if self.code_column and not (self.vocabulary and _VOCAB.match(self.vocabulary)):
             raise ValueError("code_column needs a vocabulary id (letters, digits, underscore), e.g. ICD10CM")
+        if self.concept_id_column and (self.vocabulary or self.code_normalization):
+            raise ValueError("vocabulary / code_normalization only apply to code_column")
         if self.date_format and not _DATE_FORMAT.match(self.date_format):
             raise ValueError(f"unsupported date_format {self.date_format!r}")
         if self.unit_column and not self.unit_values:
@@ -291,7 +353,12 @@ def validate_mapping(m: DatasetMapping, schema: Schema, ont: Ontology) -> tuple[
         if em.concept_id_column:
             col(f"{where}.concept_id_column", em.table, em.concept_id_column, ("BIGINT",))
         if em.code_column:
-            col(f"{where}.code_column", em.table, em.code_column, ("VARCHAR", "BIGINT"))
+            ct = col(f"{where}.code_column", em.table, em.code_column, ("VARCHAR", "BIGINT"))
+            if ct == "BIGINT":
+                warnings.append(
+                    f"{where}: {em.table}.{em.code_column} was imported as an integer; codes with leading zeros "
+                    "cannot be recovered (re-import with the column typed VARCHAR)"
+                )
         if ont.entity_has_value(entity):
             if not em.value_column:
                 errors.append(f"{where}: {entity} needs value_column (numeric results)")
@@ -366,11 +433,111 @@ def _lit(v: str) -> str:
 
 
 def _date(expr: str, fmt: str | None) -> str:
+    if fmt and not _DATE_FORMAT.match(fmt):  # enforced by the model; never interpolate anything else
+        raise ValueError("unsafe date format")
     return f"CAST(try_strptime({expr}, '{fmt}') AS DATE)" if fmt else expr
 
 
-def semantic_sql(m: DatasetMapping, stg: str, sem: str, use_person_map: bool, vocab: str = "vocab") -> list[str]:
-    """CREATE statements for the semantic views (idempotent; also run when the profile is activated)."""
+def _vocab_lit(v: str) -> str:
+    if not _VOCAB.match(v):
+        raise ValueError("unsafe vocabulary id")
+    return f"'{v}'"
+
+
+def code_strategies(m: DatasetMapping) -> dict[str, tuple[str, str]]:
+    """entity -> (vocabulary, normalization) for entities mapped through source codes."""
+    return {
+        ent: (e.vocabulary, normalization_for(e.vocabulary, e.code_normalization))
+        for ent, e in sorted(m.entities.items())
+        if e.code_column and e.vocabulary
+    }
+
+
+@dataclass(frozen=True)
+class EntityExprs:
+    """SQL expressions over one staged row (alias t) of an entity table; shared by views and data checks."""
+
+    person: str  # raw person identifier column
+    start: str  # parsed start date (NULL = missing or invalid)
+    start_raw: str
+    end: str
+    end_raw: str | None
+    code_raw: str | None  # raw source code (code mapping only)
+    code_key: str | None  # normalized lookup key (NULL = unrecognized format)
+    code_match: str | None  # join condition against code_map alias c
+    concept_raw: str | None  # concept id column (concept-id mapping only)
+
+
+def entity_exprs(e: EntityMapping, alias: str = "t") -> EntityExprs:
+    a = alias
+    start_raw = f"{a}.{qi(e.start_column)}"
+    start = _date(start_raw, e.date_format)
+    end_raw = f"{a}.{qi(e.end_column)}" if e.end_column else None
+    end = _date(end_raw, e.date_format) if end_raw else start
+    code_raw = code_key = match = concept_raw = None
+    if e.code_column and e.vocabulary:
+        strategy = normalization_for(e.vocabulary, e.code_normalization)
+        code_raw = f"{a}.{qi(e.code_column)}"
+        code_key = normalize_sql(code_raw, strategy)
+        exact = f"CAST({code_raw} AS VARCHAR)" if strategy == "exact" else f"trim(CAST({code_raw} AS VARCHAR))"
+        match = (
+            f"c.vocabulary_id = {_vocab_lit(e.vocabulary)} AND c.strategy = '{strategy}' AND c.code_key = {code_key} "
+            f"AND (NOT c.ambiguous OR c.concept_code = {exact})"
+        )
+    else:
+        concept_raw = f"{a}.{qi(e.concept_id_column or '')}"
+    return EntityExprs(
+        person=f"{a}.{qi(e.person_column)}",
+        start=start,
+        start_raw=start_raw,
+        end=end,
+        end_raw=end_raw,
+        code_raw=code_raw,
+        code_key=code_key,
+        code_match=match,
+        concept_raw=concept_raw,
+    )
+
+
+def code_map_sql(m: DatasetMapping, sem: str, vocab: str = "vocab") -> str | None:
+    """Lookup table (vocabulary_id, strategy, code_key, concept_code, concept_id, ambiguous) for the code
+    systems used. A key produced by more than one distinct vocabulary code is `ambiguous`: it then matches
+    only the exact spelling, so normalization never merges two different vocabulary codes."""
+    pairs = sorted(set(code_strategies(m).values()))
+    if not pairs:
+        return None
+    parts = []
+    for v, strategy in pairs:
+        lit = _vocab_lit(v)
+        parts.append(
+            f"SELECT {lit} AS vocabulary_id, '{strategy}' AS strategy, {normalize_sql('s.concept_code', strategy)} "
+            f"AS code_key, s.concept_code, s.concept_id FROM (SELECT s.concept_code, r.concept_id_2 AS concept_id "
+            f"FROM {vocab}.concept s JOIN {vocab}.concept_relationship r ON r.concept_id_1 = s.concept_id AND "
+            f"r.relationship_id = 'Maps to' AND r.invalid_reason IS NULL WHERE s.vocabulary_id = {lit} "
+            f"UNION SELECT concept_code, concept_id FROM {vocab}.concept WHERE standard_concept = 'S' AND "
+            f"invalid_reason IS NULL AND vocabulary_id = {lit}) s"
+        )
+    union = " UNION ".join(parts)
+    return (
+        f"CREATE OR REPLACE TABLE {qi(sem)}.code_map AS WITH k AS ({union}), "
+        "n AS (SELECT vocabulary_id, strategy, code_key, count(DISTINCT concept_code) AS spellings FROM k "
+        "GROUP BY ALL) SELECT k.*, n.spellings > 1 AS ambiguous FROM k JOIN n USING (vocabulary_id, strategy, "
+        "code_key) WHERE k.code_key IS NOT NULL"
+    )
+
+
+def semantic_sql(
+    m: DatasetMapping,
+    stg: str,
+    sem: str,
+    use_person_map: bool,
+    vocab: str = "vocab",
+    row_ref_tables: set[str] | None = None,
+) -> list[str]:
+    """CREATE statements for the semantic views (idempotent; also run when the profile is activated).
+
+    `row_ref_tables`: staged tables that carry the `_source_row` system column (all, when None; versions
+    staged before it existed get NULL source_row)."""
 
     def pid(alias: str, column: str) -> tuple[str, str]:
         if use_person_map:
@@ -381,17 +548,9 @@ def semantic_sql(m: DatasetMapping, stg: str, sem: str, use_person_map: bool, vo
         return f"{alias}.{qi(column)}", ""
 
     out = [f"CREATE SCHEMA IF NOT EXISTS {qi(sem)}"]
-    vocabs = sorted({e.vocabulary for e in m.entities.values() if e.code_column and e.vocabulary})
-    if vocabs:
-        in_list = ", ".join(f"'{v}'" for v in vocabs)
-        out.append(
-            f"CREATE OR REPLACE TABLE {qi(sem)}.code_map AS "
-            f"SELECT s.vocabulary_id, upper(replace(s.concept_code, '.', '')) AS code, r.concept_id_2 AS concept_id "
-            f"FROM {vocab}.concept s JOIN {vocab}.concept_relationship r ON r.concept_id_1 = s.concept_id "
-            f"AND r.relationship_id = 'Maps to' AND r.invalid_reason IS NULL WHERE s.vocabulary_id IN ({in_list}) "
-            f"UNION SELECT vocabulary_id, upper(replace(concept_code, '.', '')), concept_id FROM {vocab}.concept "
-            f"WHERE standard_concept = 'S' AND invalid_reason IS NULL AND vocabulary_id IN ({in_list})"
-        )
+    cm = code_map_sql(m, sem, vocab)
+    if cm:
+        out.append(cm)
     p = m.person
     person_id, join = pid("t", p.person_column)
     if p.gender_is_concept_id and p.gender_column:
@@ -414,16 +573,17 @@ def semantic_sql(m: DatasetMapping, stg: str, sem: str, use_person_map: bool, vo
     )
     for entity, e in sorted(m.entities.items()):
         person_id, join = pid("t", e.person_column)
-        start = _date(f"t.{qi(e.start_column)}", e.date_format)
-        end = _date(f"t.{qi(e.end_column)}", e.date_format) if e.end_column else start
+        x = entity_exprs(e)
         cmap = ""
-        if e.concept_id_column:
-            concept = f"coalesce(CAST(t.{qi(e.concept_id_column)} AS BIGINT), 0)"
-            source = f"CAST(t.{qi(e.concept_id_column)} AS VARCHAR)"
+        if x.code_raw:
+            cmap = f" LEFT JOIN {qi(sem)}.code_map c ON {x.code_match}"
+            concept = "coalesce(c.concept_id, 0)"
+            source = f"CAST({x.code_raw} AS VARCHAR)"  # exactly as imported
+            key = x.code_key
         else:
-            code = f"upper(replace(CAST(t.{qi(e.code_column or '')} AS VARCHAR), '.', ''))"
-            cmap = f" LEFT JOIN {qi(sem)}.code_map c ON c.vocabulary_id = '{e.vocabulary}' AND c.code = {code}"
-            concept, source = "coalesce(c.concept_id, 0)", code
+            concept = f"coalesce(CAST({x.concept_raw} AS BIGINT), 0)"
+            source, key = f"CAST({x.concept_raw} AS VARCHAR)", "CAST(NULL AS VARCHAR)"
+        row_ref = "t._source_row" if row_ref_tables is None or e.table in row_ref_tables else "CAST(NULL AS BIGINT)"
         extra = ""
         if e.value_column:
             extra += f", CAST(t.{qi(e.value_column)} AS DOUBLE) AS value_as_number"
@@ -436,9 +596,10 @@ def semantic_sql(m: DatasetMapping, stg: str, sem: str, use_person_map: bool, vo
                 extra += ", CAST(NULL AS BIGINT) AS unit_concept_id"
         out.append(
             f"CREATE OR REPLACE VIEW {qi(sem)}.{qi(_view(entity))} AS SELECT {person_id} AS person_id, {concept} AS "
-            f"concept_id, {start} AS start_date, {end} AS end_date{extra}, {source} AS source_value "
+            f"concept_id, {x.start} AS start_date, {x.end} AS end_date{extra}, {source} AS source_value, "
+            f"{key} AS source_code_normalized, '{_tab(e.table)}' AS source_table, {row_ref} AS source_row "
             f"FROM {qi(stg)}.{qi(e.table)} t{join}{cmap} "
-            f"WHERE t.{qi(e.person_column)} IS NOT NULL AND {start} IS NOT NULL"
+            f"WHERE {x.person} IS NOT NULL AND {x.start} IS NOT NULL"
         )
     ob = m.observation
     if ob.mode == "table":
@@ -479,6 +640,7 @@ def build_profile(
     use_person_map: bool,
     ont: Ontology,
     source: dict[str, Any],
+    row_ref_tables: set[str] | None = None,
 ) -> dict[str, Any]:
     """A regular dataset profile (same schema as ontology/datasets/*.yaml) for the mapped import."""
     entities = sorted(m.entities)
@@ -535,5 +697,5 @@ def build_profile(
         },
         "snapshot_sql": f"SELECT '{snapshot}'",
         "mapping": mapping,
-        "setup_sql": semantic_sql(m, stg, sem, use_person_map, ont.vocab_schema()),
+        "setup_sql": semantic_sql(m, stg, sem, use_person_map, ont.vocab_schema(), row_ref_tables),
     }

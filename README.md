@@ -263,12 +263,24 @@ are only staged; register later with `cohort-builder csv map --dataset NAME --ma
   values.
 - **Loading:** rows are streamed in batches with parameterized inserts. SQL never reads the file and no
   file content is executed.
-- **Type inference** (deterministic, documented in `csv_ingest.py`):
-  - plain integers -> BIGINT, except integers with leading zeros, which stay text (codes)
-  - plain decimals -> DOUBLE
-  - ISO dates -> DATE
-  - true/false -> BOOLEAN
-  - anything else -> text; a column with mixed numeric/date values gets a warning
+- **Type inference** (deterministic, documented in `csv_ingest.py`). A value is never altered to fit a
+  type: a column only becomes numeric or a date when **every** value converts exactly.
+  - whole numbers -> BIGINT, except: a leading zero (`00123`), more than 18 digits (beyond exact 64-bit
+    integers), or an identifier/code column name -> exact text
+  - decimals -> DOUBLE, except: more than 15 significant digits (a DOUBLE cannot hold them exactly) or an
+    identifier/code column name (ICD-9 `250.00` keeps its zeros) -> exact text
+  - ISO dates -> DATE; true/false -> BOOLEAN
+  - anything else -> text; a column with mostly numeric or date-like values gets a "mixed values" warning
+  - **Name heuristic (conservative: it can only keep a column as text, never make it numeric):**
+    identifiers are `*_id`, `*_key`, `*identifier`, `mrn`, `npi`, `ssn`, zip/postal codes, or names
+    containing person/patient/subject/member; codes contain code, icd, ndc, cpt, hcpcs, loinc, snomed,
+    rxnorm, atc, drg or revenue. `*concept_id` columns are OMOP concept ids and stay integers.
+  - Each column gets a descriptive **kind**: identifier, code, concept_id, date, quantity (whole
+    numbers), measurement (decimals), flag or text.
+  - **Overrides:** `--type TABLE.COLUMN=TYPE` (ingest), `--type COLUMN=TYPE` (profile), or
+    `column_types` per file in the API. An override is validated like inference (every value must convert
+    exactly, otherwise the import fails with counts, never values) and recorded as `type_source: override`.
+  - Every staged table keeps a `_source_row` column (the CSV line number) for traceability.
 - **Profile:** row count, nulls (count and %), distinct counts, duplicate records, candidate keys and
   duplicate-key warnings, plus *suggested* patient-id, date and code columns. Suggestions are never
   applied automatically.
@@ -287,23 +299,48 @@ are only staged; register later with `cohort-builder csv map --dataset NAME --ma
   - required: `table`, `person_column`, `start_column`
   - optional: `end_column` and `date_format` (for text dates such as `%m/%d/%Y`)
   - concepts: either `concept_id_column` (standard concept ids) or `code_column` + `vocabulary`
-    (`ICD10CM`, `NDC`, `LOINC`, ...), mapped through the vocabulary's "Maps to"
+    (`ICD10CM`, `NDC`, `LOINC`, ...), mapped through the vocabulary's "Maps to", with an optional
+    `code_normalization` (below)
   - Measurement also needs a numeric `value_column`, plus `unit_concept_id_column` or `unit_column` +
     `unit_values`.
 - **`relationships`:** declared joins between tables, checked for existence, type compatibility and
   orphan rows.
 
-The mapping is validated against the **staged** tables (existence, types, dates, numeric values) and then
-against the data. Counts are reported for:
-- usable vs dropped rows
-- rows that don't map to a standard concept
-- patients missing from the person table
-- patients without observation
-- conflicting person records
+**Source-code normalization** (per code system; a string-format lookup key, never a claim that two
+codes are clinically equivalent):
 
-Conflicting person records, entities with no usable rows, and a missing observation definition are
-errors. Entities you don't map are listed as unavailable, so a request for them (e.g. a procedure or a
-lab value) is refused with a message naming the missing data.
+| Strategy | Rule | Default for |
+|---|---|---|
+| `exact` | the stored string as-is (case-sensitive) | — |
+| `trim_upper` | whitespace trimmed, upper case | every other vocabulary (LOINC, CPT4, ...) |
+| `strip_dots` | `trim_upper`, then `.` removed (`E11.9` = `E119`) | ICD10CM, ICD9CM, ICD10, ICD9Proc |
+| `ndc11` | 11 digits as-is; hyphenated 5-4-2, 4-4-2, 5-3-2, 5-4-1 zero-padded to 5-4-2; anything else (e.g. 10 digits without hyphens, which is ambiguous) is *unrecognized* | NDC |
+
+The same rule is applied to the vocabulary's own codes. If one normalized key comes from two different
+vocabulary codes, the key is **ambiguous** and only an exact spelling maps, so normalization never merges
+two codes. Mapping depends on the vocabulary tables loaded in *this* database (`cohort-builder init-demo`
+or `load-athena`); the registration report records each vocabulary's version, or `null` if it isn't
+loaded. Semantic views keep the original code next to the derived meaning: `source_value` (untouched),
+`source_code_normalized`, `source_table` and `source_row`.
+
+**Data-quality report.** The mapping is validated against the **staged** tables (existence, types,
+dates, numeric values) and then against the data. Counts only, never values. For each entity, every
+staged row falls into exactly one of these categories, checked in this order, so they add up:
+`missing_patient_id` -> `missing_start_date` -> `invalid_start_date` -> `usable_rows`.
+Excluded rows are reported whether concepts come from a concept-id column or from source codes. On the
+usable rows:
+- **Concept mapping:** `mapped_rows` + `unmapped_rows` = usable, with `coverage_pct`, `distinct_codes`,
+  `distinct_unmatched_codes`, `missing_code_rows`, `unrecognized_format_rows`, `multi_concept_rows` (one
+  code -> several standard concepts, so `view_rows` can exceed usable), `ambiguous_key_rows`, and
+  `codes_with_several_spellings`. Concept-id columns report unknown and non-standard ids instead.
+- **Other checks:** invalid end dates, end before start, missing values and unrecognized units,
+  patients missing from the person table, patients without observation, excluded observation periods,
+  relationship orphans and conflicting person records.
+
+**Errors** stop registration: conflicting person records, an entity with no usable rows, no usable
+person rows or observation periods. Everything else is a **warning**. The `summary` lists which entities
+have mapped concepts, which have none (criteria on them would find nobody), which are not mapped (criteria
+on them are refused with a message naming the missing data), and the observation limitations.
 
 **Versions and registration.**
 - **Immutable versions:** each import is a new version, staged in its own schema `stg_<dataset>_v<N>`
@@ -311,10 +348,27 @@ lab value) is refused with a message naming the missing data.
   `results`.
 - **No silent overwrite:** importing an existing name requires `--new-version`. Built-in and internal
   names are reserved.
-- **All-or-nothing:** everything runs in one transaction. A failure rolls back all tables and views and
-  is recorded as a `failed` attempt with its problems.
-- **Profile files:** written only after the commit, to the git-ignored `data/datasets/`
-  (`CB_LOCAL_DATASETS_DIR`). `<dataset>.yaml` tracks the latest version; `<dataset>__v<N>.yaml` pins one.
+- **Version numbers** are reserved through a unique `(dataset, version)` index, so concurrent imports
+  can't share one; a failed attempt keeps its number.
+- **All-or-nothing in the database:** staging, mapping and the status change run in one transaction. A
+  failure rolls back all tables and views and is recorded as a `failed` attempt with its problems.
+- **Profile files:** the selectable profile is a file in the git-ignored `data/datasets/`
+  (`CB_LOCAL_DATASETS_DIR`). `<dataset>__v<N>.yaml` pins a version; `<dataset>.yaml` points at the
+  latest *registered* version (registering an older version doesn't move it).
+- **Registration states:** `allocating` -> `staged` -> `profile_pending` -> `registered`, or `failed` /
+  `profile_failed`. A version becomes `registered` only after its profile file was written (temp file +
+  rename) and checked. The complete profile is also stored in the database.
+- **Atomicity limitation:** a database transaction and a file write can't be made atomic together. If the
+  process stops or the file write fails after the commit, the version stays `profile_pending` or
+  `profile_failed` and is **not selectable**. `cohort-builder csv reconcile [DATASET]` (or
+  `POST /datasets/reconcile`, admin) republishes it from the stored profile. It also rewrites missing or
+  modified profile files of registered versions, repairs the latest pointer, marks abandoned `allocating`
+  rows as failed, and removes leftover temp files and generated files of unregistered versions (never
+  files it didn't generate). Run it when no import is in progress.
+- **Activation check:** selecting an imported dataset checks its profile against the database. A profile
+  for a version that isn't `registered` here, whose content hash differs (edited, stale, or from another
+  database), or a `<dataset>.yaml` that isn't the latest registered version is refused with a message
+  pointing to `reconcile`.
 - **Recorded metadata** (`meta.dataset_version`): file names, SHA-256 hashes, row counts, column
   definitions, warnings, the mapping and its hash, the data snapshot id and the software version. The
   snapshot is recorded with every cohort generation.
@@ -322,7 +376,8 @@ lab value) is refused with a message naming the missing data.
 **API.** Remote callers send CSV **content** in the JSON body, capped at 5 MB per file. Server paths are
 never accepted, and file names must be bare names.
 - `POST /datasets/csv/profile` (author): in-memory preview; nothing is stored.
-- `POST /datasets/{name}/ingest` (admin): new version; audited.
+- `POST /datasets/{name}/ingest` (admin): new version; audited. Optional `column_types` per file.
+- `POST /datasets/reconcile` (admin): repair profile files after an interrupted import; audited.
 - `GET /datasets`, `/datasets/{name}`, `/datasets/{name}/versions/{v}` (any role): metadata only.
 
 A dataset imported over the API is selected the same way, by starting the server or CLI with
@@ -340,6 +395,9 @@ A dataset imported over the API is selected the same way, by starting the server
 - **Real data stays out of the repository.** Use synthetic files to try the feature. Reports, logs,
   audit entries and profiles carry counts and column names only, never cell values. Imported data stays
   in your local database, which you must protect like any copy of patient data.
+
+How imported data is layered (raw staging vs. normalized views, provenance) and what later treatment
+analytics can build on is described in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Moving to real data
 
@@ -699,7 +757,7 @@ src/cohort_builder/
   metrics.py         sensitivity/specificity/PPV/NPV/F1 + Wilson intervals (single implementation)
   csv_ingest.py      CSV checks, streaming load, type inference, profiling (no LLM)
   dataset_mapping.py validated source-to-ontology mapping -> semantic views + dataset profile
-  dataset_registry.py  imported dataset versions, staging, registration, rollback
+  dataset_registry.py  imported dataset versions, staging, registration states, data checks, reconcile
   executor.py        runs SQL, small-cell suppression, results tables
   llm.py             Anthropic client, request hashing, cache/replay
   agents/            intent parser, concept resolver, critic, proxy parser (LLM); composer, validators,

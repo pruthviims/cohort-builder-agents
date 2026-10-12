@@ -78,7 +78,27 @@ per-patient explanations.
 
 Imported datasets: any role lists dataset metadata (`GET /datasets...`, no cell values); authors preview a CSV
 in memory (`POST /datasets/csv/profile`, nothing stored); only admins ingest (`POST /datasets/{name}/ingest`),
-which sends CSV content in the body (size-capped, bare file names only; server paths are never accepted).
+which sends CSV content in the body (size-capped, bare file names only; server paths are never accepted). Only
+admins run `POST /datasets/reconcile`.
+
+CSV ingestion path (reviewed end to end):
+- **Limits:** file size (`CB_INGEST_MAX_BYTES`, API 5 MB per file and 20 files), 500 columns, at most
+  2,000 type overrides, 20 reported row errors.
+- **Encoding and rows:** strict UTF-8; malformed rows fail the import with line numbers, never values.
+- **Names:** headers are normalized and checked (duplicates and unusable names refused); table, dataset
+  and column names match strict patterns and are always quoted. Names starting with `_` are reserved for
+  system columns (`_source_row`), and built-in and internal schema names are reserved.
+- **Paths:** the API accepts content only, never server paths; uploaded file names must be bare names.
+- **SQL:** CSV values are inserted with parameters and never executed. Mapping files are parsed strictly
+  (duplicate keys and unknown fields refused), and only validated identifiers, integers and filtered
+  literals (vocabulary ids, date formats, unit and gender values) reach generated SQL.
+- **Concurrency:** version numbers are allocated through a unique `(dataset, version)` index.
+- **Failures:** the database part rolls back; temp profile files are removed; the database/file gap is
+  handled by registration states, an activation check and `reconcile` (see README, "Versions and
+  registration").
+- **Errors and audit:** messages, audit details (`dataset.ingest`, `dataset.register`, `dataset.reconcile`)
+  and reports carry counts, codes, column names and hashes only. Unmatched source codes are reported as
+  counts, never listed.
 
 How the rules are enforced:
 

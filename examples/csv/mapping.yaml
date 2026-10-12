@@ -33,6 +33,7 @@ entities:
     date_format: "%m/%d/%Y"          # text dates in US format
     code_column: ndc
     vocabulary: NDC
+    # code_normalization: ndc11      # default for NDC (hyphenated 4-4-2/5-3-2/5-4-1 padded to 11 digits)
   Measurement:
     table: labs
     person_column: patient_id
