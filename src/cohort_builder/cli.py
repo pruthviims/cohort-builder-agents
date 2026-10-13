@@ -99,6 +99,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Run when no import is in progress. Uses only what the database recorded; never re-reads CSVs.",
     )
     t.add_argument("dataset", nargs="?", help="one dataset (default: all imported datasets)")
+    t.add_argument(
+        "--abandoned-after-minutes",
+        type=int,
+        default=60,
+        help="treat unfinished imports and temp files older than this as abandoned (default 60; 0 = all)",
+    )
     t.add_argument("--user", default="cli")
 
     s = sub.add_parser("init-demo", help="create the demo vocabulary and synthetic patients")
@@ -490,7 +496,7 @@ def _csv(settings: Settings, a) -> int:
             elif a.csv_cmd == "info":
                 _print(reg.info(a.dataset))
             elif a.csv_cmd == "reconcile":
-                result = reg.reconcile(a.user, a.dataset)
+                result = reg.reconcile(a.user, a.dataset, a.abandoned_after_minutes)
                 _print(result)
                 return 1 if result["problems"] else 0
         except IngestError as exc:

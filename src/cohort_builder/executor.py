@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import duckdb
 
 from .compiler import CompiledCohort
+from .db import redact_error
 from .proxy_compiler import CompiledProxy
 
 log = logging.getLogger(__name__)
@@ -140,8 +141,8 @@ class Executor:
             raise QueryTimeout(f"cohort query exceeded the {self.timeout:g}s time limit and was cancelled") from exc
         except duckdb.Error as exc:
             error_id = str(uuid.uuid4())[:8]
-            # full detail (may include SQL fragments) goes to the server log only
-            log.error("cohort query failed [%s]: %s: %s", error_id, type(exc).__name__, exc)
+            # detail goes to the server log only, with quoted literals (possibly data values) redacted
+            log.error("cohort query failed [%s]: %s", error_id, redact_error(exc))
             raise ExecutionError(f"cohort query failed (error id {error_id})", error_id) from exc
         finally:
             if timer:

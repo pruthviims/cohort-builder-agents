@@ -83,14 +83,17 @@ admins run `POST /datasets/reconcile`.
 
 CSV ingestion path (reviewed end to end):
 - **Limits:** file size (`CB_INGEST_MAX_BYTES`, API 5 MB per file and 20 files), 500 columns, at most
-  2,000 type overrides, 20 reported row errors.
-- **Encoding and rows:** strict UTF-8; malformed rows fail the import with line numbers, never values.
+  2,000 type overrides, 20 reported row errors, 200,000-character mapping files. Every API request body
+  is capped by `CB_API_MAX_BODY_BYTES` (default 128 MiB, `413`) *before* authentication, because the
+  framework buffers the body before the token is checked.
+- **Encoding and rows:** strict UTF-8, no NUL bytes; malformed rows fail the import with line numbers, never
+  values.
 - **Names:** headers are normalized and checked (duplicates and unusable names refused); table, dataset
   and column names match strict patterns and are always quoted. Names starting with `_` are reserved for
   system columns (`_source_row`), and built-in and internal schema names are reserved.
 - **Paths:** the API accepts content only, never server paths; uploaded file names must be bare names.
 - **SQL:** CSV values are inserted with parameters and never executed. Mapping files are parsed strictly
-  (duplicate keys and unknown fields refused), and only validated identifiers, integers and filtered
+  (duplicate keys, YAML anchors/aliases and unknown fields refused), and only validated identifiers, integers and filtered
   literals (vocabulary ids, date formats, unit and gender values) reach generated SQL.
 - **Concurrency:** version numbers are allocated through a unique `(dataset, version)` index.
 - **Failures:** the database part rolls back; temp profile files are removed; the database/file gap is
@@ -98,7 +101,11 @@ CSV ingestion path (reviewed end to end):
   registration").
 - **Errors and audit:** messages, audit details (`dataset.ingest`, `dataset.register`, `dataset.reconcile`)
   and reports carry counts, codes, column names and hashes only. Unmatched source codes are reported as
-  counts, never listed.
+  counts, never listed. Database error messages can quote the offending value (e.g. a failed conversion),
+  so the executor and the API's unhandled-error handler log them with every quoted literal redacted.
+- **Tenancy:** imported datasets are server-level resources, like the active dataset: dataset metadata
+  (`GET /datasets...`: names, versions, column names, counts, the importing admin's subject) is visible to
+  every authenticated role in every tenant. Cohort definitions, runs and results stay tenant-scoped.
 
 How the rules are enforced:
 

@@ -297,6 +297,11 @@ def validate_mapping(m: DatasetMapping, schema: Schema, ont: Ontology) -> tuple[
         t = col(where, table, column)
         if t is None:
             return
+        if fmt and "%y" in fmt:
+            warnings.append(
+                f"{where}: date_format uses %y (two-digit year): 00-68 are read as 2000-2068 and 69-99 as "
+                "1969-1999, which is wrong for many birth dates; prefer four-digit years"
+            )
         if fmt and t != "VARCHAR":
             errors.append(f"{where}: date_format only applies to text columns ({table}.{column} is {t})")
         elif not fmt and t != "DATE":
