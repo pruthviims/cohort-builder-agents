@@ -30,6 +30,11 @@ Proxy (indirect) cohort algorithms, same governance (see README "Proxy cohorts")
   POST /proxy-references                                                admin (external reference labels)
   GET  /proxy-cohorts/{id}/patients/{subject_id}/explanation            admin AND CB_ALLOW_PATIENT_LEVEL=true
 
+Treatment events and episodes (aggregate + suppressed unless stated):
+  POST /treatment-runs                                                  executor (rule set by name or inline YAML)
+  GET  /treatment-runs/{run_id}                                         executor or reviewer (own tenant)
+  GET  /treatment-runs/{run_id}/episodes/{episode_id}/explanation       admin AND CB_ALLOW_PATIENT_LEVEL=true
+
 Imported datasets (CSV; content is sent in the request body, never a server path; size-capped):
   GET  /datasets, /datasets/{name}, /datasets/{name}/versions/{version}  any role (metadata, no row values)
   POST /datasets/csv/profile                                            author (in-memory preview, nothing stored)
@@ -169,6 +174,17 @@ class CsvIngestRequest(_Strict):
     new_version: bool = False
     dry_run: bool = False
     null_values: list[str] = Field(default_factory=list, max_length=10)
+
+
+class TreatmentRunRequest(_Strict):
+    rule_set: str | None = Field(default=None, max_length=48, pattern=r"^[a-z][a-z0-9_]{0,47}$")
+    rules_yaml: str | None = Field(default=None, max_length=200_000)
+
+    @model_validator(mode="after")
+    def _one(self) -> TreatmentRunRequest:
+        if (self.rule_set is None) == (self.rules_yaml is None):
+            raise ValueError("give rule_set (a configured rule set name) or rules_yaml, not both")
+        return self
 
 
 class AskRequest(_Strict):
@@ -621,6 +637,48 @@ def create_app(
         return proxy_call(
             lambda: b().patient_explanation(def_id, subject_id, p.subject, p.is_admin, scope(p), generation_id),
             def_id,
+        )
+
+    # ---- treatment events / episodes ------------------------------------------------------------
+    def treatment_call(fn: Callable[[], Any]) -> Any:
+        with lock:
+            try:
+                return fn()
+            except KeyError as exc:
+                raise HTTPException(404, str(exc).strip("'\"")) from exc
+            except ValidationError as exc:
+                raise HTTPException(422, f"invalid rule set: {exc.error_count()} problem(s)") from exc
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/treatment-runs")
+    def treatment_run(req: TreatmentRunRequest, p: Principal = Depends(need_executor)) -> dict:
+        from .treatment_config import load_rules
+        from .treatment_service import TreatmentService, resolve_rules
+
+        def go() -> Any:
+            bb = b()
+            rules = (
+                load_rules(req.rules_yaml)
+                if req.rules_yaml
+                else resolve_rules(bb.settings.ontology_dir, req.rule_set or "")
+            )
+            return TreatmentService(bb).run(rules, p.subject, p.tenant)
+
+        return treatment_call(go)
+
+    @app.get("/treatment-runs/{run_id}")
+    def treatment_summary(run_id: str, p: Principal = Depends(need_results)) -> dict:
+        from .treatment_service import TreatmentService
+
+        return treatment_call(lambda: TreatmentService(b()).summary(run_id, scope(p)))
+
+    @app.get("/treatment-runs/{run_id}/episodes/{episode_id}/explanation")
+    def treatment_explain(run_id: str, episode_id: str, p: Principal = Depends(need_admin)) -> dict:
+        from .treatment_service import TreatmentService
+
+        return treatment_call(
+            lambda: TreatmentService(b()).explain_episode(run_id, episode_id, p.subject, p.is_admin, scope(p))
         )
 
     # ---- imported datasets (CSV) --------------------------------------------------------------

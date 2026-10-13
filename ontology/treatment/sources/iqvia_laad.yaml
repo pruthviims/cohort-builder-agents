@@ -1,0 +1,34 @@
+# Treatment-event sources for the LAAD-style synthetic claims (placeholder table/column names, like the
+# dataset profile ontology/datasets/iqvia_laad.yaml). Only MEDICATION evidence is listed here; diagnosis
+# claims are never treatment sources.
+config_version: 1
+dataset: iqvia_laad
+description: Pharmacy transactions (dispensing) and medical procedure lines (drug administration only when the code maps to a drug).
+sources:
+  - name: pharmacy
+    table: laad.rx_claims
+    person_column: patient_id
+    record_id_column: claim_id
+    start_column: svc_dt
+    start_date_source: fill_date          # the dispensing date, not a date of ingestion
+    days_supply_column: days_supply
+    quantity_column: quantity
+    evidence_type: dispensing             # a paid pharmacy claim shows the drug was dispensed, not taken
+    code_column: ndc
+    vocabulary: NDC                        # ndc11 normalization (default for NDC)
+    status:
+      column: txn_type
+      values: {PAID: paid, REJECTED: rejected, REVERSAL: reversal}
+      reference_column: orig_claim_id      # a REVERSAL row cancels the paid claim it references
+  - name: medical
+    table: laad.px_claims
+    person_column: patient_id
+    record_id_column: claim_id
+    start_column: svc_dt
+    start_date_source: service_date
+    evidence_type: administration          # billed administration (e.g. HCPCS J-codes); CPT procedures map to
+    code_column: px_code                   # non-drug concepts and are counted as excluded, never as treatment
+    code_type_column: px_code_type
+    code_type_values: {CPT: CPT4, HCPCS: HCPCS}
+notes:
+  - Medical lines carry no adjudication status in this layout (claim status 'not_applicable').

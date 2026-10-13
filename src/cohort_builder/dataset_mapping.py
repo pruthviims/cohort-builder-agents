@@ -504,16 +504,16 @@ def entity_exprs(e: EntityMapping, alias: str = "t") -> EntityExprs:
     )
 
 
-def code_map_sql(m: DatasetMapping, sem: str, vocab: str = "vocab") -> str | None:
-    """Lookup table (vocabulary_id, strategy, code_key, concept_code, concept_id, ambiguous) for the code
-    systems used. A key produced by more than one distinct vocabulary code is `ambiguous`: it then matches
-    only the exact spelling, so normalization never merges two different vocabulary codes."""
-    pairs = sorted(set(code_strategies(m).values()))
-    if not pairs:
-        return None
+def code_lookup_sql(pairs: list[tuple[str, str]], target: str, vocab: str = "vocab", temp: bool = False) -> str:
+    """CREATE statement for a lookup table (vocabulary_id, strategy, code_key, concept_code, concept_id,
+    ambiguous) for the given (vocabulary, normalization) pairs. A key produced by more than one distinct
+    vocabulary code is `ambiguous`: it then matches only the exact spelling, so normalization never merges
+    two different vocabulary codes. `target` must be an already-quoted / validated table name."""
     parts = []
-    for v, strategy in pairs:
+    for v, strategy in sorted(set(pairs)):
         lit = _vocab_lit(v)
+        if strategy not in NORMALIZATIONS:
+            raise ValueError(f"unknown code normalization {strategy!r}")
         parts.append(
             f"SELECT {lit} AS vocabulary_id, '{strategy}' AS strategy, {normalize_sql('s.concept_code', strategy)} "
             f"AS code_key, s.concept_code, s.concept_id FROM (SELECT s.concept_code, r.concept_id_2 AS concept_id "
@@ -524,11 +524,17 @@ def code_map_sql(m: DatasetMapping, sem: str, vocab: str = "vocab") -> str | Non
         )
     union = " UNION ".join(parts)
     return (
-        f"CREATE OR REPLACE TABLE {qi(sem)}.code_map AS WITH k AS ({union}), "
+        f"CREATE OR REPLACE {'TEMP ' if temp else ''}TABLE {target} AS WITH k AS ({union}), "
         "n AS (SELECT vocabulary_id, strategy, code_key, count(DISTINCT concept_code) AS spellings FROM k "
         "GROUP BY ALL) SELECT k.*, n.spellings > 1 AS ambiguous FROM k JOIN n USING (vocabulary_id, strategy, "
         "code_key) WHERE k.code_key IS NOT NULL"
     )
+
+
+def code_map_sql(m: DatasetMapping, sem: str, vocab: str = "vocab") -> str | None:
+    """The semantic schema's code_map for the code systems a mapping uses (see code_lookup_sql)."""
+    pairs = sorted(set(code_strategies(m).values()))
+    return code_lookup_sql(pairs, f"{qi(sem)}.code_map", vocab) if pairs else None
 
 
 def semantic_sql(

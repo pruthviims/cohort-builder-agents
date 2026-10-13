@@ -75,6 +75,23 @@ CREATE TABLE IF NOT EXISTS results.proxy_evidence (
 CREATE TABLE IF NOT EXISTS results.cohort_inclusion_stats (
   generation_id VARCHAR, cohort_definition_id BIGINT, rule_sequence INTEGER,
   rule_name VARCHAR, remaining_count BIGINT);
+-- treatment-event engine (patient-level; returned only with explicit patient-level authorization)
+CREATE TABLE IF NOT EXISTS results.treatment_event (
+  run_id VARCHAR, event_id VARCHAR, person_id BIGINT, dataset VARCHAR, source_name VARCHAR,
+  source_table VARCHAR, source_record_id VARCHAR, source_code VARCHAR, source_vocabulary VARCHAR,
+  product_concept_id BIGINT, ingredient_concept_id BIGINT, brand_concept_id BIGINT, drug_group VARCHAR,
+  n_ingredients INTEGER, evidence_type VARCHAR, claim_status VARCHAR, start_date DATE, start_date_source VARCHAR,
+  end_date DATE, end_date_source VARCHAR, days_supply INTEGER, days_supply_source VARCHAR, quantity DOUBLE,
+  evidence_status VARCHAR, quality_flags VARCHAR, included BOOLEAN, exclusion_reason VARCHAR,
+  episode_step VARCHAR, coverage_start DATE, coverage_end DATE, shifted_days INTEGER, episode_id VARCHAR);
+CREATE TABLE IF NOT EXISTS results.treatment_episode (
+  run_id VARCHAR, episode_id VARCHAR, person_id BIGINT, drug_group VARCHAR, episode_start DATE,
+  episode_end DATE, n_events INTEGER, days_supplied INTEGER, gap_days_bridged INTEGER, max_gap_days INTEGER,
+  n_products INTEGER, left_censored BOOLEAN, right_censored BOOLEAN, end_reason VARCHAR,
+  observation_start DATE, observation_end DATE);
+CREATE TABLE IF NOT EXISTS results.treatment_transition (
+  run_id VARCHAR, person_id BIGINT, kind VARCHAR, from_episode VARCHAR, to_episode VARCHAR,
+  from_group VARCHAR, to_group VARCHAR, on_date DATE, days INTEGER, basis VARCHAR);
 """
 
 

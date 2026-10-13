@@ -1,0 +1,22 @@
+# Treatment-event sources for OMOP CDM drug_exposure. The evidence type comes from drug_type_concept_id;
+# type concepts not listed below (e.g. 32817 'EHR') give evidence type 'unknown' - never guessed.
+# Verify the type concept ids against the vocabulary version you load.
+config_version: 1
+dataset: omop_demo
+description: OMOP drug_exposure records (standard drug concepts already mapped).
+sources:
+  - name: drug_exposure
+    table: cdm.drug_exposure
+    person_column: person_id
+    record_id_column: drug_exposure_id
+    start_column: drug_exposure_start_date
+    start_date_source: start_date
+    end_column: drug_exposure_end_date
+    days_supply_column: days_supply
+    concept_column: drug_concept_id
+    evidence_type_column: drug_type_concept_id
+    evidence_type_values:
+      "32869": dispensing       # Pharmacy claim
+      "32825": dispensing       # EHR dispensing record
+      "32838": prescription     # EHR prescription
+      "32818": administration   # EHR administration record

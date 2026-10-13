@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS meta.dataset_version (
   files_json VARCHAR, mapping_json VARCHAR, mapping_hash VARCHAR, validation_json VARCHAR, profile_hash VARCHAR,
   snapshot VARCHAR, software_version VARCHAR, errors_json VARCHAR);
 ALTER TABLE meta.dataset_version ADD COLUMN IF NOT EXISTS profile_json VARCHAR;
+CREATE TABLE IF NOT EXISTS meta.treatment_run (
+  run_id VARCHAR PRIMARY KEY, dataset VARCHAR, tenant VARCHAR, created_by VARCHAR, created_at TIMESTAMP,
+  status VARCHAR, event_schema VARCHAR, rule_set_name VARCHAR, rule_set_version VARCHAR, rule_set_hash VARCHAR,
+  rule_set_json VARCHAR, source_config_hash VARCHAR, source_config_json VARCHAR, data_snapshot VARCHAR,
+  software_version VARCHAR, output_hash VARCHAR, summary_json VARCHAR, errors_json VARCHAR);
 CREATE TABLE IF NOT EXISTS meta.audit_event (
   event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
   resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);

@@ -76,6 +76,11 @@ the token, recorded once); admins
 load reference-standard labels (`/proxy-references`) and, only when `CB_ALLOW_PATIENT_LEVEL=true`, read
 per-patient explanations.
 
+Treatment runs: executors start runs (`POST /treatment-runs`, a configured rule set or inline YAML that is
+validated like a file; dataset source configs come only from the server's `ontology/treatment/sources`);
+executors and reviewers read aggregate, suppressed summaries in their own tenant; per-episode explanations
+(source events, dates, record ids) need an admin principal AND `CB_ALLOW_PATIENT_LEVEL=true` and are audited.
+
 Imported datasets: any role lists dataset metadata (`GET /datasets...`, no cell values); authors preview a CSV
 in memory (`POST /datasets/csv/profile`, nothing stored); only admins ingest (`POST /datasets/{name}/ingest`),
 which sends CSV content in the body (size-capped, bare file names only; server paths are never accepted). Only

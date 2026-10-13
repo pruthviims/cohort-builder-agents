@@ -1,0 +1,33 @@
+# EXAMPLE rule set (illustrative, not clinically validated). The engine is disease-independent: every
+# assumption below is a parameter of this use case, recorded with each run through its content hash.
+rule_set_version: 1
+name: glucose_lowering_example
+version: "1.0.0"
+description: Metformin and SGLT2 inhibitor treatment episodes (example for the synthetic demo data).
+drug_groups:
+  metformin:
+    concepts: [1503297]                       # metformin (RxNorm ingredient); all products containing it
+  sglt2_inhibitors:
+    concepts: [45775965, 44785829, 43526465]  # empagliflozin, dapagliflozin, canagliflozin
+    max_gap_days: 60
+    justification: illustrative per-class override
+include_claim_status: [paid, not_applicable]  # rejected / reversed / unknown-status claims never count
+include_evidence_types: [dispensing, administration, prescription, unknown]  # omop_demo types are 'EHR' only
+days_supply:
+  missing: exclude                            # no assumed supply: such records are excluded and counted
+  min_valid: 1
+  max_valid: 365                              # outside 1..365 is treated as missing (and counted)
+episode:
+  max_gap_days: 45                            # uncovered days allowed between fills inside one episode
+  overlap: shift_forward                      # early refills carry remaining supply forward ...
+  max_carryover_days: 90                      # ... capped at 90 days
+  same_day_same_group: max_supply             # two products of one group on one day: the longer supply counts
+  duplicates: same_product_same_day           # same product, same day, same supply from two records = duplicate
+censoring:
+  observation: dataset                        # observation periods of the active dataset profile
+  washout_days: 180                           # an episode starting < 180 days after observation start may have started earlier
+transitions:
+  add_on_min_overlap_days: 30
+  switch_window_days: 90
+notes:
+  - Transition labels (switch, add_on, restart, discontinuation) are evidence patterns in claims, not clinical facts.

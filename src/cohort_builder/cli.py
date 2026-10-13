@@ -167,6 +167,22 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--expires-days", type=int, default=90, help="0 = no expiry (not recommended)")
     t.add_argument("--id", dest="token_id", help="label shown in audit records (default: subject + random)")
     t.add_argument("--tokens-file", type=Path, help="append the hashed entry to this token file (created 0600)")
+    s = sub.add_parser(
+        "treatment",
+        help="treatment events, episodes and transition evidence (configurable rule sets; aggregate output)",
+    )
+    tx = s.add_subparsers(dest="treatment_cmd", required=True)
+    t = tx.add_parser("run", help="build events and episodes for the active dataset with a rule set")
+    t.add_argument("--rules", required=True, help="rule set name (ontology/treatment/rules) or a YAML file path")
+    t.add_argument("--sources", type=Path, help="treatment source config (default: ontology/treatment/sources)")
+    t.add_argument("--user", default="cli")
+    t = tx.add_parser("summary", help="provenance and suppressed aggregate summary of a run")
+    t.add_argument("run_id")
+    t = tx.add_parser("explain", help="one episode with its source events and rules (needs CB_ALLOW_PATIENT_LEVEL)")
+    t.add_argument("run_id")
+    t.add_argument("episode_id")
+    t.add_argument("--user", default="cli")
+
     s = sub.add_parser("proxy", help="proxy (indirect) identification algorithms, e.g. for rare diseases")
     px = s.add_subparsers(dest="proxy_cmd", required=True)
     for name, hlp in (
@@ -338,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
     b = _builder(settings)
     if a.cmd == "proxy":
         return _proxy(b, a)
+    if a.cmd == "treatment":
+        return _treatment(b, a)
     if a.cmd == "ask":
         r = b.ask(a.query, a.user)
         if a.json:
@@ -513,6 +531,27 @@ def _csv(settings: Settings, a) -> int:
             return 1
     finally:
         con.close()
+    return 0
+
+
+def _treatment(b, a) -> int:
+    from .security import GovernanceError
+    from .treatment_config import load_sources
+    from .treatment_service import TreatmentService, resolve_rules
+
+    svc = TreatmentService(b)
+    try:
+        if a.treatment_cmd == "run":
+            rules = resolve_rules(b.settings.ontology_dir, a.rules)
+            sources = load_sources(a.sources.read_text()) if a.sources else None
+            _print(svc.run(rules, a.user, None, sources))
+        elif a.treatment_cmd == "summary":
+            _print(svc.summary(a.run_id, None))
+        elif a.treatment_cmd == "explain":
+            # the CLI runs with direct database access (operator = admin); the policy flag still applies
+            _print(svc.explain_episode(a.run_id, a.episode_id, a.user, True, None))
+    except (GovernanceError, ValueError, KeyError) as exc:
+        sys.exit(f"refused: {str(exc).strip(chr(39))}")
     return 0
 
 

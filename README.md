@@ -405,6 +405,80 @@ A dataset imported over the API is selected the same way, by starting the server
 How imported data is layered (raw staging vs. normalized views, provenance) and what later treatment
 analytics can build on is described in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Treatment events and episodes
+
+A deterministic engine turns medication records into **canonical treatment events**, then **episodes**
+and **transition evidence** (switch, add-on, restart, discontinuation). It is the foundation for later
+brand-switch, line-of-therapy, persistence and adherence modules. It is disease-independent: all
+assumptions live in versioned configuration, and every run records which configuration produced it.
+
+```bash
+cohort-builder --dataset iqvia_laad treatment run --rules glucose_lowering_example
+cohort-builder treatment summary RUN_ID                    # provenance + suppressed aggregate counts
+cohort-builder treatment explain RUN_ID EPISODE_ID         # patient-level: needs CB_ALLOW_PATIENT_LEVEL=true
+```
+
+**Two configuration files** (strict YAML, validated, content-hashed):
+- **Treatment sources**, one per dataset: `ontology/treatment/sources/<dataset>.yaml`. Shipped for
+  `iqvia_laad` and `omop_demo`. Each source names a table and its columns:
+  - patient, record id, start date and which date it is (`fill_date`, `service_date`, ...)
+  - days supply, quantity, end date (optional)
+  - the drug: a standard concept column, or a code column with a vocabulary (or a per-row code-type
+    column such as CPT/HCPCS)
+  - the claim status column and value map, with the column that links reversals/adjustments to the
+    claim they act on
+  - the **evidence type**: `dispensing`, `administration` or `prescription`, fixed or from a per-row
+    value map; unlisted values are `unknown`. It is never guessed: a pharmacy claim shows dispensing, not
+    ingestion, and a medical claim shows billed administration.
+- **Rule set**, one per analytics use case: `ontology/treatment/rules/<name>.yaml` (example:
+  `glucose_lowering_example`). It defines:
+  - drug groups (ingredients or classes, expanded through the vocabulary hierarchy)
+  - which claim statuses and evidence types count
+  - days-supply validity and what to do when it is missing (exclude, or assume N days per evidence type)
+  - duplicate and same-day handling, overlap (shift early refills forward with a carry-over cap, or
+    ignore), the allowed gap (with per-group overrides)
+  - censoring (observation periods, washout) and transition windows
+  There are no built-in thresholds: every number is written in the rule file.
+
+**Canonical event** (`results.treatment_event`, schema `treatment_event/1`): one row per source record x
+ingredient. Each row keeps its provenance (dataset, source, table, record id, original code), the product,
+ingredient, brand (when the vocabulary has one) and drug group, the evidence type and claim status, the
+start date and its source, the end date and days supply with their source (`recorded`, `from_end_date`,
+`assumed`, `missing`), an evidence status (`observed`, `inferred`, `unknown`) and quality flags. **Every**
+record gets a row: included, or excluded with one reason, checked in this order:
+- missing record id, patient or start date; implausible start date
+- reversal transaction, rejected, reversed or superseded claim; claim status or evidence type not counted
+- unmapped code; code maps to a non-drug concept (a CPT procedure or a diagnosis never becomes a
+  medication event); no ingredient; not in a drug group or in more than one
+- no usable duration; duplicate record (same record id repeated); duplicate event (episode rules)
+
+**Episodes and transitions** (`results.treatment_episode`, `results.treatment_transition`): computed per
+person and drug group by pure, ordered Python (`treatment_episodes.py`). Each event records the step
+that used it (`counted`, `same_day_merged`, `duplicate_event`), its coverage dates and any shift.
+- **Censoring:** an episode starting less than `washout_days` after its observation period starts is
+  left-censored. One whose end plus the allowed gap reaches the period end is right-censored, and its end
+  status is `unknown_after_censoring`, not a discontinuation. A missing record is never read as evidence
+  that treatment stopped while the patient was not observable.
+- **Transitions are evidence patterns, not clinical facts:** `restart`, `discontinuation`, `add_on`
+  (overlap >= the configured days), `switch` (next group within the window), `concurrent_start`.
+
+**Provenance and reproducibility:** `meta.treatment_run` stores the dataset, the data snapshot, both
+configurations (JSON and hash), the event schema, the software version, the actor and tenant, and an
+`output_hash` over every derived row. Re-running with the same inputs gives the same hash.
+
+**Access:** run summaries are aggregate and small-cell suppressed (exclusion reasons, quality flags,
+unmatched codes, episodes and censoring per group, transition counts by group pair; medians only for
+groups of at least the minimum cell count).
+- `POST /treatment-runs` (executor): a configured rule set by name, or inline YAML.
+- `GET /treatment-runs/{id}` (executor or reviewer): only within the caller's own tenant.
+- `GET /treatment-runs/{id}/episodes/{episode_id}/explanation` (admin, and `CB_ALLOW_PATIENT_LEVEL=true`):
+  one episode with its source events, rule parameters and transitions. Every access is audited.
+
+**Not implemented yet:** brand-switch matrices, line-of-therapy rules, persistence/adherence (PDC/MPR),
+an approval workflow for rule sets, and day-level dose or strength normalization. Episode building runs
+in Python per patient, which is fine for demo-size data but should move to set-based SQL for very large
+claims extracts.
+
 ## Moving to real data
 
 - **Vocabulary:** download the vocabularies from [OHDSI Athena](https://athena.ohdsi.org) and run `cohort-builder load-athena /path/to/athena`. This replaces the demo vocabulary.
@@ -766,6 +840,7 @@ src/cohort_builder/
   dataset_mapping.py validated source-to-ontology mapping -> semantic views + dataset profile
   dataset_registry.py  imported dataset versions, staging, registration states, data checks, reconcile
   executor.py        runs SQL, small-cell suppression, results tables
+  treatment_*.py     treatment events (config, event SQL, episodes, service): see "Treatment events"
   llm.py             Anthropic client, request hashing, cache/replay
   agents/            intent parser, concept resolver, critic, proxy parser (LLM); composer, validators,
                      explainers (code)
