@@ -65,6 +65,39 @@ which is why S3 and S4 show temp usage.
 - S2 with batch sizes 100,000 and 10,000;
 - S1–S3 before and after person bucketing (1 bucket vs 3 at S3).
 
+## Reliability / claims-normalization changes (`main` `8285424` vs this branch)
+
+Same machine and settings, the same generated database for both sides, runs alternated (before, after,
+before, after), each in a fresh process. "After" includes the new claims consistency checks (reference
+scope, conflicting duplicates, reversal ordering, quantity), the input fingerprint (one extra scan of the
+source tables) and the per-run connection. S4 was not repeated.
+
+| Workload | Before: total (2 runs) | After: total (2 runs) | Events phase before / after | Peak RSS before / after | Peak DuckDB temp before / after | Output hash |
+|---|---|---|---|---|---|---|
+| S1 | 4.12 s, 4.10 s | 4.60 s, 4.27 s | 0.77, 0.73 / 0.80, 0.76 s | 474–490 / 468–472 MB | 0 / 0 | identical |
+| S2 | 34.3 s, 36.3 s | 37.4 s, 37.4 s | 7.0, 7.2 / 8.4, 8.1 s | 1,372–1,378 / 1,362–1,391 MB | 0 / 0 | identical |
+| S3 | 258.3 s, 256.8 s | 271.9 s, 261.8 s | 43.9, 43.9 / 53.6, 52.4 s | 4,402–4,442 / 4,351–4,377 MB | 1,173–1,188 / 1,753–1,775 MB | identical |
+
+**Result: no speed-up.** This change is about correctness and operability, and it costs 2–6% of wall time
+(S3: +10 s, almost all in the events phase, where the new consistency CTEs run). The events phase also
+spills about 0.6 GB more at S3. Output hashes are identical on this workload, because it contains none
+of the patterns the new flags detect.
+
+**10,000 synthetic T2D patients** (`init-t2d-demo --patients 10000 --seed 2026`: 292,130 pharmacy rows,
+164,423 diagnosis rows; 297,240 events, 13,247 episodes, 4,972 transitions), CLI end to end with
+`CB_DUCKDB_MEMORY_LIMIT=4GB`, `CB_DUCKDB_THREADS=2`:
+
+| | Run 1 | Run 2 | Peak RSS |
+|---|---|---|---|
+| Before (`8285424`) | 6.7 s | 6.1 s | 524–529 MB |
+| After (this branch) | 6.9 s | 6.4 s | 523–529 MB |
+
+Generating that database took 8.3 s (peak RSS 381 MB). Before and after differ in output hash on this
+data. `diff_runs` on both runs over the same database shows that episodes and transitions are identical,
+and that inclusion and exclusion are identical for every event. 2,507 events differ, and only in
+`quality_flags`: the new consistency flags fire on the injected artefacts (cross-patient and early
+reversals, conflicting duplicates, invalid quantities).
+
 ## Before (the pre-v2 engine, `af46a4c`)
 
 | Workload | Total | Rows/s | Peak RSS | Notes |
@@ -85,8 +118,8 @@ so this is a runtime and memory comparison, not an output comparison.
     optional per-section hash that skips event rows for very large runs, or a narrower event table.
 - **Disk:** DuckDB spilled about 9 GB at S4 under a 4 GB memory limit. `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE`
   caps this, and a run that exceeds the cap fails cleanly, recorded as `failed` with the stage. The
-  database grows about 120 bytes per event per run, and result rows are kept until they are removed;
-  there is no retention job yet.
+  database grows about 120 bytes per event per run, and result rows are kept until `treatment retention`
+  purges them (optionally after a verified archive).
 - **An earlier version of the engine** failed S4 with a DuckDB out-of-memory error in the episode stage.
   Episodes are now built per person bucket (`CB_TREATMENT_BUCKET_EVENTS`), and the same workload
   completed.

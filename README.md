@@ -417,10 +417,35 @@ assumptions live in versioned configuration, and every run records which configu
 cohort-builder --dataset iqvia_laad treatment run --rules glucose_lowering_example
 cohort-builder treatment summary RUN_ID                    # provenance + suppressed aggregate counts
 cohort-builder treatment explain RUN_ID EPISODE_ID         # patient-level: needs CB_ALLOW_PATIENT_LEVEL=true
+cohort-builder treatment export RUN_ID --out DIR           # summary; --patient-level CSVs need the same flag
+cohort-builder treatment cancel RUN_ID                     # stop a run (Ctrl-C / SIGTERM during `run` too)
+cohort-builder treatment hold RUN_ID --reason "..."        # legal hold: retention never purges it (`release`)
+cohort-builder treatment retention --older-than-days 365   # DRY RUN; add --apply [--archive-dir DIR]
 cohort-builder treatment cleanup                           # abandon stale runs, drop leftover staging
+cohort-builder ontology validate [--vocabulary]            # check rule sets / source configs (exit 1 on errors)
 ```
 `treatment run` also takes `--reference-date YYYY-MM-DD` (default today, always recorded),
-`--batch-size` and `--engine reference` (the in-memory oracle, for small runs only).
+`--batch-size`, `--engine reference` (the in-memory oracle, for small runs only) and `--reuse` (return
+a completed run with the same input fingerprint instead of recomputing).
+
+**Synthetic T2D walkthrough** (fictitious patients only; every number it prints is counted, not estimated):
+
+```bash
+export CB_DB_PATH=/tmp/t2d.duckdb CB_DATASET=iqvia_laad
+cohort-builder init-t2d-demo --patients 10000 --seed 2026   # refuses to overwrite an existing database
+cohort-builder ontology validate --vocabulary
+cohort-builder treatment run --rules glucose_lowering_example --reference-date 2026-06-30
+cohort-builder treatment export RUN_ID --out /tmp/t2d_export
+```
+The generator (`synthetic_t2d.py`) writes the native `laad.*` tables with one treatment pattern per
+patient (untreated, persistent, discontinued, restart, add-on, switch, combination product, early refills,
+SGLT2 first, sparse) and injects claims artefacts at fixed rates: rejected-then-paid, reversed, corrected
+(reversal + rebill), exact and conflicting duplicates, missing or implausible days supply, negative
+quantity, unknown transaction type, unmapped and malformed NDCs, orphan, early and cross-patient
+reversals, reversals with another payer, future-dated claims, rows without a patient id, and activity
+gaps over a year. `laad.synthetic_manifest` and the command output record the seed and exact counts.
+`tests/test_t2d_fixture.py` is a 10-patient fixture whose expected episodes and transitions were worked
+out by hand (the arithmetic is in the file).
 
 **Two configuration files** (strict YAML, validated, content-hashed):
 - **Treatment sources**, one per dataset: `ontology/treatment/sources/<dataset>.yaml`. Shipped for
@@ -497,14 +522,33 @@ row and by hash, including different batch sizes. Benchmarks: [`benchmarks/READM
 **Resource controls** (validated): `CB_TREATMENT_BATCH_SIZE` (default 100000),
 `CB_TREATMENT_MAX_CONCURRENT_RUNS` (1 per process), `CB_TREATMENT_TIMEOUT_SECONDS` (3600; the running
 query is interrupted), `CB_TREATMENT_REFERENCE_MAX_EVENTS` (250000), `CB_TREATMENT_STALE_RUN_MINUTES`
-(360), plus `CB_DUCKDB_MEMORY_LIMIT`, `CB_DUCKDB_THREADS` and `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` (cap on
-spill files).
+(360), `CB_TREATMENT_BUCKET_EVENTS` (events per person bucket, bounds memory per statement), plus
+`CB_DUCKDB_MEMORY_LIMIT`, `CB_DUCKDB_THREADS`, `CB_DUCKDB_TEMP_DIRECTORY` (where DuckDB spills: absolute,
+no symbolic links, created 0700) and `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` (cap on spill files).
 
 **Run lifecycle:** a run is `running` while it works in staging. The final rows, output hash, summary
 and `completed` status are written in **one transaction**, so partial output is never visible. A failure
-leaves `failed` with the stage and a redacted error, and no result rows. Staging tables are always
-dropped. Runs left `running` by a crashed process become `abandoned` (`treatment cleanup`, also done
-before each run).
+leaves `failed` (or `cancelled`) with the stage, a redacted error and a **failure kind** with an
+actionable hint: `memory_limit`, `disk_limit` (spill cap reached), `disk_full`, `timeout`, `cancelled` or
+`error`. No result rows are written and staging tables are always dropped. Runs left `running` by a
+crashed process become `abandoned` (`treatment cleanup`, also done before each run).
+- Each `TreatmentService` uses its own DuckDB connection, so runs can proceed in parallel threads (up to
+  `CB_TREATMENT_MAX_CONCURRENT_RUNS`) and the API no longer blocks other requests during a run.
+- **Cancellation:** `POST /treatment-runs/{id}/cancel`, `treatment cancel`, or SIGINT/SIGTERM during
+  `treatment run`. DuckDB only interrupts the statement running at that instant, so a stopped run's
+  connections are interrupted repeatedly until it ends; between statements the run checks the request.
+- Structured JSON logs (`cohort_builder.treatment` logger): run id, stage, timings, row counts and hashes
+  only - never record ids, codes, dates or patient ids.
+
+**Retention** (derived results only; source claims are never deleted): `treatment retention
+--older-than-days N` is a dry run that lists what would be purged; `--apply` purges each eligible run in
+its own transaction (re-checking its state), keeps the `meta.treatment_run` row with `purged_at` and a
+purge record, and audits every purge. Runs that are running, held (`treatment hold`), newer than the
+cutoff, or of another tenant (`--tenant`) are skipped and counted. `--archive-dir` (must be below
+`CB_TREATMENT_ARCHIVE_ROOT`) first writes gzip CSVs, `meta.json` and a manifest with row counts and
+SHA-256, verifies them by reading them back, and only then purges; a retry after a crash reuses a verified
+archive and refuses a tampered one. Schedule it with cron or a systemd timer; it is idempotent.
+`CB_TREATMENT_RETENTION_DAYS` sets the default (0 = none: the command refuses to run without a value).
 
 **Provenance and reproducibility:** `meta.treatment_run` stores:
 - the dataset and the data snapshot
@@ -513,10 +557,24 @@ before each run).
 - the **reference date**, the batch size, the actor and tenant
 - per-phase timings and row counts
 - the `output_hash`
+- the **input fingerprint** (`treatment-input/1`): source and observation tables by content (row count
+  plus order-independent row-hash aggregates), the vocabulary version, both configuration hashes, the
+  reference date, engine and software/DuckDB versions. `--reuse` / `"reuse": true` returns the completed
+  run with the same fingerprint (same tenant) instead of recomputing.
+
+Configurations carry a **provenance** block (`review_status`: `illustrative`, `unverified` or `validated`;
+`validated` requires reviewer, date and evidence). The shipped rule set and LAAD source config are
+`illustrative`. Every run summary reports the review status and says so in its limitations when a
+configuration is not validated. `cohort-builder ontology validate` checks schema, duplicate and
+conflicting group members, invalid or orphaned concept references, NDC formats, unmapped NDCs, source
+columns, and refuses a `validated` source config while the vocabulary holds synthetic placeholder NDCs;
+each issue names the file, field and value. CI runs it on every push.
 
 The hash follows the contract `treatment-output/1`: SHA-256 over the canonical, key-ordered rows of
 events (with decisions and coverage), episodes and transitions, streamed from the database. The same
-data, configuration, reference date and software give the same hash, whatever the batch size or engine.
+data, configuration, reference date and software give the same hash, whatever the batch size, bucket
+size, thread count, physical row order or engine. Guarantees and their limits:
+[`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md).
 
 **Access:** run summaries are aggregate and small-cell suppressed (exclusion reasons, quality flags,
 unmatched codes, episodes and censoring per group, transition counts by group pair; medians only for
@@ -525,10 +583,16 @@ groups of at least the minimum cell count).
 - `GET /treatment-runs/{id}` (executor or reviewer): only within the caller's own tenant.
 - `GET /treatment-runs/{id}/episodes/{episode_id}/explanation` (admin, and `CB_ALLOW_PATIENT_LEVEL=true`):
   one episode with its source events, rule parameters and transitions. Every access is audited.
+- `POST /treatment-runs/{id}/cancel` (executor, own tenant); `POST /treatment-runs/{id}/hold` and
+  `/release` (admin). Failed runs answer 503 (resources / timeout), 409 (cancelled) or 500, with the run
+  id and failure kind.
 
 **Not implemented yet:** brand-switch matrices, line-of-therapy rules, persistence/adherence (PDC/MPR),
-an approval workflow for rule sets, day-level dose or strength normalization, and a retention policy for
-old runs' result rows.
+an approval workflow for rule sets (review status is recorded, not enforced), day-level dose or strength
+normalization, cross-process cancellation (DuckDB admits one writing process per database file, so a
+`running` row with no live run in this process is marked abandoned instead), and payer-consistency checks
+between a claim and its reversal (the synthetic generator injects such pairs; the engine does not use the
+payer column).
 
 ## Moving to real data
 
@@ -836,6 +900,8 @@ only; the test-suite labels are invented. Nothing in this repository is a clinic
 pip install -e ".[api,mcp,dev]"
 pytest                                    # synthetic data and a scripted fake LLM; no network, no API key
 pytest --cov                              # with coverage (CI gate: 80%)
+pytest -m slow                            # slow end-to-end tests (10k synthetic T2D patients); separate CI job
+cohort-builder ontology validate          # treatment rule sets / source configs (also in CI)
 CB_TEST_POSTGRES_DSN=postgresql://user:pass@localhost:5432/postgres pytest   # also run compiled SQL on PostgreSQL   # pragma: allowlist secret
 ruff check src tests && ruff format --check src tests && mypy
 pip-audit --skip-editable                 # dependency vulnerabilities (run in a clean virtualenv)
@@ -844,7 +910,8 @@ python -m build && twine check dist/*       # package builds and metadata is val
 ```
 
 CI runs all of these except the package build on Python 3.11–3.13, against a PostgreSQL 16 service, using synthetic data and
-throwaway credentials only.
+throwaway credentials only, plus a synthetic smoke job (generate 2,000 T2D patients, validate against the
+vocabulary, run the treatment engine, export the summary).
 
 ## Configuration
 
@@ -859,6 +926,10 @@ throwaway credentials only.
 | `CB_LOCAL_DATASETS_DIR` | `data/datasets` (profiles of imported CSV datasets; git-ignored) |
 | `CB_INGEST_MAX_BYTES` | `209715200` (200 MB per CSV file) |
 | `CB_TREATMENT_BATCH_SIZE`, `CB_TREATMENT_MAX_CONCURRENT_RUNS`, `CB_TREATMENT_TIMEOUT_SECONDS`, `CB_TREATMENT_REFERENCE_MAX_EVENTS`, `CB_TREATMENT_STALE_RUN_MINUTES` | `100000`, `1`, `3600`, `250000`, `360` (treatment engine limits) |
+| `CB_TREATMENT_BUCKET_EVENTS` | `5000000` (events per person bucket; lower it when memory is tight) |
+| `CB_TREATMENT_RETENTION_DAYS` | `0` (no default retention; `treatment retention` then needs `--older-than-days`) |
+| `CB_TREATMENT_ARCHIVE_ROOT` | (none: archiving disabled; retention archives may only be written below it) |
+| `CB_DUCKDB_TEMP_DIRECTORY` | DuckDB default (spill directory; absolute, no symbolic links, created 0700) |
 | `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | DuckDB default (cap on spill files, e.g. `20GB`) |
 | `CB_API_MAX_BODY_BYTES` | `134217728` (128 MiB per HTTP request body; larger bodies get `413` before authentication) |
 | `ANTHROPIC_API_KEY` | (required for `ask` in live/cached mode) |
@@ -893,7 +964,10 @@ src/cohort_builder/
   dataset_mapping.py validated source-to-ontology mapping -> semantic views + dataset profile
   dataset_registry.py  imported dataset versions, staging, registration states, data checks, reconcile
   executor.py        runs SQL, small-cell suppression, results tables
-  treatment_*.py     treatment events (config, event SQL, SQL engine, reference episodes, service)
+  treatment_*.py     treatment events (config, event SQL, SQL engine, reference episodes, service,
+                     retention / holds / archive, export)
+  ontology_validate.py  `ontology validate`: configuration and vocabulary checks
+  safe_paths.py      validation of operator-supplied directories (spill, archive, export)
   llm.py             Anthropic client, request hashing, cache/replay
   agents/            intent parser, concept resolver, critic, proxy parser (LLM); composer, validators,
                      explainers (code)
@@ -902,6 +976,7 @@ src/cohort_builder/
   evaluation.py      golden-case evaluation
   synthetic.py       demo vocabulary, synthetic OMOP patients, Athena loader
   synthetic_laad.py  synthetic LAAD-style claims (native vendor-shaped tables)
+  synthetic_t2d.py   synthetic type 2 diabetes claims in the laad schema with counted artefacts
   cli.py, api.py     interfaces (CLI, HTTP API)
   mcp_server.py      MCP server (stdio + Streamable HTTP)
 benchmarks/          synthetic scalability benchmark for the treatment engine (see benchmarks/README.md)

@@ -82,8 +82,26 @@ executors and reviewers read aggregate, suppressed summaries in their own tenant
 (source events, dates, record ids) need an admin principal AND `CB_ALLOW_PATIENT_LEVEL=true` and are audited.
 Run-scoped staging tables (`tx_stage.*_<run>`) live in the same database file as `results.*` and carry the
 same patient-level content, so they need the same database access controls; they are dropped when a run
-ends (success or failure) and by `treatment cleanup`. Failed runs store only the failing stage and a
-redacted error (quoted literals removed). Benchmark output contains counts and timings only.
+ends (success or failure) and by `treatment cleanup`. Failed runs store only the failing stage, a failure
+kind and a redacted error (quoted literals removed). Benchmark output contains counts and timings only.
+- Executors cancel runs of their own tenant (`POST /treatment-runs/{id}/cancel`); only admins place or
+  release legal holds (`/hold`, `/release`). Cancellations, holds, exports and retention purges are audited.
+- **Exports** (`treatment export`, CLI only): the suppressed summary always; patient-level CSVs only with
+  `--patient-level` AND `CB_ALLOW_PATIENT_LEVEL=true` (refusals are audited). The target must be a new or
+  empty directory; it is created 0700, files 0600, symbolic links refused, and text cells that a
+  spreadsheet would evaluate (`= + - @`) are prefixed with `'`. The manifest says whether the database
+  declares itself synthetic.
+- **Retention** (`treatment retention`, CLI only) deletes only derived `results.treatment_*` rows of
+  expired runs, never source data, never the run's metadata or audit records. Archives written before a
+  purge contain patient-level rows: they may only go below `CB_TREATMENT_ARCHIVE_ROOT`, in owner-only
+  directories without symbolic links, and must be protected like the database. Deleting archives is left
+  to the operator's records policy.
+- **Logs:** the `cohort_builder.treatment` logger emits JSON with run ids, stage names, timings, row
+  counts and hashes only; tests assert that record ids, codes and dates never appear. No telemetry is sent
+  anywhere: logs go to the handlers the deployment configures.
+- **Spill files:** DuckDB writes temporary files with patient-level content while large runs spill. Put
+  them on protected storage with `CB_DUCKDB_TEMP_DIRECTORY` (validated like archive directories) and cap
+  them with `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE`.
 
 Imported datasets: any role lists dataset metadata (`GET /datasets...`, no cell values); authors preview a CSV
 in memory (`POST /datasets/csv/profile`, nothing stored); only admins ingest (`POST /datasets/{name}/ingest`),
@@ -228,6 +246,7 @@ executors may submit. Treat suppression as one layer, not as anonymization.
 | Proxy tiers, scores and per-patient evidence | `results.proxy_assignment`, `results.proxy_evidence` | Patient-level. Returned only to admins with `CB_ALLOW_PATIENT_LEVEL=true` |
 | Imported CSV data | `stg_<dataset>_v<N>` schemas, `meta.dataset_version` (metadata only) | Patient-level, untrusted input: streamed and parameterized, never executed; reports, logs, audit entries and profiles hold counts and column names only. Protect the database file |
 | Reference-standard labels | `meta.reference_label` | Patient-level, from an external source. Admin-only input, immutable per name, never returned |
+| Treatment events, episodes, transitions | `results.treatment_*`, `tx_stage.*` while running, DuckDB spill files | Patient-level. Purged by `treatment retention` (metadata kept); exports and archives are files the operator must protect |
 | Tokens | Hashes only, in the token file | Protect the file anyway (it maps identities to roles) |
 
 The LLM provider receives prompts and tool results. Check your organization's policy and agreements before
@@ -238,7 +257,8 @@ sending real study questions to an external API.
 - TLS termination, network isolation, rate limiting and request-size limits (put the API behind a reverse
   proxy or gateway)
 - Enterprise SSO/OIDC, joiner/mover/leaver processes, token rotation
-- Backup, retention and deletion policies for `meta` and `results`
+- Backup, retention and deletion policies for `meta` and `results` (`treatment retention` covers derived
+  treatment rows only), and for exported or archived files
 - External, tamper-evident audit storage and monitoring or alerting on `denied` and `failed` events
 - Privacy review of the suppression threshold and of differencing risks for your data
 - Clinical validation of concept sets, cohort logic and dataset profiles (see README, "Validation results")
