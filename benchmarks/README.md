@@ -1,0 +1,94 @@
+# Treatment engine benchmarks (synthetic data only)
+
+`treatment_bench.py` generates a seeded synthetic claims workload in DuckDB, then times one treatment
+run in a fresh process. It never uses real data, and its output contains counts and timings only.
+
+```bash
+python benchmarks/treatment_bench.py generate --db /tmp/b.duckdb --patients 100000 --fills 10 \
+    --hf-patients 100 --hf-fills 10000 --seed 7
+python benchmarks/treatment_bench.py run --db /tmp/b.duckdb --memory-limit 4GB --threads 2
+# the pre-v2 engine, for comparison (needs a schema created by that version):
+python benchmarks/treatment_bench.py generate --db /tmp/old.duckdb ... --schema-src <old checkout>/src
+python benchmarks/treatment_bench.py run --db /tmp/old.duckdb --legacy-path <old checkout>/src
+```
+
+**Workload contents:**
+- 0–3 observation periods per patient (overlapping, touching or separated)
+- long fill histories across metformin, two brands of empagliflozin, dapagliflozin and a combination
+  product: brand changes, switches and add-ons
+- early refills (overlapping supply), same-day fills, gaps and restarts
+- about 1% missing and 0.5% implausible days supply, 2% rejected, 2% reversed (plus the reversal rows),
+  1% adjusted (plus the adjustment rows), and 1% duplicated claim lines
+- `--hf-patients` patients with `--hf-fills` fills every 1–3 days. This is high-frequency stockpiling,
+  which makes the carry-over cap bind and exercises the streaming path.
+
+## Environment of the reported runs
+
+| | |
+|---|---|
+| Machine | cloud container, 2 vCPU, 7.8 GiB RAM, local SSD |
+| Software | Linux 6.18 x86_64, Python 3.13.16, DuckDB 1.5.6 |
+| Settings | `--memory-limit 4GB --threads 2`, batch size 100,000 (S2 also 10,000), `CB_TREATMENT_BUCKET_EVENTS` 5,000,000 |
+| Code | after: `a92b083` (this branch); before: `af46a4c` (`main` before this work) |
+| Seed | 7 |
+
+Each run was alone on the machine.
+
+## Results: after (set-based SQL engine)
+
+"Events" are canonical treatment events: one per source record and ingredient, so combination products
+count twice. Throughput is source rows divided by the total run time.
+
+| Workload | Patients | Source rows | Events | Episodes | Transitions | Total | Rows/s | Peak RSS | Peak DuckDB temp | DB growth |
+|---|---|---|---|---|---|---|---|---|---|---|
+| S1 | 10,000 | 103,600 | 120,427 | 34,859 | 64,090 | 4.5 s | 23,141 | 485 MB | 0 | 22 MB |
+| S2 (+100 × 10,000 high-frequency) | 100,100 | 2,080,500 | 2,419,594 | 350,956 | 691,130 | 36.5 s | 56,961 | 1,367 MB | 0 | 313 MB |
+| S2, batch size 10,000 | same | same | same | same | same | 34.5 s | 60,348 | 1,383 MB | 0 | 107 MB |
+| S3 (+100 × 10,000 high-frequency) | 1,000,100 | 11,439,076 | 13,304,223 | 3,500,110 | 6,529,990 | 274 s | 41,695 | 4,398 MB | 1,139 MB | 1,840 MB |
+| S4 stress (2M × 15 fills, +500 × 10,000 high-frequency) | 2,000,500 | 36,386,049 | 42,319,211 | 8,884,899 | 18,751,825 | 1,055 s | 34,476 | 4,923 MB | 8,983 MB | 5,089 MB |
+
+**Phase timings (seconds).** "Episodes" covers all per-bucket steps; the capped-streaming and
+transition times are parts of it, shown separately.
+
+| Workload | Events (SQL) | Episodes | of which capped streaming | of which transitions | Publish | Output hash | Summary | Buckets | Capped partitions / day rows |
+|---|---|---|---|---|---|---|---|---|---|
+| S1 | 0.74 | 2.06 | 0.21 | 0.15 | 0.44 | 0.56 | 0.06 | 1 | 1,163 / 8,893 |
+| S2 | 7.58 | 12.48 | 2.75 | 1.28 | 6.82 | 8.91 | 0.56 | 1 | 11,603 / 155,913 |
+| S3 | 45.6 | 109.4 | 14.5 | 11.0 | 46.8 | 67.2 | 5.2 | 3 | 114,189 / 956,855 |
+| S4 | 190.6 | 337.5 | 51.8 | 29.8 | 262.5 | 247.7 | 16.5 | 7 | 341,682 / 3,628,547 |
+
+**Peak memory:** peak RSS is the whole process, including DuckDB's buffer pool, which was capped at
+4 GB. Python itself never holds a run's events. Above that cap DuckDB spills to its temp directory,
+which is why S3 and S4 show temp usage.
+
+**Determinism:** these runs reproduced the same output hashes:
+- S2 with batch sizes 100,000 and 10,000;
+- S1–S3 before and after person bucketing (1 bucket vs 3 at S3).
+
+## Before (the pre-v2 engine, `af46a4c`)
+
+| Workload | Total | Rows/s | Peak RSS | Notes |
+|---|---|---|---|---|
+| S1 (10,000 patients, 103,600 rows) | 417.7 s | 248 | 541 MB | 407.8 s of it was writing rows one at a time (`executemany`, about 2,000 rows/s in DuckDB) |
+| S2 (100,100 patients, 2,080,500 rows) | **did not finish in 3,600 s** (killed by `timeout`) | – | ≥ 2,508 MB | Peak RSS sampled from `/proc` while it ran. All events were loaded into Python before writing started |
+
+S3 and S4 were not run on the old engine. At the 248 rows/s measured at S1, S2 alone would need about
+2.3 hours. The two engines also produce different outputs (v2 changed the episode and transition rules),
+so this is a runtime and memory comparison, not an output comparison.
+
+## Bottlenecks and limits observed
+
+- **Publishing and hashing** dominate at the largest scale: 262 s and 248 s at S4.
+  - Publishing writes 42M event rows into `results`.
+  - The output hash serializes about 70M rows into a streamed SHA-256 in Python.
+  - Both are linear and bounded in memory. They are the next optimization targets: for example, an
+    optional per-section hash that skips event rows for very large runs, or a narrower event table.
+- **Disk:** DuckDB spilled about 9 GB at S4 under a 4 GB memory limit. `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE`
+  caps this, and a run that exceeds the cap fails cleanly, recorded as `failed` with the stage. The
+  database grows about 120 bytes per event per run, and result rows are kept until they are removed;
+  there is no retention job yet.
+- **An earlier version of the engine** failed S4 with a DuckDB out-of-memory error in the episode stage.
+  Episodes are now built per person bucket (`CB_TREATMENT_BUCKET_EVENTS`), and the same workload
+  completed.
+- **The largest workload tested** is S4: 36.4M source rows, 42.3M events, 2M patients, on 2 vCPU and
+  7.8 GiB RAM. Nothing larger was run. Production capacity has to be measured on production hardware.

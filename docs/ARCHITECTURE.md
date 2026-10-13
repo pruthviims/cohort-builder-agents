@@ -25,8 +25,9 @@ derived record can be traced back to a file, a line and the original string.
 ## Treatment-event engine (implemented)
 
 `treatment_config.py` (validated source configs and rule sets), `treatment_events.py` (config -> SQL ->
-canonical `treatment_event/1` rows, every source record accounted for), `treatment_episodes.py` (pure,
-deterministic episodes, censoring and transition evidence) and `treatment_service.py` (runs, provenance,
+canonical `treatment_event/2` rows, every source record accounted for), `treatment_episodes.py` (the semantics, and
+the in-memory reference engine used as test oracle), `treatment_engine.py` (set-based DuckDB engine:
+window functions, bounded streaming only where the carry-over cap binds, streamed output hash) and `treatment_service.py` (runs, provenance,
 suppressed summaries, gated explanations). Dataset-specific knowledge (status codes, reversal links,
 code systems, which date a row carries, evidence type) lives in `ontology/treatment/sources/<dataset>.yaml`;
 use-case assumptions live in `ontology/treatment/rules/<name>.yaml`. See README "Treatment events and

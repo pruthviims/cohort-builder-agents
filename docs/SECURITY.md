@@ -80,6 +80,10 @@ Treatment runs: executors start runs (`POST /treatment-runs`, a configured rule 
 validated like a file; dataset source configs come only from the server's `ontology/treatment/sources`);
 executors and reviewers read aggregate, suppressed summaries in their own tenant; per-episode explanations
 (source events, dates, record ids) need an admin principal AND `CB_ALLOW_PATIENT_LEVEL=true` and are audited.
+Run-scoped staging tables (`tx_stage.*_<run>`) live in the same database file as `results.*` and carry the
+same patient-level content, so they need the same database access controls; they are dropped when a run
+ends (success or failure) and by `treatment cleanup`. Failed runs store only the failing stage and a
+redacted error (quoted literals removed). Benchmark output contains counts and timings only.
 
 Imported datasets: any role lists dataset metadata (`GET /datasets...`, no cell values); authors preview a CSV
 in memory (`POST /datasets/csv/profile`, nothing stored); only admins ingest (`POST /datasets/{name}/ingest`),

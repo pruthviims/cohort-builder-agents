@@ -408,7 +408,8 @@ analytics can build on is described in [`docs/ARCHITECTURE.md`](docs/ARCHITECTUR
 ## Treatment events and episodes
 
 A deterministic engine turns medication records into **canonical treatment events**, then **episodes**
-and **transition evidence** (switch, add-on, restart, discontinuation). It is the foundation for later
+and **transition evidence** (switch, add-on, restart, product change), with one end status per episode
+(discontinued, censored or unknown). It is the foundation for later
 brand-switch, line-of-therapy, persistence and adherence modules. It is disease-independent: all
 assumptions live in versioned configuration, and every run records which configuration produced it.
 
@@ -416,7 +417,10 @@ assumptions live in versioned configuration, and every run records which configu
 cohort-builder --dataset iqvia_laad treatment run --rules glucose_lowering_example
 cohort-builder treatment summary RUN_ID                    # provenance + suppressed aggregate counts
 cohort-builder treatment explain RUN_ID EPISODE_ID         # patient-level: needs CB_ALLOW_PATIENT_LEVEL=true
+cohort-builder treatment cleanup                           # abandon stale runs, drop leftover staging
 ```
+`treatment run` also takes `--reference-date YYYY-MM-DD` (default today, always recorded),
+`--batch-size` and `--engine reference` (the in-memory oracle, for small runs only).
 
 **Two configuration files** (strict YAML, validated, content-hashed):
 - **Treatment sources**, one per dataset: `ontology/treatment/sources/<dataset>.yaml`. Shipped for
@@ -440,31 +444,79 @@ cohort-builder treatment explain RUN_ID EPISODE_ID         # patient-level: need
   - censoring (observation periods, washout) and transition windows
   There are no built-in thresholds: every number is written in the rule file.
 
-**Canonical event** (`results.treatment_event`, schema `treatment_event/1`): one row per source record x
+**Canonical event** (`results.treatment_event`, schema `treatment_event/2`): one row per source record x
 ingredient. Each row keeps its provenance (dataset, source, table, record id, original code), the product,
 ingredient, brand (when the vocabulary has one) and drug group, the evidence type and claim status, the
 start date and its source, the end date and days supply with their source (`recorded`, `from_end_date`,
 `assumed`, `missing`), an evidence status (`observed`, `inferred`, `unknown`) and quality flags. **Every**
 record gets a row: included, or excluded with one reason, checked in this order:
-- missing record id, patient or start date; implausible start date
-- reversal transaction, rejected, reversed or superseded claim; claim status or evidence type not counted
+- missing record id, patient or start date; implausible start date (before 1900 or after the run's
+  recorded reference date, never the moving `current_date`)
+- reversal transaction, rejected, reversed or superseded claim (an adjustment chain C <- A1 <- A2 keeps
+  only A2); claim status or evidence type not counted
 - unmapped code; code maps to a non-drug concept (a CPT procedure or a diagnosis never becomes a
   medication event); no ingredient; not in a drug group or in more than one
-- no usable duration; duplicate record (same record id repeated); duplicate event (episode rules)
+- no usable duration; duplicate record (same record id repeated)
+- from the episode engine: outside every observation period; duplicate event (episode rules)
 
-**Episodes and transitions** (`results.treatment_episode`, `results.treatment_transition`): computed per
-person and drug group by pure, ordered Python (`treatment_episodes.py`). Each event records the step
-that used it (`counted`, `same_day_merged`, `duplicate_event`), its coverage dates and any shift.
-- **Censoring:** an episode starting less than `washout_days` after its observation period starts is
-  left-censored. One whose end plus the allowed gap reaches the period end is right-censored, and its end
-  status is `unknown_after_censoring`, not a discontinuation. A missing record is never read as evidence
-  that treatment stopped while the patient was not observable.
-- **Transitions are evidence patterns, not clinical facts:** `restart`, `discontinuation`, `add_on`
-  (overlap >= the configured days), `switch` (next group within the window), `concurrent_start`.
+**Episodes** (`results.treatment_episode`) are built per person, drug group and **observation period**;
+the exact rules are in `treatment_episodes.py`. Each event records the step that used it (`counted`,
+`same_day_merged`, `same_record_merged` for the second ingredient of a same-group combination product,
+`duplicate_event`, `outside_observation`), its coverage dates and any shift.
+- **Observation boundaries:** overlapping or touching observation periods are merged. Events outside
+  every period are excluded (nothing can be concluded around them). An episode never bridges the gap
+  between two periods, however small the allowed treatment gap is.
+- **Coverage vs. observation:** the episode keeps its covered days (`episode_end`) and also
+  `observed_end` (capped at the period end) and `coverage_beyond_observation`. The grace gap is never
+  added to the end.
+- **One end status per episode:** `discontinued` (no supply for more than the allowed gap while the
+  patient was observed), `censored` (end + gap reaches the period end, so a refill could not have been
+  seen) or `unknown` (no observation periods). A missing record is never read as proof that treatment
+  stopped. Left-censoring (start < `washout_days` after the period start) is recorded too.
 
-**Provenance and reproducibility:** `meta.treatment_run` stores the dataset, the data snapshot, both
-configurations (JSON and hash), the event schema, the software version, the actor and tenant, and an
-`output_hash` over every derived row. Re-running with the same inputs gives the same hash.
+**Transitions** (`results.treatment_transition`) are evidence patterns, not clinical facts:
+- `restart`: the same group again after an observed gap.
+- `resumed_after_unobserved_interval`: the same group again in a later observation period.
+- `product_change`: the product set changes between dispensing days of one episode (brand, product
+  or strength), with `from_products` / `to_products`.
+- `concurrent_start`, `add_on` (overlap >= `add_on_min_overlap_days`) and `switch` (starts within
+  `switch_window_days` of the end, ends later): these are only between episodes in the same observation
+  period, and every qualifying pair is kept.
+
+Discontinuation is an episode end status, never also a transition, so it can't be double-counted.
+
+**Scale:** the production engine (`treatment_engine.py`) is set-based DuckDB SQL over run-scoped
+staging tables (`tx_stage.<step>_<run>`). Coverage uses window functions; the uncapped "shift forward"
+recurrence has an exact prefix form, so only the partitions where the carry-over cap actually binds are
+recomputed. That recompute streams the partition's days in bounded batches through the same function the
+reference uses. Transitions use window functions and a candidate join bounded by the switch window.
+Python never holds a run's events or episodes. The in-memory reference engine (`--engine reference`,
+limited by `CB_TREATMENT_REFERENCE_MAX_EVENTS`) is kept as the test oracle: the tests compare both row by
+row and by hash, including different batch sizes. Benchmarks: [`benchmarks/README.md`](benchmarks/README.md).
+
+**Resource controls** (validated): `CB_TREATMENT_BATCH_SIZE` (default 100000),
+`CB_TREATMENT_MAX_CONCURRENT_RUNS` (1 per process), `CB_TREATMENT_TIMEOUT_SECONDS` (3600; the running
+query is interrupted), `CB_TREATMENT_REFERENCE_MAX_EVENTS` (250000), `CB_TREATMENT_STALE_RUN_MINUTES`
+(360), plus `CB_DUCKDB_MEMORY_LIMIT`, `CB_DUCKDB_THREADS` and `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` (cap on
+spill files).
+
+**Run lifecycle:** a run is `running` while it works in staging. The final rows, output hash, summary
+and `completed` status are written in **one transaction**, so partial output is never visible. A failure
+leaves `failed` with the stage and a redacted error, and no result rows. Staging tables are always
+dropped. Runs left `running` by a crashed process become `abandoned` (`treatment cleanup`, also done
+before each run).
+
+**Provenance and reproducibility:** `meta.treatment_run` stores:
+- the dataset and the data snapshot
+- both configurations (JSON and hash)
+- the event schema, engine, engine version and software version
+- the **reference date**, the batch size, the actor and tenant
+- per-phase timings and row counts
+- the `output_hash`
+
+The hash follows the contract `treatment-output/1`: SHA-256 over the canonical, key-ordered rows of
+events (with decisions and coverage), episodes and transitions, streamed from the database. The same
+data, configuration, reference date and software give the same hash, whatever the batch size or engine.
 
 **Access:** run summaries are aggregate and small-cell suppressed (exclusion reasons, quality flags,
 unmatched codes, episodes and censoring per group, transition counts by group pair; medians only for
@@ -475,9 +527,8 @@ groups of at least the minimum cell count).
   one episode with its source events, rule parameters and transitions. Every access is audited.
 
 **Not implemented yet:** brand-switch matrices, line-of-therapy rules, persistence/adherence (PDC/MPR),
-an approval workflow for rule sets, and day-level dose or strength normalization. Episode building runs
-in Python per patient, which is fine for demo-size data but should move to set-based SQL for very large
-claims extracts.
+an approval workflow for rule sets, day-level dose or strength normalization, and a retention policy for
+old runs' result rows.
 
 ## Moving to real data
 
@@ -807,6 +858,8 @@ throwaway credentials only.
 | `CB_ALLOW_PATIENT_LEVEL` | `false` (per-patient proxy explanations for admins) |
 | `CB_LOCAL_DATASETS_DIR` | `data/datasets` (profiles of imported CSV datasets; git-ignored) |
 | `CB_INGEST_MAX_BYTES` | `209715200` (200 MB per CSV file) |
+| `CB_TREATMENT_BATCH_SIZE`, `CB_TREATMENT_MAX_CONCURRENT_RUNS`, `CB_TREATMENT_TIMEOUT_SECONDS`, `CB_TREATMENT_REFERENCE_MAX_EVENTS`, `CB_TREATMENT_STALE_RUN_MINUTES` | `100000`, `1`, `3600`, `250000`, `360` (treatment engine limits) |
+| `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | DuckDB default (cap on spill files, e.g. `20GB`) |
 | `CB_API_MAX_BODY_BYTES` | `134217728` (128 MiB per HTTP request body; larger bodies get `413` before authentication) |
 | `ANTHROPIC_API_KEY` | (required for `ask` in live/cached mode) |
 | `CB_DATASET` | `omop_demo` (or `iqvia_laad`) |
@@ -840,7 +893,7 @@ src/cohort_builder/
   dataset_mapping.py validated source-to-ontology mapping -> semantic views + dataset profile
   dataset_registry.py  imported dataset versions, staging, registration states, data checks, reconcile
   executor.py        runs SQL, small-cell suppression, results tables
-  treatment_*.py     treatment events (config, event SQL, episodes, service): see "Treatment events"
+  treatment_*.py     treatment events (config, event SQL, SQL engine, reference episodes, service)
   llm.py             Anthropic client, request hashing, cache/replay
   agents/            intent parser, concept resolver, critic, proxy parser (LLM); composer, validators,
                      explainers (code)
@@ -851,6 +904,7 @@ src/cohort_builder/
   synthetic_laad.py  synthetic LAAD-style claims (native vendor-shaped tables)
   cli.py, api.py     interfaces (CLI, HTTP API)
   mcp_server.py      MCP server (stdio + Streamable HTTP)
+benchmarks/          synthetic scalability benchmark for the treatment engine (see benchmarks/README.md)
 eval/                golden cases + gold IRs
 tests/               offline tests with a scripted fake LLM
 ```
