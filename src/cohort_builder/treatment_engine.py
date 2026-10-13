@@ -60,7 +60,8 @@ class Stage:
             raise ValueError("invalid staging step")
         return f"{qi(STAGE_SCHEMA)}.{qi(f'{step}_{self.run_hex}')}"
 
-    STEPS = ("ev0", "obs", "ev", "st", "day", "cov", "dec", "ep", "tr")
+    # per-run: ev0 (canonical events), obs; per person bucket: ev st day cov dec ep tr; accumulated: a*
+    STEPS = ("ev0", "obs", "ev", "st", "day", "cov", "dec", "ep", "tr", "adec", "aep", "atr")
 
 
 @dataclass
@@ -117,7 +118,12 @@ FROM r GROUP BY person_id, period_id
 """
 
 
-def steps_sql(stage: Stage, rules: TreatmentRuleSet, has_observation: bool) -> list[str]:
+def steps_sql(
+    stage: Stage, rules: TreatmentRuleSet, has_observation: bool, bucket: int = 0, buckets: int = 1
+) -> list[str]:
+    """Steps 0-3 for one person bucket (person_id mod buckets = bucket). Every partition, episode and
+    transition belongs to one person, so buckets are independent and the result does not depend on their
+    number - it only bounds how much each statement has to hold."""
     period = (
         f"LEFT JOIN {stage.t('obs')} o ON o.person_id = e.person_id AND e.start_date BETWEEN o.obs_start AND o.obs_end"
         if has_observation
@@ -132,7 +138,7 @@ CREATE TABLE {stage.t("ev")} AS
 SELECT e.event_id, e.person_id, e.drug_group, e.product_concept_id AS product, e.start_date,
        e.days_supply AS days, e.source_name || ':' || e.source_record_id AS record, {pid} AS period_id
 FROM {stage.t("ev0")} e {period}
-WHERE e.included
+WHERE e.included AND ((e.person_id % {int(buckets)}) + {int(buckets)}) % {int(buckets)} = {int(bucket)}
 """,
         # one pass of window functions (no self-joins): record merge -> duplicates -> dispensing-day order
         f"""

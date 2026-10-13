@@ -46,6 +46,7 @@ class Settings:
     treatment_timeout_seconds: float = 3600.0  # whole-run budget; the running query is interrupted
     treatment_reference_max_events: int = 250_000  # the in-memory reference engine refuses larger runs
     treatment_stale_run_minutes: int = 360  # 'running' runs older than this are cleaned up as abandoned
+    treatment_bucket_events: int = 5_000_000  # episodes are built per person bucket of about this many events
     prompt_versions: dict[str, str] = field(
         default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2", "proxy_parser": "v1"}
     )
@@ -81,6 +82,7 @@ class Settings:
             treatment_stale_run_minutes=int(
                 env.get("CB_TREATMENT_STALE_RUN_MINUTES", base.treatment_stale_run_minutes)
             ),
+            treatment_bucket_events=int(env.get("CB_TREATMENT_BUCKET_EVENTS", base.treatment_bucket_events)),
             lock_external_access=(
                 env.get("CB_DUCKDB_LOCK_EXTERNAL_ACCESS", "true").strip().lower() not in ("0", "false", "no", "off")
             ),

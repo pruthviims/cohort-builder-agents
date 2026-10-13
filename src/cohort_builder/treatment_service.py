@@ -87,6 +87,7 @@ class TreatmentLimits:
     timeout_seconds: float
     reference_max_events: int
     stale_run_minutes: int
+    bucket_events: int = 5_000_000
 
     @classmethod
     def from_settings(cls, s: Any) -> TreatmentLimits:
@@ -96,6 +97,7 @@ class TreatmentLimits:
             float(s.treatment_timeout_seconds),
             int(s.treatment_reference_max_events),
             int(s.treatment_stale_run_minutes),
+            int(getattr(s, "treatment_bucket_events", 5_000_000)),
         )
         checks = [
             (100 <= lim.batch_size <= 5_000_000, "CB_TREATMENT_BATCH_SIZE must be 100..5000000"),
@@ -103,6 +105,7 @@ class TreatmentLimits:
             (1 <= lim.timeout_seconds <= 7 * 86400, "CB_TREATMENT_TIMEOUT_SECONDS must be 1..604800"),
             (1 <= lim.reference_max_events <= 5_000_000, "CB_TREATMENT_REFERENCE_MAX_EVENTS must be 1..5000000"),
             (1 <= lim.stale_run_minutes <= 100_000, "CB_TREATMENT_STALE_RUN_MINUTES must be 1..100000"),
+            (1 <= lim.bucket_events <= 1_000_000_000, "CB_TREATMENT_BUCKET_EVENTS must be 1..1000000000"),
         ]
         for ok, msg in checks:
             if not ok:
@@ -269,6 +272,9 @@ class TreatmentService:
             ],
         )
         metrics = Metrics()
+        prior_order = self.con.execute("SELECT current_setting('preserve_insertion_order')").fetchone()
+        # every read that needs an order says ORDER BY; this lets large statements spill instead of failing
+        self.con.execute("SET preserve_insertion_order = false")
         reader = self.con.cursor()  # streaming reads run on their own connection to the same database
         cancelled = threading.Event()
 
@@ -299,11 +305,6 @@ class TreatmentService:
                     self._sql_episodes(stage, rules, reader, batch, metrics, check)
                 else:
                     self._reference_episodes(stage, rules, batch)
-            check()
-            stage_name = "transitions"
-            with metrics.timed("transitions"):
-                if engine == "sql":
-                    self.con.execute(transitions_sql(stage, rules))
             check()
             stage_name = "publish"
             self.con.execute("BEGIN")
@@ -353,6 +354,11 @@ class TreatmentService:
             ) from exc
         finally:
             timer.cancel()
+            restore = "true" if not prior_order or prior_order[0] in (True, "true") else "false"
+            try:
+                self.con.execute(f"SET preserve_insertion_order = {restore}")
+            except duckdb.Error:  # pragma: no cover
+                pass
             try:
                 reader.close()
             except duckdb.Error:  # pragma: no cover
@@ -414,6 +420,8 @@ class TreatmentService:
         metrics: Metrics,
         check: Callable[[], None],
     ) -> None:
+        """Steps 0-8 in SQL per person bucket (bounded memory per statement), accumulated into adec/aep/atr.
+        Buckets never split a person, so results do not depend on their number."""
         obs = self._observation_source(rules)
         if obs:
             self.con.execute(observation_sql(stage, obs["table"], obs["key"], obs["start"], obs["end"]))
@@ -421,20 +429,33 @@ class TreatmentService:
             self.con.execute(
                 f"CREATE TABLE {stage.t('obs')} (person_id BIGINT, period_id INTEGER, obs_start DATE, obs_end DATE)"
             )
-        for sql in steps_sql(stage, rules, obs is not None):
-            self.con.execute(sql)
-            check()
-        self.con.execute(coverage_sql(stage, rules))
-        capped = 0
-        if rules.episode.overlap == "shift_forward":
-            row = self.con.execute(capped_partitions_sql(stage, rules.episode.max_carryover_days)).fetchone()
-            capped = int(row[0]) if row else 0
-            if capped:
-                with metrics.timed("episodes_capped_streaming"):
-                    metrics.rows["capped_day_rows"] = recompute_capped(self.con, reader, stage, rules, batch, check)
-        metrics.rows["capped_partitions"] = capped
-        for sql in episodes_sql(stage, rules):
-            self.con.execute(sql)
+        n = int((self.con.execute(f"SELECT count(*) FROM {stage.t('ev0')} WHERE included").fetchone() or (0,))[0])
+        buckets = max(1, -(-n // self.limits.bucket_events))
+        metrics.rows.update(person_buckets=buckets, capped_partitions=0, capped_day_rows=0)
+        for k in range(buckets):
+            for sql in steps_sql(stage, rules, obs is not None, k, buckets):
+                self.con.execute(sql)
+                check()
+            self.con.execute(coverage_sql(stage, rules))
+            if rules.episode.overlap == "shift_forward":
+                row = self.con.execute(capped_partitions_sql(stage, rules.episode.max_carryover_days)).fetchone()
+                capped = int(row[0]) if row else 0
+                if capped:
+                    with metrics.timed("episodes_capped_streaming"):
+                        metrics.rows["capped_day_rows"] += recompute_capped(
+                            self.con, reader, stage, rules, batch, check
+                        )
+                metrics.rows["capped_partitions"] += capped
+            for sql in episodes_sql(stage, rules):
+                self.con.execute(sql)
+                check()
+            with metrics.timed("transitions"):
+                self.con.execute(transitions_sql(stage, rules))
+            for part, acc in (("dec", "adec"), ("ep", "aep"), ("tr", "atr")):
+                verb = f"CREATE TABLE {stage.t(acc)} AS" if k == 0 else f"INSERT INTO {stage.t(acc)}"
+                self.con.execute(f"{verb} SELECT * FROM {stage.t(part)}")
+            for part in ("ev", "st", "day", "cov", "dec", "ep", "tr"):
+                self.con.execute(f"DROP TABLE IF EXISTS {stage.t(part)}")
             check()
 
     def _reference_episodes(self, stage: Stage, rules: TreatmentRuleSet, batch: int) -> None:
@@ -533,12 +554,14 @@ class TreatmentService:
     def _publish(self, stage: Stage, run_id: str, engine: Engine) -> None:
         """Write the run's final rows (inside the completing transaction)."""
         if engine == "sql":  # decisions carry (person, group, period, episode_no); episodes carry the id
+            dec, ep, tr = stage.t("adec"), stage.t("aep"), stage.t("atr")
             episode_ref = "p.episode_id"
             episode_join = (
-                f" LEFT JOIN {stage.t('ep')} p ON p.person_id = d.person_id AND p.drug_group = d.drug_group "
+                f" LEFT JOIN {ep} p ON p.person_id = d.person_id AND p.drug_group = d.drug_group "
                 "AND p.period_id = d.period_id AND p.episode_no = d.episode_no"
             )
         else:
+            dec, ep, tr = stage.t("dec"), stage.t("ep"), stage.t("tr")
             episode_ref, episode_join = "d.episode_id", ""
         cols = [c for c in EVENT_COLUMNS if c not in ("included", "exclusion_reason")]
         self.con.execute(
@@ -548,17 +571,15 @@ class TreatmentService:
             "CASE WHEN d.step IN ('duplicate_event', 'outside_observation') THEN false ELSE e.included END, "
             "CASE WHEN d.step IN ('duplicate_event', 'outside_observation') THEN d.step ELSE e.exclusion_reason END, "
             f"d.step, d.coverage_start, d.coverage_end, d.shifted_days, {episode_ref} "
-            f"FROM {stage.t('ev0')} e LEFT JOIN {stage.t('dec')} d ON d.event_id = e.event_id{episode_join}"
+            f"FROM {stage.t('ev0')} e LEFT JOIN {dec} d ON d.event_id = e.event_id{episode_join}"
         )
         ep_cols = ", ".join(n for n, _ in EPISODE_COLS)
         self.con.execute(
-            f"INSERT INTO results.treatment_episode (run_id, {ep_cols}) SELECT '{run_id}', {ep_cols} "
-            f"FROM {stage.t('ep')}"
+            f"INSERT INTO results.treatment_episode (run_id, {ep_cols}) SELECT '{run_id}', {ep_cols} FROM {ep}"
         )
         tr_cols = ", ".join(n for n, _ in TRANSITION_COLS)
         self.con.execute(
-            f"INSERT INTO results.treatment_transition (run_id, {tr_cols}) SELECT '{run_id}', {tr_cols} "
-            f"FROM {stage.t('tr')}"
+            f"INSERT INTO results.treatment_transition (run_id, {tr_cols}) SELECT '{run_id}', {tr_cols} FROM {tr}"
         )
 
     def _fail(self, run_id: str, stage: Stage, stage_name: str, exc: BaseException, metrics: Metrics) -> None:

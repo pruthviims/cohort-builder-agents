@@ -381,7 +381,7 @@ def test_sql_engine_matches_reference_row_by_row(db, over):
         assert sql["metrics"]["rows"]["capped_partitions"] > 0  # the streaming path really ran
 
 
-def test_batch_size_does_not_change_results(db):
+def test_batch_size_and_person_buckets_do_not_change_results(db):
     rows, obs = random_claims(11, 80)
     fills(db, rows)
     observe(db, obs)
@@ -389,6 +389,12 @@ def test_batch_size_does_not_change_results(db):
     hashes = {run(db, r, "sql", bs)["output_hash"] for bs in (1, 3, 17, 100_000)}
     assert len(hashes) == 1
     assert run(db, r, "reference", 2)["output_hash"] in hashes
+    for bucket_events in (1, 37, 500):  # 1 = one bucket per event-count unit -> many buckets
+        svc = TreatmentService(db)
+        svc.limits = dataclasses.replace(svc.limits, bucket_events=bucket_events)
+        out = svc.run(r, "analyst", "default", source_cfg([RX_SOURCE]), REF_DATE)
+        assert out["metrics"]["rows"]["person_buckets"] > (1 if bucket_events < 500 else 0)
+        assert out["output_hash"] in hashes
 
 
 # ---- E. output hash contract -----------------------------------------------------------------------------------------
@@ -448,10 +454,10 @@ def test_failure_publishes_nothing_and_cleans_up(db, monkeypatch):
         raise RuntimeError("value 'ZZMARKER9876' broke")
 
     monkeypatch.setattr(ts, "transitions_sql", boom)
-    with pytest.raises(TreatmentError, match="stage 'transitions'"):
+    with pytest.raises(TreatmentError, match="stage 'episodes'"):  # transitions are built per person bucket
         run(db)
     row = db.con.execute("SELECT run_id, status, failed_stage, errors_json FROM meta.treatment_run").fetchone()
-    assert row[1:3] == ("failed", "transitions") and "ZZMARKER9876" not in row[3]
+    assert row[1:3] == ("failed", "episodes") and "ZZMARKER9876" not in row[3]
     for t in ("event", "episode", "transition"):
         assert (
             db.con.execute(f"SELECT count(*) FROM results.treatment_{t} WHERE run_id = ?", [row[0]]).fetchone()[0] == 0
