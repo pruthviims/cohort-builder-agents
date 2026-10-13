@@ -1003,6 +1003,16 @@ class TreatmentService:
             limitations.append("No observation periods: censoring and end status cannot be judged ('unknown').")
         if any(s.evidence_type_column for s in sources.sources):
             limitations.append("Evidence type comes from a per-row type column; unlisted types are 'unknown'.")
+        review = {
+            "rule_set": rules.provenance.review_status if rules.provenance else "unspecified",
+            "source_config": sources.provenance.review_status if sources.provenance else "unspecified",
+        }
+        for what, status in review.items():
+            if status != "validated":
+                limitations.append(
+                    f"The {what.replace('_', ' ')} is '{status}', not 'validated': its code groups, mappings and "
+                    "thresholds have not been reviewed for real analyses."
+                )
         return {
             "persons_counted_as": "distinct patients, suppressed below the minimum cell count",
             "records": {
@@ -1027,6 +1037,7 @@ class TreatmentService:
             },
             "drug_groups": groups,
             "transitions": transitions,
+            "review_status": review,
             "limitations": limitations,
         }
 

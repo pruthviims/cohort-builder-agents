@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
@@ -54,8 +55,35 @@ def _ident(v: str | None) -> str | None:
 
 
 def content_hash(model: BaseModel) -> str:
-    blob = json.dumps(model.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    data = model.model_dump(mode="json")
+    if data.get("provenance", "absent") is None:
+        data.pop("provenance")  # configs without a provenance block keep the hash they always had
+    blob = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode()).hexdigest()
+
+
+ReviewStatus = Literal["illustrative", "unverified", "validated"]
+
+
+class Provenance(_M):
+    """Where a configuration's codes, mappings and thresholds come from, and whether anyone reviewed them.
+
+    illustrative  examples for the synthetic demo data; must never be used for real analyses
+    unverified    meant for real use, not yet reviewed
+    validated     reviewed: names the reviewer, the date and the review record (evidence)
+    """
+
+    review_status: ReviewStatus
+    source: str = Field(min_length=1, max_length=500, description="origin of the codes / mappings / thresholds")
+    reviewed_by: str | None = Field(default=None, max_length=200)
+    reviewed_on: date | None = None
+    evidence: str | None = Field(default=None, max_length=500, description="review record / ticket / document")
+
+    @model_validator(mode="after")
+    def _review(self) -> Provenance:
+        if self.review_status == "validated" and not (self.reviewed_by and self.reviewed_on and self.evidence):
+            raise ValueError("review_status 'validated' needs reviewed_by, reviewed_on and evidence")
+        return self
 
 
 # ---- sources ---------------------------------------------------------------------------------------------
@@ -185,6 +213,7 @@ class TreatmentSourceConfig(_M):
     description: str = Field(default="", max_length=2000)
     sources: list[TreatmentSource] = Field(min_length=1, max_length=20)
     notes: list[str] = Field(default_factory=list)
+    provenance: Provenance | None = None
 
     @model_validator(mode="after")
     def _unique(self) -> TreatmentSourceConfig:
@@ -264,6 +293,7 @@ class TreatmentRuleSet(_M):
     censoring: CensoringRule
     transitions: TransitionRule
     notes: list[str] = Field(default_factory=list)
+    provenance: Provenance | None = None
 
     @field_validator("name")
     @classmethod

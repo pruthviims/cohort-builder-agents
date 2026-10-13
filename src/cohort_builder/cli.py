@@ -109,9 +109,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     t.add_argument("--user", default="cli")
 
+    s = sub.add_parser("ontology", help="ontology / configuration checks")
+    ox = s.add_subparsers(dest="ontology_cmd", required=True)
+    t = ox.add_parser("validate", help="validate treatment rule sets and source configs (exit 1 on errors)")
+    t.add_argument("--ontology-dir", type=Path, help="default CB_ONTOLOGY_DIR")
+    t.add_argument(
+        "--vocabulary", action="store_true", help="also check against the vocabulary in CB_DB_PATH (read-only)"
+    )
     s = sub.add_parser("init-demo", help="create the demo vocabulary and synthetic patients")
     s.add_argument("--persons", type=int, default=5000, help="patients per demo source (OMOP and LAAD-style)")
     s.add_argument("--seed", type=int, default=42)
+    s = sub.add_parser(
+        "init-t2d-demo",
+        help="create a NEW database: demo vocabulary + synthetic type 2 diabetes claims in the laad schema",
+    )
+    s.add_argument("--patients", type=int, default=10_000)
+    s.add_argument("--seed", type=int, default=2026)
     s = sub.add_parser("load-athena", help="load an OHDSI Athena vocabulary download")
     s.add_argument("directory", type=Path)
 
@@ -203,6 +216,13 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--tenant", help="only this tenant's runs")
     t.add_argument("--archive-dir", type=Path, help="verified archive before purging (below CB_TREATMENT_ARCHIVE_ROOT)")
     t.add_argument("--apply", action="store_true", help="actually purge (default: dry run, nothing changes)")
+    t.add_argument("--user", default="cli")
+    t = tx.add_parser("export", help="write a completed run's summary (and patient-level CSVs if allowed)")
+    t.add_argument("run_id")
+    t.add_argument("--out", type=Path, required=True, help="new or empty directory (created 0700)")
+    t.add_argument(
+        "--patient-level", action="store_true", help="also episodes/events/transitions (CB_ALLOW_PATIENT_LEVEL)"
+    )
     t.add_argument("--user", default="cli")
     t = tx.add_parser("summary", help="provenance and suppressed aggregate summary of a run")
     t.add_argument("run_id")
@@ -344,6 +364,38 @@ def main(argv: list[str] | None = None) -> int:
         con = connect(settings.db_path)
         _print(build_demo_database(con, a.persons, a.seed))
         print(f"Demo database written to {settings.db_path}")
+        return 0
+    if a.cmd == "ontology":
+        import duckdb
+
+        from .ontology_validate import validate_ontology
+
+        vcon = None
+        if a.vocabulary:
+            if not settings.db_path.exists():
+                sys.exit(f"refused: no database at {settings.db_path} for --vocabulary")
+            vcon = duckdb.connect(str(settings.db_path), read_only=True)
+        try:
+            report = validate_ontology(a.ontology_dir or settings.ontology_dir, vcon)
+        finally:
+            if vcon is not None:
+                vcon.close()
+        _print(report)
+        return 1 if report["errors"] else 0
+    if a.cmd == "init-t2d-demo":
+        from .db import init_schemas
+        from .synthetic import load_demo_vocabulary
+        from .synthetic_t2d import generate_laad_t2d
+
+        if settings.db_path.exists():  # never overwrite an existing database
+            sys.exit(f"refused: {settings.db_path} exists; set CB_DB_PATH to a new file")
+        con = connect(settings.db_path)
+        init_schemas(con)
+        load_demo_vocabulary(con)
+        stats = generate_laad_t2d(con, a.patients, a.seed)
+        con.close()
+        _print(stats)
+        print(f"SYNTHETIC T2D database written to {settings.db_path} (use CB_DATASET=iqvia_laad)", file=sys.stderr)
         return 0
     if a.cmd == "load-athena":
         from .synthetic import load_athena
@@ -603,6 +655,11 @@ def _treatment(b, a) -> int:
             ref = date.fromisoformat(a.reference_date) if a.reference_date else None
             with _cancel_on_signals():
                 _print(svc.run(rules, a.user, None, sources, ref, a.engine, a.batch_size, a.reuse))
+        elif a.treatment_cmd == "export":
+            from .treatment_export import export_run
+
+            # the CLI runs with direct database access (operator = admin); the policy flag still applies
+            _print(export_run(svc, a.run_id, a.out.absolute(), a.user, True, a.patient_level, None))
         elif a.treatment_cmd == "cancel":
             _print(svc.cancel(a.run_id, a.user, None))
         elif a.treatment_cmd in ("hold", "release"):
@@ -614,7 +671,8 @@ def _treatment(b, a) -> int:
             from .treatment_retention import apply_retention
 
             days = a.older_than_days if a.older_than_days is not None else b.settings.treatment_retention_days
-            _print(apply_retention(svc, days, a.user, a.tenant, not a.apply, a.archive_dir))
+            archive = a.archive_dir.absolute() if a.archive_dir else None
+            _print(apply_retention(svc, days, a.user, a.tenant, not a.apply, archive))
         elif a.treatment_cmd == "cleanup":
             minutes = a.older_than_minutes if a.older_than_minutes is not None else svc.limits.stale_run_minutes
             _print(svc.cleanup_incomplete_runs(minutes, a.user))

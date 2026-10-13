@@ -20,3 +20,6 @@ sources:
       "32825": dispensing       # EHR dispensing record
       "32838": prescription     # EHR prescription
       "32818": administration   # EHR administration record
+provenance:
+  review_status: unverified                 # OMOP CDM v5.4 columns; type concept ids to be checked per vocabulary release
+  source: OMOP CDM v5.4 drug_exposure conventions; drug type concept ids from the OMOP Type Concept vocabulary.

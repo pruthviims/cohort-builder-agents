@@ -25,6 +25,8 @@ jobs:
         run: ruff format --check src tests
       - name: mypy (types)
         run: mypy
+      - name: ontology / treatment configuration validation
+        run: cohort-builder ontology validate
 
   test:
     runs-on: ubuntu-latest
@@ -56,6 +58,47 @@ jobs:
         with:
           name: coverage-xml
           path: coverage.xml
+
+  slow-tests:
+    runs-on: ubuntu-latest
+    env:
+      CB_ENV: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[api,mcp,dev]"
+      - name: slow tests (10k synthetic T2D end-to-end)
+        run: pytest -q -m slow
+
+  synthetic-smoke:
+    # generate -> validate against the vocabulary -> run -> export, on SYNTHETIC T2D claims only
+    runs-on: ubuntu-latest
+    env:
+      CB_ENV: production
+      CB_DB_PATH: ${{ github.workspace }}/smoke/t2d.duckdb
+      CB_DATASET: iqvia_laad
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[api,mcp,dev]"
+      - run: mkdir -p smoke
+      - name: generate synthetic T2D claims
+        run: cohort-builder init-t2d-demo --patients 2000 --seed 2026 > smoke/generate.json
+      - name: validate configuration against the vocabulary
+        run: cohort-builder ontology validate --vocabulary
+      - name: run the treatment engine
+        run: |
+          cohort-builder treatment run --rules glucose_lowering_example --reference-date 2026-06-30 > smoke/run.json
+          python -c "import json,sys; r=json.load(open('smoke/run.json')); sys.exit(r['status'] != 'completed')"
+      - name: export the aggregate summary
+        run: |
+          RUN_ID=$(python -c "import json; print(json.load(open('smoke/run.json'))['run_id'])")
+          cohort-builder treatment export "$RUN_ID" --out smoke/export
+          python -c "import json,sys; m=json.load(open('smoke/export/manifest.json')); sys.exit(m['data'] != 'synthetic')"
 
   security:
     runs-on: ubuntu-latest

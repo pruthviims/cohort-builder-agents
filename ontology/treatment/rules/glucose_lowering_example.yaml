@@ -31,3 +31,8 @@ transitions:
   switch_window_days: 90
 notes:
   - Transition labels (switch, add_on, restart, discontinuation) are evidence patterns in claims, not clinical facts.
+provenance:
+  review_status: illustrative               # examples for the synthetic demo data, NOT clinically validated
+  source: >-
+    Ingredient concept ids from the OMOP standard vocabulary (RxNorm); gap, carry-over, washout and
+    transition thresholds chosen for illustration only.

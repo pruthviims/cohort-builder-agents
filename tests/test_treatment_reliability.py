@@ -611,3 +611,33 @@ def test_cli_cancel_hold_retention(settings, monkeypatch, capsys, tmp_path):
     assert got["purged"] == 1 and got["archived"] == 1 and (root / "x" / rid / "manifest.json").is_file()
     with pytest.raises(SystemExit, match=">= 1"):
         cli(["treatment", "retention"])  # CB_TREATMENT_RETENTION_DAYS defaults to 0: refuse, never purge all
+
+
+# ---- determinism ------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("seed", [5, 23])
+def test_row_order_and_thread_count_do_not_change_output(tmp_path, seed):
+    """Same rows loaded in three physical orders, run with 1 and 2 DuckDB threads: one output hash and one
+    input fingerprint."""
+    import random
+
+    from test_treatment_scale import random_claims
+
+    rows, obs = random_claims(seed, 120)
+    hashes, prints = set(), set()
+    for k, order in enumerate(("as_is", "reversed", "shuffled")):
+        b = make_db(tmp_path / f"{seed}_{order}")
+        try:
+            observe(b, obs)
+            data = list(rows)
+            if order == "reversed":
+                data.reverse()
+            elif order == "shuffled":
+                random.Random(seed).shuffle(data)
+            fills(b, data)
+            b.con.execute(f"SET threads = {1 + k % 2}")
+            out = go(service(b), rules(episode={"max_carryover_days": 5}))
+            hashes.add(out["output_hash"])
+            prints.add(out["input_fingerprint"])
+        finally:
+            b.con.close()
+    assert len(hashes) == 1 and len(prints) == 1

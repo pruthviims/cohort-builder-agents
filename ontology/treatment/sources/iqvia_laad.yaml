@@ -32,3 +32,8 @@ sources:
     code_type_values: {CPT: CPT4, HCPCS: HCPCS}
 notes:
   - Medical lines carry no adjudication status in this layout (claim status 'not_applicable').
+provenance:
+  review_status: illustrative               # placeholder LAAD-like layout; real deliveries need their own mapping
+  source: >-
+    Placeholder table/column names and transaction codes of the synthetic laad schema
+    (src/cohort_builder/synthetic_laad.py, synthetic_t2d.py), not a vendor data dictionary.
