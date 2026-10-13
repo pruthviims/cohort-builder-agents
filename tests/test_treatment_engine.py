@@ -581,6 +581,16 @@ def test_cli_run_summary_and_gated_explain(settings, tmp_path, monkeypatch, caps
         cli(["treatment", "explain", out["run_id"], "1:metformin:1"])
     with pytest.raises(SystemExit, match="unknown treatment rule set"):
         cli(["treatment", "run", "--rules", "nope"])
+    # fixed reference date, the reference engine and a small batch give the same logical output
+    args = ["treatment", "run", "--rules", "glucose_lowering_example", "--reference-date", "2026-06-30"]
+    assert cli(args + ["--engine", "reference", "--batch-size", "7"]) == 0
+    ref = json.loads(capsys.readouterr().out)
+    assert cli(args) == 0
+    sql = json.loads(capsys.readouterr().out)
+    assert ref["reference_date"] == sql["reference_date"] == "2026-06-30" and ref["engine"] == "reference"
+    assert ref["output_hash"] == sql["output_hash"]
+    assert cli(["treatment", "cleanup", "--older-than-minutes", "0"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"abandoned_runs": 0, "dropped_staging_tables": 0}
 
 
 def test_api_roles_tenants_and_validation(builder, tmp_path):
@@ -601,9 +611,11 @@ def test_api_roles_tenants_and_validation(builder, tmp_path):
     body = {"rule_set": "glucose_lowering_example"}
     assert c.post("/treatment-runs", json=body).status_code == 401
     assert c.post("/treatment-runs", json=body, headers=heads["au"]).status_code == 403
-    r = c.post("/treatment-runs", json=body, headers=heads["ex"])
+    r = c.post("/treatment-runs", json={**body, "reference_date": "2026-06-30"}, headers=heads["ex"])
     assert r.status_code == 200, r.text
     run_id = r.json()["run_id"]
+    assert r.json()["reference_date"] == "2026-06-30"
+    assert c.post("/treatment-runs", json={**body, "reference_date": "June 30"}, headers=heads["ex"]).status_code == 422
     assert c.get(f"/treatment-runs/{run_id}", headers=heads["ex"]).json()["output_hash"] == r.json()["output_hash"]
     assert c.get(f"/treatment-runs/{run_id}", headers=heads["rv"]).status_code == 404  # other tenant
     explain = f"/treatment-runs/{run_id}/episodes/1:metformin:1/explanation"
