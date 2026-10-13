@@ -257,7 +257,7 @@ are only staged; register later with `cohort-builder csv map --dataset NAME --ma
 
 **What happens to each file.**
 - **Checks:** the file must exist, be `.csv` or `.tsv`, be no larger than `CB_INGEST_MAX_BYTES` (default
-  200 MB), and be strict UTF-8; the first invalid line is reported.
+  200 MB), and be strict UTF-8 text (no NUL bytes); the first invalid line is reported.
 - **Header and rows:** headers are normalized to SQL-safe names. Duplicate, empty or unusable names are
   refused, and so are malformed rows. Rows are never silently dropped; errors list line numbers, never
   values.
@@ -267,14 +267,16 @@ are only staged; register later with `cohort-builder csv map --dataset NAME --ma
   type: a column only becomes numeric or a date when **every** value converts exactly.
   - whole numbers -> BIGINT, except: a leading zero (`00123`), more than 18 digits (beyond exact 64-bit
     integers), or an identifier/code column name -> exact text
-  - decimals -> DOUBLE, except: more than 15 significant digits (a DOUBLE cannot hold them exactly) or an
-    identifier/code column name (ICD-9 `250.00` keeps its zeros) -> exact text
+  - decimals -> DOUBLE, except: more than 15 significant digits or a value outside the exact DOUBLE range
+    (`1e999` would become infinity, `1e-400` zero), a leading zero (`007.5`), or an identifier/code column
+    name (ICD-9 `250.00` keeps its zeros) -> exact text
   - ISO dates -> DATE; true/false -> BOOLEAN
   - anything else -> text; a column with mostly numeric or date-like values gets a "mixed values" warning
   - **Name heuristic (conservative: it can only keep a column as text, never make it numeric):**
     identifiers are `*_id`, `*_key`, `*identifier`, `mrn`, `npi`, `ssn`, zip/postal codes, or names
     containing person/patient/subject/member; codes contain code, icd, ndc, cpt, hcpcs, loinc, snomed,
-    rxnorm, atc, drg or revenue. `*concept_id` columns are OMOP concept ids and stay integers.
+    rxnorm, atc, drg or revenue, or are the word dx, px, diag, diagnosis, proc or procedure (`dx1`,
+    `proc_2`; not `dx_date`). `*concept_id` columns are OMOP concept ids and stay integers.
   - Each column gets a descriptive **kind**: identifier, code, concept_id, date, quantity (whole
     numbers), measurement (decimals), flag or text.
   - **Overrides:** `--type TABLE.COLUMN=TYPE` (ingest), `--type COLUMN=TYPE` (profile), or
@@ -298,6 +300,7 @@ are only staged; register later with `cohort-builder csv map --dataset NAME --ma
 - **`entities`** (one per ontology entity you map):
   - required: `table`, `person_column`, `start_column`
   - optional: `end_column` and `date_format` (for text dates such as `%m/%d/%Y`)
+  - dates: prefer four-digit years; a `%y` format gets a warning (`68` is read as 2068)
   - concepts: either `concept_id_column` (standard concept ids) or `code_column` + `vocabulary`
     (`ICD10CM`, `NDC`, `LOINC`, ...), mapped through the vocabulary's "Maps to", with an optional
     `code_normalization` (below)
@@ -333,7 +336,8 @@ usable rows:
   `distinct_unmatched_codes`, `missing_code_rows`, `unrecognized_format_rows`, `multi_concept_rows` (one
   code -> several standard concepts, so `view_rows` can exceed usable), `ambiguous_key_rows`, and
   `codes_with_several_spellings`. Concept-id columns report unknown and non-standard ids instead.
-- **Other checks:** invalid end dates, end before start, missing values and unrecognized units,
+- **Other checks:** invalid end dates, end before start, start dates before 1900 or in the future, years
+  of birth before 1900 or in the future (reported, never altered), missing values and unrecognized units,
   patients missing from the person table, patients without observation, excluded observation periods,
   relationship orphans and conflicting person records.
 
@@ -364,7 +368,9 @@ on them are refused with a message naming the missing data), and the observation
   `POST /datasets/reconcile`, admin) republishes it from the stored profile. It also rewrites missing or
   modified profile files of registered versions, repairs the latest pointer, marks abandoned `allocating`
   rows as failed, and removes leftover temp files and generated files of unregistered versions (never
-  files it didn't generate). Run it when no import is in progress.
+  files it didn't generate). Unfinished imports and temp files younger than
+  `--abandoned-after-minutes` (default 60) may belong to an import that is still running and are only
+  reported; pass `0` once you know no import is running.
 - **Activation check:** selecting an imported dataset checks its profile against the database. A profile
   for a version that isn't `registered` here, whose content hash differs (edited, stale, or from another
   database), or a `<dataset>.yaml` that isn't the latest registered version is refused with a message
@@ -727,6 +733,7 @@ throwaway credentials only.
 | `CB_ALLOW_PATIENT_LEVEL` | `false` (per-patient proxy explanations for admins) |
 | `CB_LOCAL_DATASETS_DIR` | `data/datasets` (profiles of imported CSV datasets; git-ignored) |
 | `CB_INGEST_MAX_BYTES` | `209715200` (200 MB per CSV file) |
+| `CB_API_MAX_BODY_BYTES` | `134217728` (128 MiB per HTTP request body; larger bodies get `413` before authentication) |
 | `ANTHROPIC_API_KEY` | (required for `ask` in live/cached mode) |
 | `CB_DATASET` | `omop_demo` (or `iqvia_laad`) |
 | `CB_MODEL` | `claude-sonnet-5-5` |

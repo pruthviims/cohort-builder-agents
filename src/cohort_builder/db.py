@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,17 @@ def init_schemas(con: duckdb.DuckDBPyConnection) -> None:
 
     for ddl in (VOCAB_DDL, CDM_DDL, RESULTS_DDL, META_DDL):
         con.execute(ddl)
+
+
+_QUOTED = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+
+def redact_error(exc: BaseException, limit: int = 300) -> str:
+    """Exception type + message with every quoted literal replaced: database messages quote the offending
+    VALUE (e.g. "Could not convert string 'X' to INT64", 'duplicate key "..."'), which may be patient data.
+    Use this for anything written to logs."""
+    msg = _QUOTED.sub("<redacted>", str(exc)).replace("\n", " ")
+    return f"{type(exc).__name__}: {msg[:limit]}"
 
 
 class MissingRowError(RuntimeError):

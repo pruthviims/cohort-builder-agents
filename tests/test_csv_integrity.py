@@ -27,6 +27,7 @@ from cohort_builder.dataset_registry import (
 )
 from cohort_builder.db import connect, init_schemas
 from cohort_builder.ir import CohortDefinition
+from cohort_builder.metadata import now
 from cohort_builder.ontology import Ontology
 from cohort_builder.orchestrator import CohortBuilder
 from cohort_builder.security import SecurityConfig, issue_token
@@ -230,6 +231,7 @@ def test_dropped_rows_are_reported_for_code_mappings(reg, tmp_path):
         "usable_rows": 2,
         "invalid_end_date": 0,
         "end_before_start": 0,
+        "start_date_out_of_range": 0,
     }
     rows = c["rows"]
     assert rows["staged_rows"] == sum(
@@ -518,7 +520,8 @@ def test_reconcile_cleans_abandoned_rows_and_stale_files(demo_reg):
     reg.ingest("clinic", example_files(), "alice", mapping=example_mapping())
     reg.con.execute(
         "INSERT INTO meta.dataset_version (ingest_id, dataset, version, status, created_by, created_at) "
-        "VALUES ('crashed', 'clinic', 2, 'allocating', 'alice', now())"
+        "VALUES ('crashed', 'clinic', 2, 'allocating', 'alice', ?)",
+        [now()],
     )
     stale = dict(yaml.safe_load((reg.local_dir / "clinic__v1.yaml").read_text()))
     stale["source"] = {**stale["source"], "version": 7}
@@ -526,14 +529,13 @@ def test_reconcile_cleans_abandoned_rows_and_stale_files(demo_reg):
     (reg.local_dir / "clinic__v8.yaml").write_text("name: clinic__v8\nnote: hand-written, not generated\n")
     (reg.local_dir / ".tmp-abc.yaml").write_text("partial")
     (reg.local_dir / "clinic__v1.yaml").unlink()  # registered version lost its file
-    out = reg.reconcile("ops", "clinic")
+    left = reg.reconcile("ops", "clinic")  # default: a just-started import may still be running
+    acts = {(a.get("version"), a["action"]) for a in left["actions"]}
+    assert {(2, "left_in_progress"), (7, "removed_stale_profile"), (1, "rewrote_profile")} <= acts
+    assert (reg.local_dir / ".tmp-abc.yaml").exists() and reg.versions("clinic")[0]["status"] == "allocating"
+    out = reg.reconcile("ops", "clinic", abandoned_after_minutes=0)  # operator: nothing is running
     acts = {(a.get("version"), a["action"]) for a in out["actions"]}
-    assert {
-        (2, "marked_failed"),
-        (7, "removed_stale_profile"),
-        (1, "rewrote_profile"),
-        (None, "removed_temp_file"),
-    } <= acts
+    assert acts == {(2, "marked_failed"), (None, "removed_temp_file")}
     assert (reg.local_dir / "clinic__v8.yaml").is_file()  # files we did not generate are never deleted
     assert (reg.local_dir / "clinic__v1.yaml").is_file() and no_temp_files(reg)
     assert {v["version"]: v["status"] for v in reg.versions("clinic")} == {1: "registered", 2: "failed"}

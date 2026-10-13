@@ -17,7 +17,10 @@ altered to fit a type: a column only gets a numeric or date type when EVERY valu
        - the column NAME marks an identifier or code (below) -> VARCHAR (ids and codes stay exact text)
        - otherwise                                           -> BIGINT
   3. every value is a plain decimal number (optional exponent):
-       - some have more than 15 significant digits           -> VARCHAR (a DOUBLE could not hold it exactly)
+       - some have more than 15 significant digits, or are out of the exact DOUBLE range (overflow to
+         infinity, underflow to zero or subnormal, e.g. '1e999', '1e-400')
+                                                             -> VARCHAR (a DOUBLE could not hold it exactly)
+       - some have a leading zero ('007.5')                  -> VARCHAR (as for whole numbers)
        - the column name marks an identifier or code         -> VARCHAR (e.g. ICD-9 '250.00' keeps its zeros)
        - otherwise                                           -> DOUBLE
   4. every value is an ISO date YYYY-MM-DD                   -> DATE
@@ -27,7 +30,8 @@ altered to fit a type: a column only gets a numeric or date type when EVERY valu
 Name heuristic (conservative; it can only keep a column as TEXT, never make it numeric):
   identifier: *_id, *_key, *identifier, mrn, npi, ssn, zip / postal code, or containing person / patient /
               subject / member;  code: containing code, icd, ndc, cpt, hcpcs, loinc, snomed, rxnorm, atc,
-              drg, revenue.  Exception: *concept_id columns hold OMOP concept ids (integers by definition).
+              drg, revenue, or the word dx / px / diag / diagnosis / proc / procedure (e.g. dx1, proc_2), unless
+              the name marks a date (dx_date).  Exception: *concept_id columns hold OMOP concept ids.
 Explicit per-column overrides (`column_types`) replace inference; they are validated the same way (every
 value must convert exactly) and recorded as type_source 'override'.
 Each column also gets a descriptive `kind`: identifier, code, concept_id, date, quantity (whole numbers),
@@ -62,9 +66,13 @@ _ID_NAME = re.compile(r"((^|_)(id|key|identifier)$|^(mrn|npi|ssn|zip|zipcode|zip
 _PATIENT_NAME = re.compile(r"(person|patient|subject|member|mrn)")
 SOURCE_ROW = "_source_row"  # system column (user columns cannot start with '_')
 _DATE_NAME = re.compile(r"(date|_dt$|_dt_|^dt_|_time$|timestamp)")
+_DOUBLE_MIN_NORMAL = 2.2250738585072014e-308  # smaller non-zero values lose precision (subnormal)
 _INT_RE = "[+-]?[0-9]{1,18}"  # fits BIGINT without overflow
 _NUM_RE = "[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]{1,3})?"
-_CODE_NAME = re.compile(r"(code|concept|icd|ndc|loinc|cpt|hcpcs|snomed|rxnorm|atc|drg|revenue|vocabulary)")
+_CODE_NAME = re.compile(
+    r"(code|concept|icd|ndc|loinc|cpt|hcpcs|snomed|rxnorm|atc|drg|revenue|vocabulary)"
+    r"|(^|_)(dx|px|diag|diagnosis|proc|procedure)([0-9_]|$)"
+)
 _CONCEPT_ID_NAME = re.compile(r"concept_id$")
 
 
@@ -120,6 +128,13 @@ class FileInfo:
     sha256: str
 
 
+def _nul_error(name: str, line: int) -> IngestError:
+    return IngestError(
+        f"{name}: line {line} contains a NUL byte (binary content is not CSV text)",
+        [{"code": "invalid_encoding", "message": "NUL byte in text", "line": line}],
+    )
+
+
 def check_file(path: Path, max_bytes: int | None = None) -> FileInfo:
     """Existence, regular file, extension, size and strict UTF-8 (with line number of the first bad line)."""
     limit = max_bytes or max_bytes_from_env()
@@ -152,6 +167,8 @@ def check_file(path: Path, max_bytes: int | None = None) -> FileInfo:
                     f"{path.name}: line {i} is not valid UTF-8 (re-save the file as UTF-8)",
                     [{"code": "invalid_encoding", "message": "not valid UTF-8", "line": i}],
                 ) from None
+            if b"\x00" in line:
+                raise _nul_error(path.name, i)
     return FileInfo(path.name, ALLOWED_EXTENSIONS[ext], size, "sha256:" + digest.hexdigest())
 
 
@@ -169,7 +186,15 @@ def check_text(name: str, text: str, max_bytes: int) -> FileInfo:
             f"unsupported file type {ext or '(none)'!r}; expected one of {sorted(ALLOWED_EXTENSIONS)}",
             [{"code": "unsupported_extension", "message": f"unsupported extension {ext!r}"}],
         )
-    data = text.encode("utf-8")
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:  # lone surrogates in JSON input
+        raise IngestError(
+            f"{base}: content is not valid Unicode text",
+            [{"code": "invalid_encoding", "message": "not valid UTF-8"}],
+        ) from None
+    if "\x00" in text:
+        raise _nul_error(base, text.count("\n", 0, text.index("\x00")) + 1)
     if not data:
         raise IngestError(f"{base} is empty", [{"code": "empty_file", "message": "file is empty"}])
     if len(data) > max_bytes:
@@ -224,6 +249,8 @@ def name_kind(col: str) -> str | None:
         return "concept_id"
     if _ID_NAME.search(col) or _PATIENT_NAME.search(col):
         return "identifier"
+    if _DATE_NAME.search(col):  # dx_date, procedure_date: a date, not a code
+        return None
     if _CODE_NAME.search(col):
         return "code"
     return None
@@ -342,9 +369,9 @@ class ColumnStats:
     n: int
     ints: int  # whole numbers with <= 18 digits
     long_ints: int  # whole numbers with > 18 digits
-    zeros: int  # whole numbers with a leading zero
+    zeros: int  # numbers with a leading zero ('007', '007.5')
     nums: int  # plain decimal numbers (includes whole numbers)
-    wide_nums: int  # numbers with > 15 significant digits
+    wide_nums: int  # numbers a DOUBLE cannot hold exactly (> 15 significant digits, overflow, underflow)
     dates: int
     bools: int
 
@@ -357,9 +384,11 @@ def _stats(con: duckdb.DuckDBPyConnection, raw: str, col: str) -> ColumnStats:
         f"SELECT count({c}), "
         f"count(*) FILTER (WHERE regexp_full_match({c}, '{_INT_RE}')), "
         f"count(*) FILTER (WHERE regexp_full_match({c}, '[+-]?[0-9]{{19,}}')), "
-        f"count(*) FILTER (WHERE regexp_full_match({c}, '[+-]?0[0-9]+')), "
+        f"count(*) FILTER (WHERE regexp_full_match({c}, '[+-]?0[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?')), "
         f"count(*) FILTER (WHERE regexp_full_match({c}, '{_NUM_RE}')), "
-        f"count(*) FILTER (WHERE regexp_full_match({c}, '{_NUM_RE}') AND length({digits}) > 15), "
+        f"count(*) FILTER (WHERE regexp_full_match({c}, '{_NUM_RE}') AND (length({digits}) > 15 OR "
+        f"NOT isfinite(TRY_CAST({c} AS DOUBLE)) OR (length({digits}) > 0 AND "
+        f"abs(TRY_CAST({c} AS DOUBLE)) < {_DOUBLE_MIN_NORMAL!r}))), "
         f"count(*) FILTER (WHERE regexp_full_match({c}, '[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}') "
         f"AND TRY_CAST({c} AS DATE) IS NOT NULL), "
         f"count(*) FILTER (WHERE lower({c}) IN ('true', 'false')) FROM {raw}"
@@ -383,7 +412,9 @@ def _infer(col: str, st: ColumnStats) -> tuple[str, str, list[str]]:
         return "BIGINT", "concept_id" if nk == "concept_id" else "quantity", []
     if st.nums == st.n:
         if st.wide_nums:
-            return "VARCHAR", nk or "text", ["numbers with more than 15 significant digits kept as exact text"]
+            return "VARCHAR", nk or "text", ["numbers a DOUBLE cannot hold exactly (precision or range) kept as text"]
+        if st.zeros:
+            return "VARCHAR", nk or "code", ["numbers with leading zeros kept as exact text"]
         if exact_text:
             return "VARCHAR", nk or "text", [f"{nk} column: numeric-looking values kept as exact text"]
         return "DOUBLE", "measurement", []

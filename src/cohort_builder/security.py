@@ -55,6 +55,19 @@ class AuthError(Exception):
     """Missing, malformed, unknown or expired credentials."""
 
 
+DEFAULT_MAX_BODY_BYTES = 128 * 1024 * 1024  # CSV ingestion: 20 files x 5M characters, plus JSON overhead
+
+
+def _int(env: dict[str, str], key: str, default: int) -> int:
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ConfigError(f"{key} must be an integer") from None
+
+
 def _bool(env: dict[str, str], key: str, default: bool = False) -> bool:
     raw = env.get(key)
     if raw is None or raw.strip() == "":
@@ -195,6 +208,8 @@ class SecurityConfig:
     allow_draft_execution: bool = False
     # patient-level proxy explanations (per-patient evidence) for admins; off unless explicitly enabled
     allow_patient_level: bool = False
+    # request bodies are buffered before authentication runs, so the size is capped for every request
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
 
     @property
     def is_production(self) -> bool:
@@ -218,11 +233,14 @@ class SecurityConfig:
             allow_self_approval=_bool(env, "CB_ALLOW_SELF_APPROVAL"),
             allow_draft_execution=_bool(env, "CB_ALLOW_DRAFT_EXECUTION"),
             allow_patient_level=_bool(env, "CB_ALLOW_PATIENT_LEVEL"),
+            max_body_bytes=_int(env, "CB_API_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
         )
         cfg.check()
         return cfg
 
     def check(self) -> None:
+        if self.max_body_bytes < 1024:
+            raise ConfigError("CB_API_MAX_BODY_BYTES must be at least 1024")
         if self.is_production and self.dev_bypass:
             raise ConfigError("CB_AUTH_DEV_BYPASS is not allowed when CB_ENV=production")
         if self.is_production and self.allow_draft_execution:

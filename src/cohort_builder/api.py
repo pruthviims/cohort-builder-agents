@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import traceback
 import uuid
 from collections.abc import Callable
 from datetime import date
@@ -54,6 +55,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from .agents.composer import format_validation_error
 from .agents.validator import validate
+from .db import redact_error
 from .executor import ExecutionError, QueryTimeout
 from .ir import CohortDefinition
 from .orchestrator import CohortBuilder, GovernanceError
@@ -75,6 +77,68 @@ from .security import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class BodySizeLimit:
+    """Reject request bodies above `limit` bytes (413) before they are buffered: FastAPI reads the body
+    before authentication runs, so without this an unauthenticated client could make the server hold an
+    arbitrarily large body in memory. Checks Content-Length, and counts streamed bytes when it is absent."""
+
+    def __init__(self, app: Any, limit: int) -> None:
+        self.app, self.limit = app, limit
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope.get("headers") or []).get(b"content-length")
+        if declared is not None and (not declared.isdigit() or int(declared) > self.limit):
+            await self._reject(send)
+            return
+        seen = 0
+        state = {"started": False, "rejected": False}
+
+        async def limited_receive() -> dict:
+            nonlocal seen
+            if state["rejected"]:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.limit:
+                    # answer now and make the app stop reading (it sees a disconnect); its own response,
+                    # if any, is dropped below
+                    if not state["started"]:
+                        state["rejected"] = True
+                        await self._reject(send)
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message: dict) -> None:
+            if state["rejected"]:
+                return
+            if message["type"] == "http.response.start":
+                state["started"] = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, guarded_send)
+        except Exception:
+            if not state["rejected"]:
+                raise
+
+    async def _reject(self, send: Callable) -> None:
+        body = b'{"detail":"request body too large (CB_API_MAX_BODY_BYTES)"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
 ANY_ROLE = tuple(sorted(ROLES))
 
 
@@ -204,6 +268,7 @@ def create_app(
         log.warning("no API tokens configured (CB_AUTH_TOKENS_FILE): all protected endpoints will return 401")
 
     app = FastAPI(title="Cohort Builder Agents", version="0.2.0")
+    app.add_middleware(BodySizeLimit, limit=security.max_body_bytes)
     state: dict[str, Any] = {"builder": builder}
     if builder is not None:
         builder.policy = policy
@@ -275,7 +340,9 @@ def create_app(
     @app.exception_handler(Exception)
     def _unexpected(_: Request, exc: Exception) -> JSONResponse:
         error_id = str(uuid.uuid4())[:8]
-        log.exception("unhandled error [%s]", error_id)
+        # no log.exception: exception messages can quote data values; log the redacted message + frames
+        frames = "".join(traceback.format_tb(exc.__traceback__))
+        log.error("unhandled error [%s]: %s\n%s", error_id, redact_error(exc), frames)
         return JSONResponse({"detail": "internal error", "error_id": error_id}, status_code=500)
 
     # ---- endpoints ---------------------------------------------------------------------
