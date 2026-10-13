@@ -16,7 +16,7 @@ from cohort_builder import treatment_service as ts
 from cohort_builder.config import Settings
 from cohort_builder.orchestrator import CohortBuilder
 from cohort_builder.treatment_config import TreatmentRuleSet
-from cohort_builder.treatment_engine import HASH_SECTIONS, OUTPUT_HASH_VERSION, bulk_insert, output_hash
+from cohort_builder.treatment_engine import HASH_SECTIONS, OUTPUT_HASH_VERSION, bulk_insert, diff_runs, output_hash
 from cohort_builder.treatment_service import TreatmentError, TreatmentLimits, TreatmentService
 from fake_llm import FakeLLM
 from test_treatment_engine import ANCESTORS, CONCEPTS, MAPS, rules, source_cfg
@@ -69,6 +69,12 @@ RX_SOURCE = {
 @pytest.fixture
 def db(tmp_path):
     """Empty claims tables, a tiny vocabulary and helpers to load fills and observation periods."""
+    b = make_db(tmp_path)
+    yield b
+    b.con.close()
+
+
+def make_db(tmp_path) -> CohortBuilder:
     s = dataclasses.replace(Settings(), db_path=tmp_path / "s.duckdb", local_datasets_dir=tmp_path / "ds")
     b = CohortBuilder(s, backend=FakeLLM({}))
     con = b.con
@@ -87,8 +93,7 @@ def db(tmp_path):
         "CREATE SCHEMA claims; CREATE TABLE claims.pharmacy (claim_id VARCHAR, member BIGINT, fill_dt DATE, "
         "ndc VARCHAR, dsup INTEGER, qty DOUBLE, status VARCHAR, ref_claim VARCHAR)"
     )
-    yield b
-    b.con.close()
+    return b
 
 
 def fills(b: CohortBuilder, rows: list[tuple]) -> None:
@@ -370,6 +375,9 @@ def test_sql_engine_matches_reference_row_by_row(db, over):
     r = rules(**over)
     sql, ref = run(db, r, "sql"), run(db, r, "reference")
     assert sql["status"] == ref["status"] == "completed"
+    # on a mismatch, report which person / event / episode / date differs and in which step or rule field
+    diff = diff_runs(db.con, sql["run_id"], ref["run_id"], examples=5)
+    assert all(v["only_in_a"] == v["only_in_b"] == 0 for v in diff.values()), json.dumps(diff, default=str, indent=1)
     for name, _table, cols, order in HASH_SECTIONS:
         key = ", ".join(order)
         a = table(db, sql["run_id"], _table.split("_", 1)[1], ", ".join(cols), key)

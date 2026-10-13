@@ -67,6 +67,11 @@ class StatusMapping(_M):
     reference_column: str | None = Field(
         default=None, description="on reversal / adjustment rows: the record id they reverse or replace"
     )
+    reference_scope: Literal["record", "record_and_person"] = Field(
+        default="record",
+        description="'record': a reversal/adjustment acts on the referenced record id (claim ids unique per "
+        "source); 'record_and_person': only when it belongs to the same patient (claim ids unique per patient)",
+    )
 
     @field_validator("column", "reference_column")
     @classmethod

@@ -490,3 +490,26 @@ def output_hash(con: duckdb.DuckDBPyConnection, run_id: str, batch_size: int) ->
 def iter_batches(cur: duckdb.DuckDBPyConnection, batch_size: int) -> Iterator[list[tuple[Any, ...]]]:
     while rows := cur.fetchmany(batch_size):
         yield rows
+
+
+def diff_runs(con: duckdb.DuckDBPyConnection, run_a: str, run_b: str, examples: int = 0) -> dict[str, dict[str, Any]]:
+    """Section-by-section comparison of two runs' logical outputs (the hash columns). Returns counts of rows
+    only in A / only in B and, when `examples` > 0, up to that many differing keys per side with the fields
+    that differ - patient-level, so callers must apply patient-level authorization before showing them."""
+    out: dict[str, dict[str, Any]] = {}
+    for name, table, cols, order in HASH_SECTIONS:
+        col_list = ", ".join(qi(c) for c in cols)
+        a = f"SELECT {col_list} FROM {table} WHERE run_id = ?"
+        only_a = int((con.execute(f"SELECT count(*) FROM ({a} EXCEPT ALL {a})", [run_a, run_b]).fetchone() or (0,))[0])
+        only_b = int((con.execute(f"SELECT count(*) FROM ({a} EXCEPT ALL {a})", [run_b, run_a]).fetchone() or (0,))[0])
+        entry: dict[str, Any] = {"only_in_a": only_a, "only_in_b": only_b}
+        if examples and (only_a or only_b):
+            key = ", ".join(qi(c) for c in order)
+            sample: list[dict[str, Any]] = []
+            for side, (x, y) in (("a", (run_a, run_b)), ("b", (run_b, run_a))):
+                cur = con.execute(f"SELECT * FROM ({a} EXCEPT ALL {a}) ORDER BY {key} LIMIT {int(examples)}", [x, y])
+                names = [d[0] for d in cur.description]
+                sample += [{"side": side, **dict(zip(names, r, strict=True))} for r in cur.fetchall()]
+            entry["examples"] = sample
+        out[name] = entry
+    return out

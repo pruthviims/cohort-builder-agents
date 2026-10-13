@@ -131,6 +131,10 @@ def source_event_sql(
         return f"{t}.{qi(col)}"
 
     rec = f"CAST({c(src.record_id_column)} AS VARCHAR)"
+    by_person = bool(src.status and src.status.reference_scope == "record_and_person")
+    ref_person = ", person_id" if by_person else ""
+    ref_person_join_rv = " AND rv.person_id = b.person_id" if by_person else ""
+    ref_person_join_aj = " AND aj.person_id = b.person_id" if by_person else ""
     # claim status -------------------------------------------------------------------------------
     if src.status:
         st = src.status
@@ -198,9 +202,13 @@ WITH base AS (
          {qty} AS quantity, {raw_cat} AS status_cat, {ref} AS ref_id, {evidence} AS evidence_type,
          {code} AS source_code, {vocab_expr} AS source_vocabulary, {product} AS product_concept_id
   FROM {_table(src.table)} {t}{product_join}),
-rev AS (SELECT DISTINCT ref_id FROM base WHERE status_cat = 'reversal' AND ref_id IS NOT NULL),
-adj AS (SELECT DISTINCT ref_id FROM base WHERE status_cat = 'adjustment' AND ref_id IS NOT NULL),
-ids AS (SELECT DISTINCT record_id FROM base WHERE record_id IS NOT NULL),
+rev AS (SELECT DISTINCT ref_id{ref_person} FROM base WHERE status_cat = 'reversal' AND ref_id IS NOT NULL),
+adj AS (SELECT DISTINCT ref_id{ref_person} FROM base WHERE status_cat = 'adjustment' AND ref_id IS NOT NULL),
+orig AS (SELECT record_id, min(person_id) AS person_id, min(start_date) AS start_date FROM base
+         WHERE record_id IS NOT NULL GROUP BY record_id),
+var AS (SELECT record_id, count(DISTINCT row(person_id, start_date, source_code, ds_raw, end_raw, quantity,
+                                             status_cat, ref_id)) AS variants
+        FROM base WHERE record_id IS NOT NULL GROUP BY record_id),
 ing AS (
   SELECT p.concept_id AS product_concept_id, i.concept_id AS ingredient_concept_id
   FROM {vocab}.concept p JOIN {vocab}.concept i ON i.concept_class_id = 'Ingredient'
@@ -220,13 +228,19 @@ ev AS (
               WHEN b.status_cat IN ('paid', 'adjustment') AND aj.ref_id IS NOT NULL THEN 'superseded'
               WHEN b.status_cat = 'adjustment' THEN 'adjusted'
               ELSE b.status_cat END AS claim_status,
-         b.status_cat = 'reversal' AND kn.record_id IS NULL AS orphan_reversal,
-         b.status_cat = 'adjustment' AND kn.record_id IS NULL AS orphan_adjustment,
+         b.status_cat = 'reversal' AND og.record_id IS NULL AS orphan_reversal,
+         b.status_cat = 'adjustment' AND og.record_id IS NULL AS orphan_adjustment,
+         b.ref_id IS NOT NULL AND og.record_id IS NOT NULL AND og.person_id IS DISTINCT FROM b.person_id
+           AS ref_person_mismatch,
+         b.status_cat = 'reversal' AND og.start_date IS NOT NULL AND b.start_date < og.start_date
+           AS reversal_before_original,
+         coalesce(vr.variants, 1) > 1 AS conflicting_duplicate,
          CASE WHEN {ds_ok} THEN b.ds_raw END AS ds_valid
   FROM base b
-  LEFT JOIN rev rv ON rv.ref_id = b.record_id
-  LEFT JOIN adj aj ON aj.ref_id = b.record_id
-  LEFT JOIN ids kn ON kn.record_id = b.ref_id
+  LEFT JOIN rev rv ON rv.ref_id = b.record_id{ref_person_join_rv}
+  LEFT JOIN adj aj ON aj.ref_id = b.record_id{ref_person_join_aj}
+  LEFT JOIN orig og ON og.record_id = b.ref_id
+  LEFT JOIN var vr ON vr.record_id = b.record_id
   LEFT JOIN {vocab}.concept pc ON pc.concept_id = b.product_concept_id
   LEFT JOIN ing i ON i.product_concept_id = b.product_concept_id
   LEFT JOIN ning n ON n.product_concept_id = b.product_concept_id
@@ -265,6 +279,10 @@ SELECT {_lit(run_id)} AS run_id,
          CASE WHEN n_ingredients > 1 THEN 'combination_product' END,
          CASE WHEN orphan_reversal THEN 'orphan_reversal' END,
          CASE WHEN orphan_adjustment THEN 'orphan_adjustment' END,
+         CASE WHEN ref_person_mismatch THEN 'reference_person_mismatch' END,
+         CASE WHEN reversal_before_original THEN 'reversal_before_original' END,
+         CASE WHEN conflicting_duplicate THEN 'conflicting_duplicate_record' END,
+         CASE WHEN quantity IS NOT NULL AND quantity <= 0 THEN 'quantity_invalid' END,
          CASE WHEN ds_raw IS NULL AND product_domain = 'Drug' THEN 'days_supply_missing' END,
          CASE WHEN ds_raw IS NOT NULL AND ds_valid IS NULL AND product_domain = 'Drug'
               THEN 'days_supply_out_of_range' END,
