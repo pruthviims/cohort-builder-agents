@@ -92,6 +92,14 @@ CREATE TABLE IF NOT EXISTS meta.treatment_run (
   status VARCHAR, event_schema VARCHAR, rule_set_name VARCHAR, rule_set_version VARCHAR, rule_set_hash VARCHAR,
   rule_set_json VARCHAR, source_config_hash VARCHAR, source_config_json VARCHAR, data_snapshot VARCHAR,
   software_version VARCHAR, output_hash VARCHAR, summary_json VARCHAR, errors_json VARCHAR);
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS reference_date DATE;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS engine VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS engine_version VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS output_hash_version VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS batch_size INTEGER;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS failed_stage VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS metrics_json VARCHAR;
 CREATE TABLE IF NOT EXISTS meta.audit_event (
   event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
   resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);

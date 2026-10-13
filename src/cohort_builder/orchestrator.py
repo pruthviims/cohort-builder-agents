@@ -113,6 +113,10 @@ class CohortBuilder(ProxyMixin):
             self.con.execute(f"SET memory_limit = '{s.duckdb_memory_limit.strip()}'")
         if s.duckdb_threads:
             self.con.execute(f"SET threads = {int(s.duckdb_threads)}")
+        if s.duckdb_max_temp_directory_size:
+            if not _MEMORY_LIMIT.match(s.duckdb_max_temp_directory_size.strip()):
+                raise ValueError("CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE must look like '20GB'")
+            self.con.execute(f"SET max_temp_directory_size = '{s.duckdb_max_temp_directory_size.strip()}'")
         if s.lock_external_access:
             self.con.execute("SET enable_external_access = false")
 

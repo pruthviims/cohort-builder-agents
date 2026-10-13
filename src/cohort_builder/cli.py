@@ -175,9 +175,17 @@ def main(argv: list[str] | None = None) -> int:
     t = tx.add_parser("run", help="build events and episodes for the active dataset with a rule set")
     t.add_argument("--rules", required=True, help="rule set name (ontology/treatment/rules) or a YAML file path")
     t.add_argument("--sources", type=Path, help="treatment source config (default: ontology/treatment/sources)")
+    t.add_argument("--reference-date", help="fixed 'as of' date YYYY-MM-DD (default: today; recorded)")
+    t.add_argument(
+        "--engine", choices=["sql", "reference"], default="sql", help="'reference' = in-memory oracle (small runs)"
+    )
+    t.add_argument("--batch-size", type=int, help="rows per fetch/write batch (default CB_TREATMENT_BATCH_SIZE)")
     t.add_argument("--user", default="cli")
     t = tx.add_parser("summary", help="provenance and suppressed aggregate summary of a run")
     t.add_argument("run_id")
+    t = tx.add_parser("cleanup", help="mark stale 'running' runs abandoned and drop leftover staging tables")
+    t.add_argument("--older-than-minutes", type=int, default=None, help="default CB_TREATMENT_STALE_RUN_MINUTES")
+    t.add_argument("--user", default="cli")
     t = tx.add_parser("explain", help="one episode with its source events and rules (needs CB_ALLOW_PATIENT_LEVEL)")
     t.add_argument("run_id")
     t.add_argument("episode_id")
@@ -535,6 +543,8 @@ def _csv(settings: Settings, a) -> int:
 
 
 def _treatment(b, a) -> int:
+    from datetime import date
+
     from .security import GovernanceError
     from .treatment_config import load_sources
     from .treatment_service import TreatmentService, resolve_rules
@@ -544,7 +554,11 @@ def _treatment(b, a) -> int:
         if a.treatment_cmd == "run":
             rules = resolve_rules(b.settings.ontology_dir, a.rules)
             sources = load_sources(a.sources.read_text()) if a.sources else None
-            _print(svc.run(rules, a.user, None, sources))
+            ref = date.fromisoformat(a.reference_date) if a.reference_date else None
+            _print(svc.run(rules, a.user, None, sources, ref, a.engine, a.batch_size))
+        elif a.treatment_cmd == "cleanup":
+            minutes = a.older_than_minutes if a.older_than_minutes is not None else svc.limits.stale_run_minutes
+            _print(svc.cleanup_incomplete_runs(minutes, a.user))
         elif a.treatment_cmd == "summary":
             _print(svc.summary(a.run_id, None))
         elif a.treatment_cmd == "explain":

@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .dataset_mapping import CodeNormalization, normalization_for
 
-EVENT_SCHEMA_VERSION = "treatment_event/1"
+EVENT_SCHEMA_VERSION = "treatment_event/2"  # /2: observation partitioning, end_status, product_change
 EvidenceType = Literal["dispensing", "administration", "prescription", "unknown"]
 StatusCategory = Literal["paid", "rejected", "reversal", "adjustment"]
 DateSource = Literal["fill_date", "service_date", "administration_date", "prescription_date", "start_date"]

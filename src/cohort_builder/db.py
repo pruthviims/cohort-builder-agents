@@ -92,6 +92,15 @@ CREATE TABLE IF NOT EXISTS results.treatment_episode (
 CREATE TABLE IF NOT EXISTS results.treatment_transition (
   run_id VARCHAR, person_id BIGINT, kind VARCHAR, from_episode VARCHAR, to_episode VARCHAR,
   from_group VARCHAR, to_group VARCHAR, on_date DATE, days INTEGER, basis VARCHAR);
+-- treatment engine v2 (additive; rows of earlier runs keep NULLs here)
+ALTER TABLE results.treatment_episode ADD COLUMN IF NOT EXISTS period_id INTEGER;
+ALTER TABLE results.treatment_episode ADD COLUMN IF NOT EXISTS end_status VARCHAR;
+ALTER TABLE results.treatment_episode ADD COLUMN IF NOT EXISTS observed_end DATE;
+ALTER TABLE results.treatment_episode ADD COLUMN IF NOT EXISTS coverage_beyond_observation BOOLEAN;
+ALTER TABLE results.treatment_transition ADD COLUMN IF NOT EXISTS from_products VARCHAR;
+ALTER TABLE results.treatment_transition ADD COLUMN IF NOT EXISTS to_products VARCHAR;
+-- run-scoped staging tables of the treatment engine (dropped when a run ends; same database access rules)
+CREATE SCHEMA IF NOT EXISTS tx_stage;
 """
 
 

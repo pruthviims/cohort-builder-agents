@@ -39,6 +39,13 @@ class Settings:
     duckdb_memory_limit: str | None = None  # e.g. "4GB"
     duckdb_threads: int | None = None
     lock_external_access: bool = True  # block file/network access from SQL after setup
+    duckdb_max_temp_directory_size: str | None = None  # e.g. "20GB": cap on DuckDB spill files
+    # treatment-event engine resource controls (validated in treatment_service.TreatmentLimits)
+    treatment_batch_size: int = 100_000  # rows per fetch / bulk write batch
+    treatment_max_concurrent_runs: int = 1  # per process (DuckDB allows one writing process anyway)
+    treatment_timeout_seconds: float = 3600.0  # whole-run budget; the running query is interrupted
+    treatment_reference_max_events: int = 250_000  # the in-memory reference engine refuses larger runs
+    treatment_stale_run_minutes: int = 360  # 'running' runs older than this are cleaned up as abandoned
     prompt_versions: dict[str, str] = field(
         default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2", "proxy_parser": "v1"}
     )
@@ -62,6 +69,18 @@ class Settings:
             query_timeout_seconds=float(env.get("CB_QUERY_TIMEOUT_SECONDS", base.query_timeout_seconds)),
             duckdb_memory_limit=env.get("CB_DUCKDB_MEMORY_LIMIT") or None,
             duckdb_threads=int(env["CB_DUCKDB_THREADS"]) if env.get("CB_DUCKDB_THREADS") else None,
+            duckdb_max_temp_directory_size=env.get("CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE") or None,
+            treatment_batch_size=int(env.get("CB_TREATMENT_BATCH_SIZE", base.treatment_batch_size)),
+            treatment_max_concurrent_runs=int(
+                env.get("CB_TREATMENT_MAX_CONCURRENT_RUNS", base.treatment_max_concurrent_runs)
+            ),
+            treatment_timeout_seconds=float(env.get("CB_TREATMENT_TIMEOUT_SECONDS", base.treatment_timeout_seconds)),
+            treatment_reference_max_events=int(
+                env.get("CB_TREATMENT_REFERENCE_MAX_EVENTS", base.treatment_reference_max_events)
+            ),
+            treatment_stale_run_minutes=int(
+                env.get("CB_TREATMENT_STALE_RUN_MINUTES", base.treatment_stale_run_minutes)
+            ),
             lock_external_access=(
                 env.get("CB_DUCKDB_LOCK_EXTERNAL_ACCESS", "true").strip().lower() not in ("0", "false", "no", "off")
             ),

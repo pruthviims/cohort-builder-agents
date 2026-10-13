@@ -163,8 +163,9 @@ def test_gaps_restarts_discontinuation_and_per_group_gap():
         (D("2020-06-01"), D("2020-06-30"), 0),
     ]
     kinds = [(t.kind, t.from_episode, t.to_episode) for t in r.transitions]
-    assert ("restart", "1:metformin:1", "1:metformin:2") in kinds
-    assert ("discontinuation", "1:metformin:1", None) in kinds and ("discontinuation", "1:metformin:2", None) in kinds
+    # discontinuation is the episode END STATUS (once per episode), never also a transition
+    assert kinds == [("restart", "1:metformin:1", "1:metformin:2")]
+    assert [e.end_status for e in r.episodes] == ["discontinued", "discontinued"]
     wider = build([ev(x.event_id, x.start.isoformat(), x.days, group="sglt2") for x in evs], OBS, rules())
     assert len(wider.episodes) == 1  # the sglt2 group allows 60 days
 
@@ -174,11 +175,11 @@ def test_censoring_at_observation_boundaries_and_unknowns():
     r = build([ev("a", "2020-01-10", 30)], obs, rules())
     e = r.episodes[0]
     assert e.left_censored is True and e.right_censored is True and e.end_reason == "observation_end"
-    assert [t.kind for t in r.transitions] == ["unknown_after_censoring"]  # no claim it was stopped
-    outside = build([ev("a", "2018-01-10", 30)], obs, rules())
-    assert outside.episodes[0].right_censored is None and outside.transitions[0].kind == "unknown_no_observation"
+    assert e.end_status == "censored" and r.transitions == []  # no claim that treatment stopped
+    outside = build([ev("a", "2018-01-10", 30)], obs, rules())  # no observed time around it
+    assert outside.episodes == [] and outside.decisions[0].step == "outside_observation"
     none = build([ev("a", "2020-01-10", 30)], None, rules(censoring={"observation": "none", "washout_days": 0}))
-    assert none.episodes[0].end_reason == "unknown"
+    assert none.episodes[0].end_reason == "unknown" and none.episodes[0].end_status == "unknown"
 
 
 def test_switch_add_on_and_concurrent_start():
@@ -206,7 +207,8 @@ def test_episode_building_is_deterministic_regardless_of_input_order():
     first = build(evs, obs, rules())
     shuffled = list(evs)
     random.Random(4).shuffle(shuffled)
-    assert build(shuffled, obs, rules()).output_hash() == first.output_hash()
+    again = build(shuffled, obs, rules())
+    assert (again.decisions, again.episodes, again.transitions) == (first.decisions, first.episodes, first.transitions)
 
 
 # ---- 3. canonical events from multiple differently shaped sources -----------------------------------------------
@@ -498,7 +500,7 @@ def test_repeat_runs_are_identical_and_carry_provenance(tx):
     assert (
         a["rule_set_hash"] == rules().content_hash() and a["source_config_hash"] == source_cfg(SOURCES).content_hash()
     )
-    assert a["event_schema"] == "treatment_event/1" and a["software_version"] and a["data_snapshot"] is not None
+    assert a["event_schema"] == "treatment_event/2" and a["software_version"] and a["data_snapshot"] is not None
     other = run(tx, rules(episode={"max_gap_days": 120}))
     assert other["output_hash"] != a["output_hash"] and other["rule_set_hash"] != a["rule_set_hash"]
     stored = json.loads(

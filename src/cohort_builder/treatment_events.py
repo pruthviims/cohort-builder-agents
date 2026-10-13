@@ -1,16 +1,24 @@
-"""Canonical treatment events (schema `treatment_event/1`) from configured medication sources.
+"""Canonical treatment events (schema `treatment_event/2`) from configured medication sources.
 
 One canonical event = one source record x one ingredient of the drug it names. Every source record of a
 configured source produces at least one row in `results.treatment_event` - included or excluded with a
 single, ordered exclusion reason - so the quality summary accounts for every record.
 
 Exclusion reasons, checked in this order (the first that applies is recorded):
-  missing_record_id, missing_person, missing_start_date, implausible_start_date (before 1900 or after today),
-  reversal_transaction (the reversal row itself), rejected_claim, reversed_claim (a paid claim that a
-  reversal references), superseded_by_adjustment, claim_status_excluded, evidence_type_excluded,
-  unmapped_code, not_a_drug (code maps to a non-drug concept, e.g. a CPT procedure), no_ingredient,
-  not_in_drug_group, ambiguous_drug_group (ingredient in more than one group), missing_days_supply
-  (no usable duration and no assumption configured), duplicate_record (the same record id repeated).
+  missing_record_id, missing_person, missing_start_date,
+  implausible_start_date      before 1900 or after the run's recorded reference date
+  reversal_transaction        the reversal row itself
+  rejected_claim
+  reversed_claim              a paid or adjustment claim that a reversal references
+  superseded_by_adjustment    a paid or adjustment claim that a later adjustment references (in a chain
+                              C <- A1 <- A2 only A2 counts)
+  claim_status_excluded, evidence_type_excluded, unmapped_code,
+  not_a_drug                  the code maps to a non-drug concept (a CPT procedure, a diagnosis)
+  no_ingredient, not_in_drug_group,
+  ambiguous_drug_group        the ingredient is in more than one group
+  missing_days_supply         no usable duration and no assumption configured
+  duplicate_record            the same record id repeated (deterministic tie-break on every field)
+The episode engine then adds outside_observation and duplicate_event (see treatment_episodes.py).
 
 Duration: a valid recorded days supply wins (end = start + days - 1, end_date_source 'days_supply'); else
 a recorded end date on/after the start ('recorded'); else the rule set's assumed days for the evidence type
@@ -19,6 +27,8 @@ type says what the record shows (dispensing, administration, prescription, unkno
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 from .csv_ingest import qi
 from .dataset_mapping import normalize_sql
@@ -72,7 +82,8 @@ EXCLUSION_REASONS = [
     "ambiguous_drug_group",
     "missing_days_supply",
     "duplicate_record",
-    # decided by the episode builder (deterministic, rule-driven)
+    # decided by the episode engine (deterministic, rule-driven)
+    "outside_observation",
     "duplicate_event",
 ]
 
@@ -103,9 +114,18 @@ def group_member_sql(rules: TreatmentRuleSet, vocab: str) -> str:
     )
 
 
-def source_event_sql(src: TreatmentSource, rules: TreatmentRuleSet, run_id: str, dataset: str, vocab: str) -> str:
-    """SELECT producing canonical event rows (EVENT_COLUMNS) for every record of one source."""
+def source_event_sql(
+    src: TreatmentSource,
+    rules: TreatmentRuleSet,
+    run_id: str,
+    dataset: str,
+    vocab: str,
+    reference_date: date,
+) -> str:
+    """SELECT producing canonical event rows (EVENT_COLUMNS) for every record of one source. Dates after
+    the run's recorded `reference_date` are implausible (never the moving SQL current_date)."""
     t = "r"
+    ref_date = f"DATE '{date.fromisoformat(reference_date.isoformat()).isoformat()}'"
 
     def c(col: str) -> str:
         return f"{t}.{qi(col)}"
@@ -178,10 +198,9 @@ WITH base AS (
          {qty} AS quantity, {raw_cat} AS status_cat, {ref} AS ref_id, {evidence} AS evidence_type,
          {code} AS source_code, {vocab_expr} AS source_vocabulary, {product} AS product_concept_id
   FROM {_table(src.table)} {t}{product_join}),
-acted AS (
-  SELECT DISTINCT status_cat AS action, ref_id FROM base WHERE status_cat IN ('reversal', 'adjustment')
-   AND ref_id IS NOT NULL),
-ids AS (SELECT DISTINCT record_id FROM base),
+rev AS (SELECT DISTINCT ref_id FROM base WHERE status_cat = 'reversal' AND ref_id IS NOT NULL),
+adj AS (SELECT DISTINCT ref_id FROM base WHERE status_cat = 'adjustment' AND ref_id IS NOT NULL),
+ids AS (SELECT DISTINCT record_id FROM base WHERE record_id IS NOT NULL),
 ing AS (
   SELECT p.concept_id AS product_concept_id, i.concept_id AS ingredient_concept_id
   FROM {vocab}.concept p JOIN {vocab}.concept i ON i.concept_class_id = 'Ingredient'
@@ -197,15 +216,17 @@ grp AS (SELECT ingredient_concept_id, min(drug_group) AS drug_group, count(*) AS
 ev AS (
   SELECT b.*, i.ingredient_concept_id, br.brand_concept_id, coalesce(n.n, 0) AS n_ingredients,
          g.drug_group, coalesce(g.n_groups, 0) AS n_groups, pc.domain_id AS product_domain,
-         CASE WHEN b.status_cat = 'paid' AND EXISTS (SELECT 1 FROM acted x WHERE x.action = 'reversal'
-                   AND x.ref_id = b.record_id) THEN 'reversed'
-              WHEN b.status_cat = 'paid' AND EXISTS (SELECT 1 FROM acted x WHERE x.action = 'adjustment'
-                   AND x.ref_id = b.record_id) THEN 'superseded'
+         CASE WHEN b.status_cat IN ('paid', 'adjustment') AND rv.ref_id IS NOT NULL THEN 'reversed'
+              WHEN b.status_cat IN ('paid', 'adjustment') AND aj.ref_id IS NOT NULL THEN 'superseded'
               WHEN b.status_cat = 'adjustment' THEN 'adjusted'
               ELSE b.status_cat END AS claim_status,
-         b.status_cat = 'reversal' AND b.ref_id NOT IN (SELECT record_id FROM ids) AS orphan_reversal,
+         b.status_cat = 'reversal' AND kn.record_id IS NULL AS orphan_reversal,
+         b.status_cat = 'adjustment' AND kn.record_id IS NULL AS orphan_adjustment,
          CASE WHEN {ds_ok} THEN b.ds_raw END AS ds_valid
   FROM base b
+  LEFT JOIN rev rv ON rv.ref_id = b.record_id
+  LEFT JOIN adj aj ON aj.ref_id = b.record_id
+  LEFT JOIN ids kn ON kn.record_id = b.ref_id
   LEFT JOIN {vocab}.concept pc ON pc.concept_id = b.product_concept_id
   LEFT JOIN ing i ON i.product_concept_id = b.product_concept_id
   LEFT JOIN ning n ON n.product_concept_id = b.product_concept_id
@@ -225,8 +246,8 @@ fin AS (
          CASE days_supply_source WHEN 'recorded' THEN 'days_supply' WHEN 'from_end_date' THEN 'recorded'
               WHEN 'assumed' THEN 'assumed' ELSE 'missing' END AS end_date_source,
          ROW_NUMBER() OVER (PARTITION BY record_id, coalesce(ingredient_concept_id, product_concept_id, 0)
-                            ORDER BY start_date, product_concept_id, source_code, ds_raw, end_raw, quantity,
-                                     status_cat, evidence_type) AS rn
+                            ORDER BY person_id, start_date, product_concept_id, source_code, ds_raw, end_raw,
+                                     quantity, status_cat, ref_id, evidence_type) AS rn
   FROM dur)
 SELECT {_lit(run_id)} AS run_id,
        {source_lit} || ':' || coalesce(record_id, '<none>') || ':'
@@ -243,6 +264,7 @@ SELECT {_lit(run_id)} AS run_id,
        nullif(concat_ws(',',
          CASE WHEN n_ingredients > 1 THEN 'combination_product' END,
          CASE WHEN orphan_reversal THEN 'orphan_reversal' END,
+         CASE WHEN orphan_adjustment THEN 'orphan_adjustment' END,
          CASE WHEN ds_raw IS NULL AND product_domain = 'Drug' THEN 'days_supply_missing' END,
          CASE WHEN ds_raw IS NOT NULL AND ds_valid IS NULL AND product_domain = 'Drug'
               THEN 'days_supply_out_of_range' END,
@@ -253,7 +275,7 @@ FROM (SELECT fin.*,
   CASE WHEN record_id IS NULL THEN 'missing_record_id'
        WHEN person_id IS NULL THEN 'missing_person'
        WHEN start_date IS NULL THEN 'missing_start_date'
-       WHEN start_date < DATE '1900-01-01' OR start_date > current_date THEN 'implausible_start_date'
+       WHEN start_date < DATE '1900-01-01' OR start_date > {ref_date} THEN 'implausible_start_date'
        WHEN claim_status = 'reversal' THEN 'reversal_transaction'
        WHEN claim_status = 'rejected' THEN 'rejected_claim'
        WHEN claim_status = 'reversed' THEN 'reversed_claim'

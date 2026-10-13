@@ -179,6 +179,9 @@ class CsvIngestRequest(_Strict):
 class TreatmentRunRequest(_Strict):
     rule_set: str | None = Field(default=None, max_length=48, pattern=r"^[a-z][a-z0-9_]{0,47}$")
     rules_yaml: str | None = Field(default=None, max_length=200_000)
+    reference_date: date | None = Field(
+        default=None, description="fixed 'as of' date for date validation (default: today, recorded with the run)"
+    )
 
     @model_validator(mode="after")
     def _one(self) -> TreatmentRunRequest:
@@ -663,7 +666,7 @@ def create_app(
                 if req.rules_yaml
                 else resolve_rules(bb.settings.ontology_dir, req.rule_set or "")
             )
-            return TreatmentService(bb).run(rules, p.subject, p.tenant)
+            return TreatmentService(bb).run(rules, p.subject, p.tenant, reference_date=req.reference_date)
 
         return treatment_call(go)
 
