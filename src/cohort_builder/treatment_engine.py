@@ -134,36 +134,35 @@ SELECT e.event_id, e.person_id, e.drug_group, e.product_concept_id AS product, e
 FROM {stage.t("ev0")} e {period}
 WHERE e.included
 """,
+        # one pass of window functions (no self-joins): record merge -> duplicates -> dispensing-day order
         f"""
 CREATE TABLE {stage.t("st")} AS
 WITH a AS (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY person_id, drug_group, period_id, record ORDER BY event_id) AS rec_rn
   FROM {stage.t("ev")} WHERE period_id IS NOT NULL),
-k AS (
-  SELECT *, {
-            "ROW_NUMBER() OVER (PARTITION BY person_id, drug_group, period_id, start_date, product, days "
+b AS (
+  SELECT *, CASE WHEN rec_rn = 1 THEN {
+            "ROW_NUMBER() OVER (PARTITION BY person_id, drug_group, period_id, start_date, product, days, rec_rn = 1 "
             "ORDER BY event_id)"
             if dup
             else "1"
-        } AS dup_rn
-  FROM a WHERE rec_rn = 1),
+        } END AS dup_rn
+  FROM a),
+c AS (
+  SELECT *, max(dup_rn) OVER (PARTITION BY person_id, drug_group, period_id, record) AS record_dup_rn,
+         rec_rn = 1 AND dup_rn = 1 AS kept
+  FROM b),
 d AS (
-  SELECT *, ROW_NUMBER() OVER (PARTITION BY person_id, drug_group, period_id, start_date
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY person_id, drug_group, period_id, start_date, kept
                                ORDER BY product, days DESC, event_id) AS day_rn
-  FROM k WHERE dup_rn = 1),
-first_of_record AS (
-  SELECT k.person_id, k.drug_group, k.period_id, k.record, k.dup_rn FROM k)
-SELECT a.event_id, a.person_id, a.drug_group, a.period_id, a.start_date, a.product,
-       CASE WHEN a.rec_rn > 1 AND f.dup_rn > 1 THEN 'duplicate_event'
-            WHEN a.rec_rn > 1 THEN 'same_record_merged'
-            WHEN k.dup_rn > 1 THEN 'duplicate_event'
-            WHEN d.day_rn = 1 THEN 'counted'
+  FROM c)
+SELECT event_id, person_id, drug_group, period_id, start_date, product,
+       CASE WHEN rec_rn > 1 AND record_dup_rn > 1 THEN 'duplicate_event'
+            WHEN rec_rn > 1 THEN 'same_record_merged'
+            WHEN dup_rn > 1 THEN 'duplicate_event'
+            WHEN day_rn = 1 THEN 'counted'
             ELSE 'same_day_merged' END AS step
-FROM a
-LEFT JOIN k ON k.event_id = a.event_id
-LEFT JOIN d ON d.event_id = a.event_id
-LEFT JOIN first_of_record f ON a.rec_rn > 1 AND f.person_id = a.person_id AND f.drug_group = a.drug_group
-     AND f.period_id = a.period_id AND f.record = a.record
+FROM d
 UNION ALL
 SELECT event_id, person_id, drug_group, NULL, start_date, product, 'outside_observation'
 FROM {stage.t("ev")} WHERE period_id IS NULL
