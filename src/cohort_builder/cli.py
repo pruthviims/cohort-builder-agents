@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 from .config import Settings
@@ -180,6 +182,27 @@ def main(argv: list[str] | None = None) -> int:
         "--engine", choices=["sql", "reference"], default="sql", help="'reference' = in-memory oracle (small runs)"
     )
     t.add_argument("--batch-size", type=int, help="rows per fetch/write batch (default CB_TREATMENT_BATCH_SIZE)")
+    t.add_argument(
+        "--reuse", action="store_true", help="return a completed run with the same input fingerprint, if any"
+    )
+    t.add_argument("--user", default="cli")
+    t = tx.add_parser("cancel", help="cancel a run; a 'running' run with no live process is marked abandoned")
+    t.add_argument("run_id")
+    t.add_argument("--user", default="cli")
+    for name, hlp in (("hold", "place a legal hold (retention never purges)"), ("release", "release a hold")):
+        t = tx.add_parser(name, help=hlp)
+        t.add_argument("run_id")
+        if name == "hold":
+            t.add_argument("--reason", required=True)
+        t.add_argument("--user", default="cli")
+    t = tx.add_parser(
+        "retention",
+        help="purge derived results of old runs (dry run unless --apply; source data is never deleted)",
+    )
+    t.add_argument("--older-than-days", type=int, help="default CB_TREATMENT_RETENTION_DAYS (must be >= 1)")
+    t.add_argument("--tenant", help="only this tenant's runs")
+    t.add_argument("--archive-dir", type=Path, help="verified archive before purging (below CB_TREATMENT_ARCHIVE_ROOT)")
+    t.add_argument("--apply", action="store_true", help="actually purge (default: dry run, nothing changes)")
     t.add_argument("--user", default="cli")
     t = tx.add_parser("summary", help="provenance and suppressed aggregate summary of a run")
     t.add_argument("run_id")
@@ -542,12 +565,35 @@ def _csv(settings: Settings, a) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def _cancel_on_signals() -> Iterator[None]:
+    """SIGINT/SIGTERM during a treatment run cancel it cleanly (status 'cancelled', staging dropped, nothing
+    published) instead of killing the process mid-write. A second signal falls back to the default."""
+    import signal
+
+    from .treatment_service import cancel_all_active
+
+    def handler(signum: int, _frame: object) -> None:
+        signal.signal(signum, previous[signal.Signals(signum)])
+        print("cancelling the treatment run (send the signal again to force)", file=sys.stderr)
+        cancel_all_active("cancelled")
+
+    previous = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    for s in previous:
+        signal.signal(s, handler)
+    try:
+        yield
+    finally:
+        for s, h in previous.items():
+            signal.signal(s, h)
+
+
 def _treatment(b, a) -> int:
     from datetime import date
 
     from .security import GovernanceError
     from .treatment_config import load_sources
-    from .treatment_service import TreatmentService, resolve_rules
+    from .treatment_service import TreatmentRunFailed, TreatmentService, resolve_rules
 
     svc = TreatmentService(b)
     try:
@@ -555,7 +601,20 @@ def _treatment(b, a) -> int:
             rules = resolve_rules(b.settings.ontology_dir, a.rules)
             sources = load_sources(a.sources.read_text()) if a.sources else None
             ref = date.fromisoformat(a.reference_date) if a.reference_date else None
-            _print(svc.run(rules, a.user, None, sources, ref, a.engine, a.batch_size))
+            with _cancel_on_signals():
+                _print(svc.run(rules, a.user, None, sources, ref, a.engine, a.batch_size, a.reuse))
+        elif a.treatment_cmd == "cancel":
+            _print(svc.cancel(a.run_id, a.user, None))
+        elif a.treatment_cmd in ("hold", "release"):
+            from .treatment_retention import set_hold
+
+            hold = a.treatment_cmd == "hold"
+            _print(set_hold(svc, a.run_id, a.user, hold, a.reason if hold else "", None))
+        elif a.treatment_cmd == "retention":
+            from .treatment_retention import apply_retention
+
+            days = a.older_than_days if a.older_than_days is not None else b.settings.treatment_retention_days
+            _print(apply_retention(svc, days, a.user, a.tenant, not a.apply, a.archive_dir))
         elif a.treatment_cmd == "cleanup":
             minutes = a.older_than_minutes if a.older_than_minutes is not None else svc.limits.stale_run_minutes
             _print(svc.cleanup_incomplete_runs(minutes, a.user))
@@ -564,8 +623,12 @@ def _treatment(b, a) -> int:
         elif a.treatment_cmd == "explain":
             # the CLI runs with direct database access (operator = admin); the policy flag still applies
             _print(svc.explain_episode(a.run_id, a.episode_id, a.user, True, None))
+    except TreatmentRunFailed as exc:
+        sys.exit(f"{exc.status}: {exc}")
     except (GovernanceError, ValueError, KeyError) as exc:
         sys.exit(f"refused: {str(exc).strip(chr(39))}")
+    finally:
+        svc.close()
     return 0
 
 

@@ -39,6 +39,7 @@ from .metadata import MetadataStore, now
 from .ontology import Ontology
 from .proxy import ProxyDefinition, is_proxy_payload
 from .proxy_service import ProxyMixin, ProxyRunResult
+from .safe_paths import safe_directory
 from .security import DEFAULT_TENANT, GovernanceError, GovernancePolicy
 from .vocab import Vocabulary
 
@@ -117,6 +118,9 @@ class CohortBuilder(ProxyMixin):
             if not _MEMORY_LIMIT.match(s.duckdb_max_temp_directory_size.strip()):
                 raise ValueError("CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE must look like '20GB'")
             self.con.execute(f"SET max_temp_directory_size = '{s.duckdb_max_temp_directory_size.strip()}'")
+        if s.duckdb_temp_directory is not None:
+            tmp = safe_directory(s.duckdb_temp_directory, "CB_DUCKDB_TEMP_DIRECTORY")
+            self.con.execute("SET temp_directory = ?", [str(tmp)])
         if s.lock_external_access:
             self.con.execute("SET enable_external_access = false")
 

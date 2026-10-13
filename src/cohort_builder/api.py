@@ -33,6 +33,8 @@ Proxy (indirect) cohort algorithms, same governance (see README "Proxy cohorts")
 Treatment events and episodes (aggregate + suppressed unless stated):
   POST /treatment-runs                                                  executor (rule set by name or inline YAML)
   GET  /treatment-runs/{run_id}                                         executor or reviewer (own tenant)
+  POST /treatment-runs/{run_id}/cancel                                  executor (own tenant)
+  POST /treatment-runs/{run_id}/hold, /release                          admin (legal hold against retention)
   GET  /treatment-runs/{run_id}/episodes/{episode_id}/explanation       admin AND CB_ALLOW_PATIENT_LEVEL=true
 
 Imported datasets (CSV; content is sent in the request body, never a server path; size-capped):
@@ -176,11 +178,18 @@ class CsvIngestRequest(_Strict):
     null_values: list[str] = Field(default_factory=list, max_length=10)
 
 
+class HoldRequest(_Strict):
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class TreatmentRunRequest(_Strict):
     rule_set: str | None = Field(default=None, max_length=48, pattern=r"^[a-z][a-z0-9_]{0,47}$")
     rules_yaml: str | None = Field(default=None, max_length=200_000)
     reference_date: date | None = Field(
         default=None, description="fixed 'as of' date for date validation (default: today, recorded with the run)"
+    )
+    reuse: bool = Field(
+        default=False, description="return a completed run with the same input fingerprint instead of recomputing"
     )
 
     @model_validator(mode="after")
@@ -643,46 +652,72 @@ def create_app(
         )
 
     # ---- treatment events / episodes ------------------------------------------------------------
-    def treatment_call(fn: Callable[[], Any]) -> Any:
+    def treatment_errors(exc: Exception) -> HTTPException:
+        from .treatment_service import TreatmentRunFailed
+
+        if isinstance(exc, TreatmentRunFailed):
+            code = {"cancelled": 409, "error": 500}.get(exc.kind, 503)  # resources / timeout: 503
+            return HTTPException(
+                code, {"message": str(exc), "run_id": exc.run_id, "status": exc.status, "failure_kind": exc.kind}
+            )
+        if isinstance(exc, KeyError):
+            return HTTPException(404, str(exc).strip("'\""))
+        if isinstance(exc, ValidationError):
+            return HTTPException(422, f"invalid rule set: {exc.error_count()} problem(s)")
+        return HTTPException(422, str(exc))
+
+    def treatment_call(fn: Callable[[Any], Any]) -> Any:
+        """Run fn(service) on a treatment service with its own database connection. Only creating the
+        connection holds the API lock, so a long run does not block other requests (or its own cancel)."""
+        from .treatment_service import TreatmentService
+
         with lock:
-            try:
-                return fn()
-            except KeyError as exc:
-                raise HTTPException(404, str(exc).strip("'\"")) from exc
-            except ValidationError as exc:
-                raise HTTPException(422, f"invalid rule set: {exc.error_count()} problem(s)") from exc
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
+            svc = TreatmentService(b())
+        try:
+            return fn(svc)
+        except (KeyError, ValueError) as exc:
+            raise treatment_errors(exc) from exc
+        finally:
+            svc.close()
 
     @app.post("/treatment-runs")
     def treatment_run(req: TreatmentRunRequest, p: Principal = Depends(need_executor)) -> dict:
         from .treatment_config import load_rules
-        from .treatment_service import TreatmentService, resolve_rules
+        from .treatment_service import resolve_rules
 
-        def go() -> Any:
-            bb = b()
+        def go(svc: Any) -> Any:
             rules = (
                 load_rules(req.rules_yaml)
                 if req.rules_yaml
-                else resolve_rules(bb.settings.ontology_dir, req.rule_set or "")
+                else resolve_rules(svc.b.settings.ontology_dir, req.rule_set or "")
             )
-            return TreatmentService(bb).run(rules, p.subject, p.tenant, reference_date=req.reference_date)
+            return svc.run(rules, p.subject, p.tenant, reference_date=req.reference_date, reuse=req.reuse)
 
         return treatment_call(go)
 
     @app.get("/treatment-runs/{run_id}")
     def treatment_summary(run_id: str, p: Principal = Depends(need_results)) -> dict:
-        from .treatment_service import TreatmentService
+        return treatment_call(lambda svc: svc.summary(run_id, scope(p)))
 
-        return treatment_call(lambda: TreatmentService(b()).summary(run_id, scope(p)))
+    @app.post("/treatment-runs/{run_id}/cancel")
+    def treatment_cancel(run_id: str, p: Principal = Depends(need_executor)) -> dict:
+        return treatment_call(lambda svc: svc.cancel(run_id, p.subject, scope(p)))
+
+    @app.post("/treatment-runs/{run_id}/hold")
+    def treatment_hold(run_id: str, req: HoldRequest, p: Principal = Depends(need_admin)) -> dict:
+        from .treatment_retention import set_hold
+
+        return treatment_call(lambda svc: set_hold(svc, run_id, p.subject, True, req.reason, scope(p)))
+
+    @app.post("/treatment-runs/{run_id}/release")
+    def treatment_release(run_id: str, p: Principal = Depends(need_admin)) -> dict:
+        from .treatment_retention import set_hold
+
+        return treatment_call(lambda svc: set_hold(svc, run_id, p.subject, False, "", scope(p)))
 
     @app.get("/treatment-runs/{run_id}/episodes/{episode_id}/explanation")
     def treatment_explain(run_id: str, episode_id: str, p: Principal = Depends(need_admin)) -> dict:
-        from .treatment_service import TreatmentService
-
-        return treatment_call(
-            lambda: TreatmentService(b()).explain_episode(run_id, episode_id, p.subject, p.is_admin, scope(p))
-        )
+        return treatment_call(lambda svc: svc.explain_episode(run_id, episode_id, p.subject, p.is_admin, scope(p)))
 
     # ---- imported datasets (CSV) --------------------------------------------------------------
     def registry() -> Any:

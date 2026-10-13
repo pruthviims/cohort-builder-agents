@@ -20,8 +20,12 @@ an admin principal AND CB_ALLOW_PATIENT_LEVEL=true (audited). Summaries are aggr
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
+import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,7 +40,7 @@ from .csv_ingest import qi
 from .dataset_mapping import code_lookup_sql
 from .db import redact_error
 from .executor import suppress_count, suppress_partition, suppress_with_total
-from .metadata import dumps, now
+from .metadata import MetadataStore, dumps, now
 from .security import DEFAULT_TENANT, GovernanceError
 from .treatment_config import (
     EVENT_SCHEMA_VERSION,
@@ -66,18 +70,136 @@ from .treatment_engine import (
 )
 from .treatment_episodes import Event, build, merge_periods
 from .treatment_events import EVENT_COLUMNS, EXCLUSION_REASONS, GROUPS, LOOKUP, group_member_sql, source_event_sql
+from .vocab import Vocabulary
 
 if TYPE_CHECKING:
     from .orchestrator import CohortBuilder
 
 ENGINE_VERSION = "2.0.0"
+FINGERPRINT_VERSION = "treatment-input/1"
 Engine = Literal["sql", "reference"]
 _SLOTS: dict[int, threading.BoundedSemaphore] = {}
 _SLOTS_LOCK = threading.Lock()
+log = logging.getLogger("cohort_builder.treatment")
 
 
 class TreatmentError(ValueError):
     """A run could not be performed (configuration does not fit the dataset); message has no data values."""
+
+
+class TreatmentRunFailed(TreatmentError):
+    """A run started but did not complete. Carries the run id and a failure kind (see FAILURE_HINTS); the
+    message is actionable and has no data values."""
+
+    def __init__(self, run_id: str, status: str, kind: str, stage: str, error_type: str):
+        self.run_id, self.status, self.kind, self.stage = run_id, status, kind, stage
+        super().__init__(
+            f"treatment run {status} at stage {stage!r} ({kind}, {error_type}): {FAILURE_HINTS[kind]}; see run {run_id}"
+        )
+
+
+class _ActiveRun:
+    """In-process handle of a running run: lets `cancel`, the timeout and signal handlers stop it from another
+    thread. DuckDB's interrupt only reaches the statement executing at that moment, so after a stop request
+    the run's connections are interrupted repeatedly until the run has ended; between statements the run
+    checks `event` itself."""
+
+    REPEAT_SECONDS = 0.2
+
+    def __init__(self, run_id: str, tenant: str):
+        self.run_id, self.tenant = run_id, tenant
+        self.event = threading.Event()
+        self.done = threading.Event()
+        self.reason: str | None = None
+        self.connections: list[duckdb.DuckDBPyConnection] = []
+        self._lock = threading.Lock()
+
+    def _interrupt(self) -> None:
+        for c in list(self.connections):
+            try:
+                c.interrupt()
+            except duckdb.Error:  # pragma: no cover - nothing running / already closed
+                pass
+
+    def _keep_interrupting(self) -> None:
+        while not self.done.wait(self.REPEAT_SECONDS):
+            with self._lock:  # never interrupt after finish(): the failure path is writing its record
+                if self.done.is_set():
+                    return
+                self._interrupt()
+
+    def stop(self, reason: str) -> None:
+        with self._lock:
+            first = self.reason is None
+            if first:
+                self.reason = reason
+            self.event.set()
+            if self.done.is_set():
+                return
+            self._interrupt()
+        if first:
+            threading.Thread(target=self._keep_interrupting, name=f"stop-{self.run_id[:8]}", daemon=True).start()
+
+    def finish(self) -> None:
+        with self._lock:
+            self.done.set()
+
+
+_ACTIVE: dict[str, _ActiveRun] = {}
+_ACTIVE_LOCK = threading.Lock()
+# preserve_insertion_order is a database-wide setting: relaxed while any run is active, restored after the last
+_RELAXED: dict[str, Any] = {"count": 0, "prior": "true"}
+
+
+def active_runs() -> list[str]:
+    with _ACTIVE_LOCK:
+        return sorted(_ACTIVE)
+
+
+def cancel_all_active(reason: str = "cancelled") -> int:
+    """Stop every run active in this process (used by the CLI's SIGINT/SIGTERM handler)."""
+    with _ACTIVE_LOCK:
+        handles = list(_ACTIVE.values())
+    for h in handles:
+        h.stop(reason)
+    return len(handles)
+
+
+FAILURE_HINTS = {
+    "memory_limit": (
+        "DuckDB ran out of memory: raise CB_DUCKDB_MEMORY_LIMIT, lower CB_TREATMENT_BUCKET_EVENTS, or set "
+        "CB_DUCKDB_TEMP_DIRECTORY so DuckDB can spill to disk"
+    ),
+    "disk_limit": (
+        "DuckDB spill files reached CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE: raise that limit or lower "
+        "CB_TREATMENT_BUCKET_EVENTS"
+    ),
+    "disk_full": (
+        "the disk holding the database or the spill directory is full: free space, or point "
+        "CB_DUCKDB_TEMP_DIRECTORY at a larger volume"
+    ),
+    "timeout": "the run exceeded CB_TREATMENT_TIMEOUT_SECONDS: raise it or run on a smaller data snapshot",
+    "cancelled": "the run was cancelled on request; nothing was published",
+    "error": "unexpected error; see the redacted error and failed_stage, then retry",
+}
+
+
+def classify_failure(exc: BaseException, stop_reason: str | None) -> str:
+    """Failure kind for operators (no data values): memory_limit, disk_limit, disk_full, timeout, cancelled,
+    error. An interrupted statement or a stop between statements is reported as the reason the run was stopped;
+    any other exception keeps its own kind even if a stop was requested meanwhile."""
+    if isinstance(exc, (RunCancelled, duckdb.InterruptException)):
+        return stop_reason if stop_reason in ("timeout", "cancelled") else "timeout"
+    text = str(exc).lower()
+    if isinstance(exc, MemoryError) or isinstance(exc, duckdb.OutOfMemoryException):
+        return "disk_limit" if "max_temp_directory_size" in text else "memory_limit"
+    if isinstance(exc, OSError | duckdb.IOException) and (
+        "no space left" in text or "disk full" in text or getattr(exc, "errno", None) == errno.ENOSPC
+    ):
+        return "disk_full"
+    if "no space left on device" in text:
+        return "disk_full"
+    return "error"
 
 
 @dataclass(frozen=True)
@@ -176,11 +298,29 @@ TRANSITION_COLS = [
 class TreatmentService:
     def __init__(self, builder: CohortBuilder):
         self.b = builder
-        self.con = builder.con
-        self.store = builder.store
+        # A dedicated connection to the same database (DuckDB connections must not be shared between threads):
+        # runs, cancellation, retention and other API requests can then proceed concurrently. Call close().
+        self.con = builder.con.cursor()
+        self.store = MetadataStore(self.con)
         self.ontology = builder.ontology
         self.min_cell = builder.executor.min_cell
         self.limits = TreatmentLimits.from_settings(builder.settings)
+
+    def close(self) -> None:
+        try:
+            self.con.close()
+        except duckdb.Error:  # pragma: no cover - already closed
+            pass
+
+    def __enter__(self) -> TreatmentService:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _log(self, event: str, **fields: Any) -> None:
+        """Structured operational log: identifiers, stage names, timings and counts only, never data values."""
+        log.info(json.dumps({"event": event, **fields}, sort_keys=True, default=str))
 
     # ---- configuration ---------------------------------------------------------------------------
     def sources_for_dataset(self) -> TreatmentSourceConfig:
@@ -196,6 +336,55 @@ class TreatmentService:
             raise TreatmentError(f"treatment source config is for {cfg.dataset!r}, not the active dataset {dataset!r}")
         return cfg
 
+    # ---- input fingerprint -----------------------------------------------------------------------------
+    def input_fingerprint(
+        self, rules: TreatmentRuleSet, sources: TreatmentSourceConfig, ref: date, engine: Engine
+    ) -> dict[str, Any]:
+        """Everything a run's output depends on (contract `treatment-input/1`):
+
+        - every source table and the observation-period table by CONTENT: row count plus two order-independent
+          aggregates of DuckDB's row hash (bit_xor and sum), so loading the same rows in another order gives
+          the same fingerprint, while adding, removing, duplicating or changing a row changes it;
+        - the vocabulary by its version label, concept count and highest concept id (not by content);
+        - rule set and source configuration content hashes, the reference date, engine and engine version,
+          event schema, output-hash contract, software version and DuckDB version (row hashes are only
+          comparable within one DuckDB version).
+
+        Batch size, bucket size and thread count are deliberately absent: they never change the output."""
+        tables = {s.table for s in sources.sources}
+        obs = self._observation_source(rules)
+        if obs:
+            tables.add(obs["table"])
+        data: dict[str, str] = {}
+        for t in sorted(tables):
+            tab = ".".join(qi(x) for x in t.split("."))
+            try:
+                row = self.con.execute(
+                    f"SELECT count(*), coalesce(bit_xor(hash(t)), 0), coalesce(sum(hash(t)::HUGEINT), 0) FROM {tab} t"
+                ).fetchone()
+            except duckdb.CatalogException:  # reported by the events stage, which records a failed run
+                data[t] = "missing"
+                continue
+            data[t] = ":".join(str(v) for v in (row or (0, 0, 0)))
+        try:
+            vocabulary = Vocabulary(self.con).version()
+        except duckdb.Error:
+            vocabulary = "unavailable"
+        return {
+            "fingerprint_version": FINGERPRINT_VERSION,
+            "data": data,
+            "vocabulary": vocabulary,
+            "rule_set_hash": rules.content_hash(),
+            "source_config_hash": sources.content_hash(),
+            "reference_date": ref.isoformat(),
+            "engine": engine,
+            "engine_version": ENGINE_VERSION,
+            "event_schema": EVENT_SCHEMA_VERSION,
+            "output_hash_version": OUTPUT_HASH_VERSION,
+            "software_version": __version__,
+            "duckdb_version": duckdb.__version__,
+        }
+
     # ---- run -------------------------------------------------------------------------------------
     def run(
         self,
@@ -206,7 +395,10 @@ class TreatmentService:
         reference_date: date | None = None,
         engine: Engine = "sql",
         batch_size: int | None = None,
+        reuse: bool = False,
     ) -> dict[str, Any]:
+        """Run the engine. With `reuse=True` a completed, unpurged run of the same tenant with the same input
+        fingerprint is returned instead of recomputing (safe client retries)."""
         sources = sources or self.sources_for_dataset()
         if sources.dataset != self.ontology.dataset_name:
             raise TreatmentError(
@@ -219,6 +411,7 @@ class TreatmentService:
         if not 1 <= batch <= 5_000_000:
             raise TreatmentError("batch size must be 1..5000000")
         ref = reference_date or datetime.now(timezone.utc).date()
+        tenant = tenant or DEFAULT_TENANT
         slot = _slot(self.limits.max_concurrent_runs)
         if not slot.acquire(blocking=False):
             raise TreatmentError(
@@ -227,9 +420,39 @@ class TreatmentService:
             )
         try:
             self.cleanup_incomplete_runs(self.limits.stale_run_minutes, actor)
-            return self._run(rules, actor, tenant or DEFAULT_TENANT, sources, ref, engine, batch)
+            parts = self.input_fingerprint(rules, sources, ref, engine)
+            fingerprint = hashlib.sha256(dumps(parts).encode()).hexdigest()
+            if reuse:
+                row = self.con.execute(
+                    "SELECT run_id FROM meta.treatment_run WHERE input_fingerprint = ? AND tenant = ? AND "
+                    "status = 'completed' AND purged_at IS NULL ORDER BY created_at, run_id LIMIT 1",
+                    [fingerprint, tenant],
+                ).fetchone()
+                if row:
+                    self.store.audit(actor, "treatment.run", "treatment_run", row[0], "reused", tenant, {})
+                    self._log("treatment.run.reused", run_id=row[0], input_fingerprint=fingerprint)
+                    return self.summary(row[0], None)
+            return self._run(rules, actor, tenant, sources, ref, engine, batch, fingerprint, parts)
         finally:
             slot.release()
+
+    def _relax_insertion_order(self) -> None:
+        # every read that needs an order says ORDER BY; this lets large statements spill instead of failing
+        with _ACTIVE_LOCK:
+            if _RELAXED["count"] == 0:
+                prior = self.con.execute("SELECT current_setting('preserve_insertion_order')").fetchone()
+                _RELAXED["prior"] = "true" if not prior or prior[0] in (True, "true") else "false"
+                self.con.execute("SET preserve_insertion_order = false")
+            _RELAXED["count"] += 1
+
+    def _restore_insertion_order(self) -> None:
+        with _ACTIVE_LOCK:
+            _RELAXED["count"] = max(0, _RELAXED["count"] - 1)
+            if _RELAXED["count"] == 0:
+                try:
+                    self.con.execute(f"SET preserve_insertion_order = {_RELAXED['prior']}")
+                except duckdb.Error:  # pragma: no cover
+                    pass
 
     def _run(
         self,
@@ -240,6 +463,8 @@ class TreatmentService:
         ref: date,
         engine: Engine,
         batch: int,
+        fingerprint: str,
+        fingerprint_parts: dict[str, Any],
     ) -> dict[str, Any]:
         run_uuid = uuid.uuid4()
         run_id, stage = str(run_uuid), Stage(run_uuid.hex)
@@ -248,7 +473,8 @@ class TreatmentService:
             "INSERT INTO meta.treatment_run (run_id, dataset, tenant, created_by, created_at, status, event_schema, "
             "rule_set_name, rule_set_version, rule_set_hash, rule_set_json, source_config_hash, source_config_json, "
             "data_snapshot, software_version, reference_date, engine, engine_version, output_hash_version, "
-            "batch_size) VALUES (?,?,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "batch_size, input_fingerprint, input_fingerprint_json) "
+            "VALUES (?,?,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 run_id,
                 dataset,
@@ -262,35 +488,32 @@ class TreatmentService:
                 dumps(rules.model_dump(mode="json")),
                 sources.content_hash(),
                 dumps(sources.model_dump(mode="json")),
-                self.b.data_snapshot(),
+                self.store.data_snapshot(self.ontology.dataset.get("snapshot_sql")),
                 __version__,
                 ref,
                 engine,
                 ENGINE_VERSION,
                 OUTPUT_HASH_VERSION,
                 batch,
+                fingerprint,
+                dumps(fingerprint_parts),
             ],
         )
         metrics = Metrics()
-        prior_order = self.con.execute("SELECT current_setting('preserve_insertion_order')").fetchone()
-        # every read that needs an order says ORDER BY; this lets large statements spill instead of failing
-        self.con.execute("SET preserve_insertion_order = false")
+        handle = _ActiveRun(run_id, tenant)
         reader = self.con.cursor()  # streaming reads run on their own connection to the same database
-        cancelled = threading.Event()
-
-        def interrupt() -> None:
-            cancelled.set()
-            for c in (self.con, reader):
-                try:
-                    c.interrupt()
-                except duckdb.Error:  # pragma: no cover - nothing running
-                    pass
+        handle.connections = [self.con, reader]
+        with _ACTIVE_LOCK:
+            _ACTIVE[run_id] = handle
+        self._relax_insertion_order()
+        started = time.monotonic()
+        self._log("treatment.run.started", run_id=run_id, tenant=tenant, engine=engine, input_fingerprint=fingerprint)
 
         def check() -> None:
-            if cancelled.is_set():
-                raise RunCancelled("treatment run exceeded CB_TREATMENT_TIMEOUT_SECONDS")
+            if handle.event.is_set():
+                raise RunCancelled(f"treatment run stopped ({handle.reason})")
 
-        timer = threading.Timer(self.limits.timeout_seconds, interrupt)
+        timer = threading.Timer(self.limits.timeout_seconds, handle.stop, args=("timeout",))
         timer.daemon = True
         timer.start()
         stage_name = "events"
@@ -299,6 +522,7 @@ class TreatmentService:
             with metrics.timed("events"):
                 self._events(stage, rules, sources, run_id, dataset, ref)
             check()
+            self._log("treatment.run.stage", run_id=run_id, stage="events", seconds=metrics.timings.get("events"))
             stage_name = "episodes"
             with metrics.timed("episodes"):
                 if engine == "sql":
@@ -306,11 +530,13 @@ class TreatmentService:
                 else:
                     self._reference_episodes(stage, rules, batch)
             check()
+            self._log("treatment.run.stage", run_id=run_id, stage="episodes", seconds=metrics.timings.get("episodes"))
             stage_name = "publish"
             self.con.execute("BEGIN")
             in_tx = True
             with metrics.timed("publish"):
                 self._publish(stage, run_id, engine)
+            check()
             with metrics.timed("hash"):
                 digest = output_hash(self.con, run_id, batch)
             with metrics.timed("summary"):
@@ -322,6 +548,7 @@ class TreatmentService:
             ):
                 got = self.con.execute(f"SELECT count(*) FROM {table} WHERE run_id = ?", [run_id]).fetchone()
                 metrics.rows[name] = int(got[0]) if got else 0
+            check()  # last chance: a cancel before COMMIT publishes nothing
             self.con.execute(
                 "UPDATE meta.treatment_run SET status='completed', output_hash=?, summary_json=?, finished_at=?, "
                 "metrics_json=? WHERE run_id=?",
@@ -329,36 +556,43 @@ class TreatmentService:
             )
             self.con.execute("COMMIT")
             in_tx = False
+            handle.finish()  # published: a late stop request no longer interrupts anything
         except Exception as exc:
+            handle.finish()  # no further interrupts while the failure is recorded
             if in_tx:
                 try:
                     self.con.execute("ROLLBACK")
                 except duckdb.Error:  # pragma: no cover - DuckDB already rolled back
                     pass
-            if cancelled.is_set() and not isinstance(exc, RunCancelled):
-                exc = RunCancelled("treatment run exceeded CB_TREATMENT_TIMEOUT_SECONDS")
-            self._fail(run_id, stage, stage_name, exc, metrics)
+            kind = classify_failure(exc, handle.reason)
+            status = "cancelled" if kind == "cancelled" else "failed"
+            self._fail(run_id, stage_name, exc, metrics, kind, status)
             self.store.audit(
                 actor,
                 "treatment.run",
                 "treatment_run",
                 run_id,
-                "failed",
+                status,
                 tenant,
-                {"dataset": dataset, "stage": stage_name},
+                {"dataset": dataset, "stage": stage_name, "failure_kind": kind},
             )
-            if isinstance(exc, (TreatmentError, GovernanceError)):
+            self._log(
+                "treatment.run.failed",
+                run_id=run_id,
+                stage=stage_name,
+                failure_kind=kind,
+                error_type=type(exc).__name__,
+                seconds=round(time.monotonic() - started, 3),
+            )
+            if kind == "error" and isinstance(exc, (TreatmentError, GovernanceError)):
                 raise
-            raise TreatmentError(
-                f"treatment run failed at stage {stage_name!r} ({type(exc).__name__}); see run {run_id}"
-            ) from exc
+            raise TreatmentRunFailed(run_id, status, kind, stage_name, type(exc).__name__) from exc
         finally:
             timer.cancel()
-            restore = "true" if not prior_order or prior_order[0] in (True, "true") else "false"
-            try:
-                self.con.execute(f"SET preserve_insertion_order = {restore}")
-            except duckdb.Error:  # pragma: no cover
-                pass
+            handle.finish()
+            with _ACTIVE_LOCK:
+                _ACTIVE.pop(run_id, None)
+            self._restore_insertion_order()
             try:
                 reader.close()
             except duckdb.Error:  # pragma: no cover
@@ -373,7 +607,40 @@ class TreatmentService:
             tenant,
             {"dataset": dataset, "rule_set_hash": rules.content_hash(), "output_hash": digest, "engine": engine},
         )
+        self._log(
+            "treatment.run.completed",
+            run_id=run_id,
+            seconds=round(time.monotonic() - started, 3),
+            rows=metrics.rows,
+            output_hash=digest,
+        )
         return self.summary(run_id, None)
+
+    # ---- cancellation --------------------------------------------------------------------------------
+    def cancel(self, run_id: str, actor: str, tenant: str | None = None) -> dict[str, Any]:
+        """Request that a running run stop. A run active in this process is interrupted and ends 'cancelled'
+        with nothing published. A 'running' row with no live run behind it (its process died; DuckDB admits
+        one writing process per database file, so no other process can be working on it) is marked
+        'abandoned'. Finished runs are left as they are."""
+        run = self.summary(run_id, tenant)
+        if run["status"] != "running":
+            return {"run_id": run_id, "status": run["status"], "cancelled": False}
+        with _ACTIVE_LOCK:
+            handle = _ACTIVE.get(run_id)
+        if handle is not None:
+            handle.stop("cancelled")
+            outcome = "cancelling"
+        else:
+            self.con.execute(
+                "UPDATE meta.treatment_run SET status='abandoned', finished_at=?, cancel_requested_at=?, "
+                "failure_kind='cancelled' WHERE run_id=? AND status='running'",
+                [now(), now(), run_id],
+            )
+            self._drop_stage(Stage(uuid.UUID(run_id).hex))
+            outcome = "abandoned"
+        self.store.audit(actor, "treatment.cancel", "treatment_run", run_id, outcome, run["tenant"], {})
+        self._log("treatment.run.cancel_requested", run_id=run_id, outcome=outcome)
+        return {"run_id": run_id, "status": outcome, "cancelled": True}
 
     # ---- stages -------------------------------------------------------------------------------------
     def _events(
@@ -582,15 +849,29 @@ class TreatmentService:
             f"INSERT INTO results.treatment_transition (run_id, {tr_cols}) SELECT '{run_id}', {tr_cols} FROM {tr}"
         )
 
-    def _fail(self, run_id: str, stage: Stage, stage_name: str, exc: BaseException, metrics: Metrics) -> None:
-        try:
-            self.con.execute(
-                "UPDATE meta.treatment_run SET status='failed', errors_json=?, failed_stage=?, finished_at=?, "
-                "metrics_json=? WHERE run_id=?",
-                [dumps([redact_error(exc)]), stage_name, now(), dumps({"seconds": metrics.timings}), run_id],
-            )
-        except duckdb.Error:  # pragma: no cover - the database itself is unusable
-            pass
+    def _fail(self, run_id: str, stage_name: str, exc: BaseException, metrics: Metrics, kind: str, status: str) -> None:
+        for _ in range(2):  # an interrupt that arrived between statements can cancel the first attempt
+            try:
+                self.con.execute(
+                    "UPDATE meta.treatment_run SET status=?, errors_json=?, failed_stage=?, finished_at=?, "
+                    "metrics_json=?, failure_kind=?, cancel_requested_at=CASE WHEN ? THEN ? END WHERE run_id=?",
+                    [
+                        status,
+                        dumps([redact_error(exc)]),
+                        stage_name,
+                        now(),
+                        dumps({"seconds": metrics.timings}),
+                        kind,
+                        kind == "cancelled",
+                        now(),
+                        run_id,
+                    ],
+                )
+                return
+            except duckdb.InterruptException:  # pragma: no cover - timing dependent
+                continue
+            except duckdb.Error:  # pragma: no cover - the database itself is unusable
+                return
 
     def _drop_stage(self, stage: Stage) -> None:
         for t in (LOOKUP, GROUPS):
@@ -605,13 +886,25 @@ class TreatmentService:
 
     def cleanup_incomplete_runs(self, older_than_minutes: int, actor: str = "system") -> dict[str, int]:
         """Mark 'running' runs older than the threshold as abandoned and drop staging tables that belong to
-        no running run. Completed results are never touched; failed runs never published rows."""
+        no running run. Runs active in this process are never touched. Completed results are never touched;
+        failed runs never published rows."""
         cutoff = now() - timedelta(minutes=max(0, int(older_than_minutes)))
+        with _ACTIVE_LOCK:
+            live = {uuid.UUID(r).hex for r in _ACTIVE}
+        # list staging tables BEFORE reading the running runs: a run inserts its 'running' row before it
+        # creates staging tables, so every table listed here belongs to a run visible in the next query
+        tables = [
+            str(r[0])
+            for r in self.con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = ?", [STAGE_SCHEMA]
+            ).fetchall()
+        ]
         stale = [
             r[0]
             for r in self.con.execute(
                 "SELECT run_id FROM meta.treatment_run WHERE status = 'running' AND created_at < ?", [cutoff]
             ).fetchall()
+            if uuid.UUID(r[0]).hex not in live
         ]
         for run_id in stale:
             self.con.execute(
@@ -619,18 +912,18 @@ class TreatmentService:
                 [now(), run_id],
             )
             self.store.audit(actor, "treatment.cleanup", "treatment_run", run_id, "abandoned", None, {})
-        running = {
+        running = live | {
             uuid.UUID(r[0]).hex
             for r in self.con.execute("SELECT run_id FROM meta.treatment_run WHERE status = 'running'").fetchall()
         }
         dropped = 0
-        for (name,) in self.con.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = ?", [STAGE_SCHEMA]
-        ).fetchall():
-            hex_part = str(name).rsplit("_", 1)[-1]
+        for name in tables:
+            hex_part = name.rsplit("_", 1)[-1]
             if hex_part not in running:
-                self.con.execute(f"DROP TABLE IF EXISTS {qi(STAGE_SCHEMA)}.{qi(str(name))}")
+                self.con.execute(f"DROP TABLE IF EXISTS {qi(STAGE_SCHEMA)}.{qi(name)}")
                 dropped += 1
+        if stale or dropped:
+            self._log("treatment.cleanup", abandoned_runs=len(stale), dropped_staging_tables=dropped)
         return {"abandoned_runs": len(stale), "dropped_staging_tables": dropped}
 
     # ---- aggregate output (suppressed), from persisted rows ------------------------------------------
@@ -742,7 +1035,8 @@ class TreatmentService:
             "SELECT run_id, dataset, tenant, created_by, created_at, status, event_schema, rule_set_name, "
             "rule_set_version, rule_set_hash, source_config_hash, data_snapshot, software_version, output_hash, "
             "reference_date, engine, engine_version, output_hash_version, failed_stage, finished_at, summary_json, "
-            "errors_json, metrics_json FROM meta.treatment_run WHERE run_id = ?",
+            "errors_json, metrics_json, failure_kind, input_fingerprint, legal_hold, hold_json, purged_at, "
+            "purge_json FROM meta.treatment_run WHERE run_id = ?",
             [run_id],
         )
         row = cur.fetchone()
@@ -757,6 +1051,13 @@ class TreatmentService:
         out.pop("summary_json", None)
         out.pop("errors_json", None)
         out.pop("metrics_json", None)
+        out["legal_hold"] = bool(out["legal_hold"])
+        out["hold"] = json.loads(out.pop("hold_json")) if out.get("hold_json") else None
+        out["purge"] = json.loads(out.pop("purge_json")) if out.get("purge_json") else None
+        out.pop("hold_json", None)
+        out.pop("purge_json", None)
+        out["purged_at"] = str(out["purged_at"]) if out["purged_at"] is not None else None
+        out["failure_hint"] = FAILURE_HINTS.get(out["failure_kind"]) if out["failure_kind"] else None
         return out
 
     # ---- patient-level explanation (authorized only) ------------------------------------------------------
@@ -777,6 +1078,8 @@ class TreatmentService:
             raise GovernanceError("patient-level output requires an admin principal and CB_ALLOW_PATIENT_LEVEL=true")
         if run["status"] != "completed":
             raise KeyError(f"treatment run {run_id} is {run['status']}, not completed")
+        if run["purged_at"] is not None:
+            raise KeyError(f"treatment run {run_id} results were removed by retention on {run['purged_at']}")
         cur = self.con.execute(
             "SELECT * FROM results.treatment_episode WHERE run_id = ? AND episode_id = ?", [run_id, episode_id]
         )

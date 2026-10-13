@@ -40,6 +40,8 @@ class Settings:
     duckdb_threads: int | None = None
     lock_external_access: bool = True  # block file/network access from SQL after setup
     duckdb_max_temp_directory_size: str | None = None  # e.g. "20GB": cap on DuckDB spill files
+    # where DuckDB spills (absolute path; created 0700; default: DuckDB's choice next to the database file)
+    duckdb_temp_directory: Path | None = None
     # treatment-event engine resource controls (validated in treatment_service.TreatmentLimits)
     treatment_batch_size: int = 100_000  # rows per fetch / bulk write batch
     treatment_max_concurrent_runs: int = 1  # per process (DuckDB allows one writing process anyway)
@@ -47,6 +49,10 @@ class Settings:
     treatment_reference_max_events: int = 250_000  # the in-memory reference engine refuses larger runs
     treatment_stale_run_minutes: int = 360  # 'running' runs older than this are cleaned up as abandoned
     treatment_bucket_events: int = 5_000_000  # episodes are built per person bucket of about this many events
+    # retention of derived treatment results (source claims are never deleted); 0 = no default retention
+    treatment_retention_days: int = 0
+    # archives of derived results may only be written below this directory (absolute; None = archiving disabled)
+    treatment_archive_root: Path | None = None
     prompt_versions: dict[str, str] = field(
         default_factory=lambda: {"intent_parser": "v2", "concept_resolver": "v1", "critic": "v2", "proxy_parser": "v1"}
     )
@@ -83,6 +89,13 @@ class Settings:
                 env.get("CB_TREATMENT_STALE_RUN_MINUTES", base.treatment_stale_run_minutes)
             ),
             treatment_bucket_events=int(env.get("CB_TREATMENT_BUCKET_EVENTS", base.treatment_bucket_events)),
+            duckdb_temp_directory=(
+                Path(env["CB_DUCKDB_TEMP_DIRECTORY"]) if env.get("CB_DUCKDB_TEMP_DIRECTORY") else None
+            ),
+            treatment_retention_days=int(env.get("CB_TREATMENT_RETENTION_DAYS", base.treatment_retention_days)),
+            treatment_archive_root=(
+                Path(env["CB_TREATMENT_ARCHIVE_ROOT"]) if env.get("CB_TREATMENT_ARCHIVE_ROOT") else None
+            ),
             lock_external_access=(
                 env.get("CB_DUCKDB_LOCK_EXTERNAL_ACCESS", "true").strip().lower() not in ("0", "false", "no", "off")
             ),

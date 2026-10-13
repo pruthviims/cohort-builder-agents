@@ -100,6 +100,14 @@ ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS batch_size INTEGER;
 ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP;
 ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS failed_stage VARCHAR;
 ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS metrics_json VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS failure_kind VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS input_fingerprint VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS input_fingerprint_json VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMP;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS legal_hold BOOLEAN;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS hold_json VARCHAR;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS purged_at TIMESTAMP;
+ALTER TABLE meta.treatment_run ADD COLUMN IF NOT EXISTS purge_json VARCHAR;
 CREATE TABLE IF NOT EXISTS meta.audit_event (
   event_id VARCHAR PRIMARY KEY, occurred_at TIMESTAMP, actor VARCHAR, tenant VARCHAR, action VARCHAR,
   resource_type VARCHAR, resource_id VARCHAR, outcome VARCHAR, details_json VARCHAR);
