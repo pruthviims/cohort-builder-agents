@@ -34,6 +34,7 @@ from .config import Settings
 from .db import connect, fetch_count, fetch_one, init_schemas
 from .executor import ExecutionError, Executor
 from .ir import CohortDefinition
+from .ir_diff import ir_changes
 from .llm import Backend, LLMClient, LLMError, Prompt
 from .metadata import MetadataStore, now
 from .ontology import Ontology
@@ -158,7 +159,9 @@ class CohortBuilder(ProxyMixin):
         return AgentContext(self.settings, self.ontology, self.vocab, self.store, self.llm, run_id, step_id)
 
     # ---- the agent graph ----------------------------------------------------
-    def ask(self, query: str, user_id: str = "anonymous", tenant: str = DEFAULT_TENANT) -> RunResult:
+    def ask(
+        self, query: str, user_id: str = "anonymous", tenant: str = DEFAULT_TENANT, parent_id: int | None = None
+    ) -> RunResult:
         run_id = self.store.start_run(query, user_id, tenant)
         seq = 0
 
@@ -306,6 +309,7 @@ class CohortBuilder(ProxyMixin):
                 result.status,
                 user_id,
                 run_id=run_id,
+                parent_id=parent_id,
                 issues=[] if result.status == "draft" else result.issues,
                 dataset=self.ontology.dataset_name,
                 tenant=tenant,
@@ -356,6 +360,101 @@ class CohortBuilder(ProxyMixin):
             "tool_calls": tools,
             "dry_run_count": result.attrition[-1]["remaining"] if result.attrition else None,
             **self.component_versions(),
+        }
+
+    # ---- conversational refinement ------------------------------------------
+    MAX_REFINED_QUERY = 16_000
+
+    def refine(self, def_id: int, instruction: str, user_id: str, tenant: str | None = None) -> dict:
+        """Revise a definition in natural language through the SAME pipeline as `ask` (intent parser ->
+        resolver -> validator -> critic); nothing is edited in place. The request sent to the intent parser
+        is the request that produced `def_id` (or, for a version saved from the structured editor, the
+        deterministic explanation of that version) followed by the revision. The result is a NEW version
+        whose parent is `def_id` and never inherits an approval; `changes` lists every field that differs
+        from the parent, so changes to unrelated criteria are visible rather than silent."""
+        instruction = " ".join(instruction.split())
+        if not instruction:
+            raise ValueError("the revision is empty")
+        row, parent = self.load_cohort(def_id, tenant)
+        run = self.store.get_run(row["run_id"]) if row.get("run_id") else None
+        if run and run.get("user_query"):
+            base, basis = str(run["user_query"]), "original_request"
+        else:
+            base = "Current cohort definition to revise:\n" + self.explainer.explain(parent)
+            basis = "definition_explanation"
+        query = f"{base}\n\nRevision: {instruction}"
+        if len(query) > self.MAX_REFINED_QUERY:
+            raise ValueError("too many accumulated revisions: start a new conversation from this version's text")
+        row_tenant = row.get("tenant") or DEFAULT_TENANT
+        result = self.ask(query, user_id, row_tenant, parent_id=def_id)
+        out = result.as_dict()
+        out["parent_definition_id"] = def_id
+        out["refinement_basis"] = basis
+        out["changes"] = ir_changes(parent, result.ir) if result.ir is not None else []
+        self.store.audit(
+            user_id,
+            "definition.refine",
+            "cohort_definition",
+            def_id,
+            "success" if result.status != "failed" else "failed",
+            row_tenant,
+            {"run_id": result.run_id, "new_definition_id": result.cohort_definition_id, "changes": len(out["changes"])},
+        )
+        return out
+
+    # ---- system status (no secrets) ----------------------------------------
+    def system_status(self) -> dict:
+        """Facts about this server for status pages: each check is run, not assumed. Never returns secrets:
+        whether an API key is configured is a boolean."""
+        import os
+
+        from .treatment_export import synthetic_label
+
+        checks: dict[str, Any] = {}
+        try:
+            fetch_one(self.con, "SELECT 1")
+            checks["database"] = {"ok": True}
+        except duckdb.Error as exc:
+            checks["database"] = {"ok": False, "error": type(exc).__name__}
+        try:
+            checks["vocabulary"] = {"ok": True, "version": self.vocab.version()}
+        except duckdb.Error as exc:
+            checks["vocabulary"] = {"ok": False, "error": type(exc).__name__}
+        try:
+            persons = fetch_count(self.con, f"SELECT count(*) FROM {self.ontology.mappings['person']['table']}")
+            checks["dataset"] = {"ok": persons > 0, "name": self.ontology.dataset_name, "has_persons": persons > 0}
+        except (duckdb.Error, KeyError) as exc:
+            checks["dataset"] = {"ok": False, "name": self.ontology.dataset_name, "error": type(exc).__name__}
+        cached = fetch_count(self.con, "SELECT count(*) FROM meta.llm_cache")
+        key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        mode = self.settings.llm_mode
+        checks["llm"] = {
+            "mode": mode,
+            "model": self.settings.model,
+            "api_key_configured": key,
+            "cached_responses": cached,
+            "ok": key or (mode in ("cached", "replay") and cached > 0),
+            "note": None
+            if key
+            else "no API key: only requests already in the response cache can be answered "
+            "(structured editing, validation, review and execution do not need the LLM)",
+        }
+        return {
+            "checks": checks,
+            "data": synthetic_label(self.con),
+            "dataset": {
+                "name": self.ontology.dataset_name,
+                "description": self.ontology.dataset.get("description", ""),
+                "capabilities": self.ontology.capabilities,
+                "data_snapshot": self.data_snapshot(),
+            },
+            "governance": {
+                "allow_self_approval": self.policy.allow_self_approval,
+                "allow_draft_execution": self.policy.allow_draft_execution,
+                "allow_patient_level": self.policy.allow_patient_level,
+                "min_cell_count": self.executor.min_cell,
+            },
+            "versions": self.component_versions(),
         }
 
     # ---- human review & execution -------------------------------------------

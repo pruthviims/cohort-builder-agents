@@ -9,7 +9,13 @@ Roles per endpoint (admin implies all):
   GET  /health                       public (liveness only)
   GET  /me, /versions                any role
   GET  /cohorts, /cohorts/{id}, /cohorts/{id}/sql, /concepts/search   any role
+  GET  /cohorts/{id}/versions, /cohorts/{id}/reviews, /concepts/{id}  any role
+  GET  /cohorts/{id}/diff/{other_id}                                  any role (field-level IR differences)
+  GET  /status                                                        any role (checks run now; no secrets)
   POST /cohorts/ask, /cohorts, /cohorts/validate                      author
+  POST /cohorts/{id}/refine                                           author (new version via the same pipeline)
+  GET  /cohorts/{id}/generations, POST /cohorts/compare               executor or reviewer (suppressed counts)
+  GET  /runs                                                          author (own runs), reviewer (tenant), admin
   POST /cohorts/{id}/review                                           reviewer (not own work, unless policy allows)
   POST /cohorts/{id}/execute                                          executor (approved definitions only)
   GET  /runs/{id}, POST /runs/{id}/replay                             author (own runs), reviewer (tenant), admin
@@ -201,6 +207,14 @@ class TreatmentRunRequest(_Strict):
 
 class AskRequest(_Strict):
     query: str = Field(min_length=1, max_length=4000)
+
+
+class RefineRequest(_Strict):
+    instruction: str = Field(min_length=1, max_length=2000, description="the change, in plain language")
+
+
+class CompareCohortsRequest(_Strict):
+    generation_ids: list[str] = Field(min_length=2, max_length=6)
 
 
 class ReviewRequest(_Strict):
@@ -467,6 +481,12 @@ def create_app(
             raise HTTPException(404, "run not found")
         return run
 
+    @app.get("/runs")
+    def list_runs(limit: int = 50, p: Principal = Depends(need_trace_reader)) -> list[dict]:
+        own = None if p.has(REVIEWER) else p.subject  # same visibility as GET /runs/{id}
+        with lock:
+            return b().store.list_runs(max(1, min(limit, 500)), scope(p), own)
+
     @app.get("/runs/{run_id}")
     def get_run(run_id: str, p: Principal = Depends(need_trace_reader)) -> dict:
         with lock:
@@ -484,6 +504,96 @@ def create_app(
     def search(q: str, domain: str | None = None, limit: int = 10, _: Principal = Depends(any_role)) -> list[dict]:
         with lock:
             return b().vocab.search_concepts(q[:200], domain, limit=max(1, min(limit, 25)))
+
+    @app.get("/concepts/{concept_id}")
+    def concept(concept_id: int, _: Principal = Depends(any_role)) -> dict:
+        with lock:
+            c = b().vocab.get_concept(concept_id)
+        if c is None:
+            raise HTTPException(404, f"concept {concept_id} not found in the vocabulary")
+        return c
+
+    @app.get("/status")
+    def status(_: Principal = Depends(any_role)) -> dict:
+        with lock:
+            return b().system_status()
+
+    @app.post("/cohorts/{def_id}/refine")
+    def refine(def_id: int, req: RefineRequest, p: Principal = Depends(need_author)) -> dict:
+        with lock:
+            try:
+                return b().refine(def_id, req.instruction, p.subject, scope(p))
+            except KeyError as exc:
+                raise HTTPException(404, str(exc).strip("'\"")) from exc
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/cohorts/{def_id}/versions")
+    def versions_of(def_id: int, p: Principal = Depends(any_role)) -> list[dict]:
+        with lock:
+            try:
+                b().load_definition(def_id, scope(p))
+            except KeyError as exc:
+                raise HTTPException(404, f"cohort definition {def_id} not found") from exc
+            rows = b().store.lineage(def_id)
+        t = scope(p)
+        return [r for r in rows if t is None or (r.get("tenant") or "default") == t]
+
+    @app.get("/cohorts/{def_id}/reviews")
+    def reviews_of(def_id: int, p: Principal = Depends(any_role)) -> list[dict]:
+        with lock:
+            try:
+                b().load_definition(def_id, scope(p))
+            except KeyError as exc:
+                raise HTTPException(404, f"cohort definition {def_id} not found") from exc
+            return b().store.reviews(def_id)
+
+    @app.get("/cohorts/{def_id}/diff/{other_id}")
+    def diff_cohorts(def_id: int, other_id: int, p: Principal = Depends(any_role)) -> dict:
+        from .ir_diff import ir_changes
+
+        with lock:
+            try:
+                ra, a = b().load_cohort(def_id, scope(p))
+                rb, bdef = b().load_cohort(other_id, scope(p))
+            except KeyError as exc:
+                raise HTTPException(404, str(exc).strip("'\"")) from exc
+        return {
+            "from": def_id,
+            "to": other_id,
+            "same_dataset": ra.get("dataset") == rb.get("dataset"),
+            "same_semantics": ra["semantic_hash"] == rb["semantic_hash"],
+            "changes": ir_changes(a, bdef),
+        }
+
+    need_counts = require(EXECUTOR, REVIEWER)
+
+    @app.get("/cohorts/{def_id}/generations")
+    def generations_of(def_id: int, p: Principal = Depends(need_counts)) -> list[dict]:
+        from .executor import suppress_count
+
+        with lock:
+            try:
+                b().load_definition(def_id, scope(p))
+            except KeyError as exc:
+                raise HTTPException(404, f"cohort definition {def_id} not found") from exc
+            k = b().executor.min_cell
+            gens = b().store.generations(def_id)
+        keep = ("generation_id", "cohort_definition_id", "dataset", "data_snapshot", "compiler_version", "sql_hash",
+                "executed_by", "executed_at", "caveats")  # fmt: skip
+        return [
+            {**{x: g.get(x) for x in keep}, "person_count": suppress_count(int(g["person_count"]), k)} for g in gens
+        ]
+
+    @app.post("/cohorts/compare")
+    def compare_cohorts(req: CompareCohortsRequest, p: Principal = Depends(need_counts)) -> dict:
+        with lock:
+            try:
+                return b().compare_generations(req.generation_ids, p.subject, scope(p))
+            except KeyError as exc:
+                raise HTTPException(404, str(exc).strip("'\"")) from exc
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
 
     @app.get("/audit")
     def audit(limit: int = 100, _: Principal = Depends(need_admin)) -> list[dict]:

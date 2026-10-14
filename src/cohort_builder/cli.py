@@ -297,6 +297,10 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("subject_id", type=int)
     t.add_argument("--generation")
     t.add_argument("--user", default="cli")
+    s = sub.add_parser("ui", help="run the analytics workspace (needs the API: `cohort-builder serve`)")
+    s.add_argument("--port", type=int, default=8501)
+    s.add_argument("--host", default="127.0.0.1", help="interface to listen on (default: this machine only)")
+    s.add_argument("--api-url", help="API address (default CB_UI_API_URL or http://127.0.0.1:8000)")
     s = sub.add_parser("serve", help="run the HTTP API")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8000)
@@ -402,6 +406,8 @@ def main(argv: list[str] | None = None) -> int:
 
         _print(load_athena(connect(settings.db_path), a.directory))
         return 0
+    if a.cmd == "ui":
+        return _ui(a)
     if a.cmd == "serve":
         import uvicorn
 
@@ -652,6 +658,30 @@ def _cancel_on_signals() -> Iterator[None]:
     finally:
         for s, h in previous.items():
             signal.signal(s, h)
+
+
+def _ui(a) -> int:
+    """Start Streamlit on the workspace app with the light theme; telemetry is switched off."""
+    import os
+    import subprocess
+
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        sys.exit('refused: the workspace needs the ui extra: pip install -e ".[api,ui]"')
+    app = Path(__file__).parent / "ui" / "app.py"
+    env = dict(os.environ)
+    if a.api_url:
+        env["CB_UI_API_URL"] = a.api_url
+    cmd = [
+        sys.executable, "-m", "streamlit", "run", str(app),
+        "--server.port", str(a.port), "--server.address", a.host, "--server.headless", "true",
+        "--browser.gatherUsageStats", "false", "--client.toolbarMode", "minimal",
+        "--theme.base", "light", "--theme.primaryColor", "#1d4ed8", "--theme.backgroundColor", "#ffffff",
+        "--theme.secondaryBackgroundColor", "#f1f5f9", "--theme.textColor", "#0f172a",
+    ]  # fmt: skip
+    print(f"Workspace on http://{a.host}:{a.port} (API {env.get('CB_UI_API_URL', 'http://127.0.0.1:8000')})")
+    return subprocess.call(cmd, env=env)
 
 
 def _treatment(b, a) -> int:

@@ -377,6 +377,55 @@ class MetadataStore:
                 [ts, def_id],
             )
 
+    def lineage(self, def_id: int) -> list[dict]:
+        """Every version connected to `def_id` through parent links (ancestors and descendants), oldest first.
+        Summary columns only (no IR); callers check the tenant."""
+        cols = (
+            "cohort_definition_id, parent_definition_id, name, status, content_hash, semantic_hash, created_by, "
+            "created_at, approved_by, approved_at, run_id, dataset, tenant"
+        )
+        root = def_id
+        seen: set[int] = set()
+        while root not in seen:  # walk up to the first version
+            seen.add(root)
+            row = self.con.execute(
+                "SELECT parent_definition_id FROM meta.cohort_definition WHERE cohort_definition_id = ?", [root]
+            ).fetchone()
+            if row is None or row[0] is None:
+                break
+            root = int(row[0])
+        ids, frontier = {root}, [root]
+        while frontier:  # then collect every descendant
+            marks = ",".join("?" for _ in frontier)
+            kids = [
+                int(r[0])
+                for r in self.con.execute(
+                    f"SELECT cohort_definition_id FROM meta.cohort_definition WHERE parent_definition_id IN ({marks})",
+                    frontier,
+                ).fetchall()
+            ]
+            frontier = [k for k in kids if k not in ids]
+            ids.update(frontier)
+        marks = ",".join("?" for _ in ids)
+        return _rows(
+            self.con.execute(
+                f"SELECT {cols} FROM meta.cohort_definition WHERE cohort_definition_id IN ({marks}) "
+                "ORDER BY cohort_definition_id",
+                sorted(ids),
+            )
+        )
+
+    def list_runs(self, limit: int = 50, tenant: str | None = None, user_id: str | None = None) -> list[dict]:
+        """Agent runs (newest first): status and identifiers only; the request text stays in GET /runs/{id}."""
+        return _rows(
+            self.con.execute(
+                "SELECT run_id, user_id, tenant, submitted_at, finished_at, status, retry_count, output_definition_id "
+                "FROM meta.agent_run WHERE (CAST(? AS VARCHAR) IS NULL OR tenant = ?) "
+                "AND (CAST(? AS VARCHAR) IS NULL OR user_id = ?) ORDER BY submitted_at DESC LIMIT ?",
+                [tenant, tenant, user_id, user_id, limit],
+            )
+        )
+
     def reviews(self, def_id: int) -> list[dict]:
         return _rows(
             self.con.execute(

@@ -48,6 +48,23 @@ You can try the pipeline without an LLM by running a hand-written definition:
 cohort-builder dry-run examples/t2dm_metformin_hba1c.json
 ```
 
+### Web workspace
+
+A browser workspace for building, refining, validating, reviewing, executing and comparing cohorts. It
+has a conversational assistant and a structured criteria editor that work on the same draft. It runs on
+top of the HTTP API, so the API's roles, approval gates, suppression and audit log apply unchanged.
+
+```bash
+pip install -e ".[api,ui]"
+export CB_AUTH_TOKENS_FILE=$PWD/config/tokens.yaml   # tokens from `cohort-builder auth issue-token`
+cohort-builder serve &                              # the API, http://127.0.0.1:8000
+cohort-builder ui                                   # the workspace, http://127.0.0.1:8501
+```
+
+Windows PowerShell steps, page-by-page behaviour and limitations: [`docs/UI.md`](docs/UI.md). The AI
+model is optional. Without `ANTHROPIC_API_KEY` the workspace still opens, and the deterministic paths
+work: uploading a definition, structured editing, validation, review, execution and comparison.
+
 ### HTTP API
 
 Every endpoint except `GET /health` requires a bearer token. The caller's identity and roles come from the
@@ -950,6 +967,7 @@ vocabulary, run the treatment engine, export the summary).
 | `CB_DUCKDB_MEMORY_LIMIT` / `CB_DUCKDB_THREADS` | DuckDB defaults |
 | `CB_DUCKDB_LOCK_EXTERNAL_ACCESS` | `true` (SQL cannot read files, attach databases or load extensions) |
 | `CB_MCP_USER`, `CB_MCP_TENANT`, `CB_MCP_TOKEN`, `CB_MCP_ALLOWED_HOSTS` | see MCP server |
+| `CB_UI_API_URL`, `CB_UI_API_TOKEN` | workspace: API address (default `http://127.0.0.1:8000`) and an optional preset token (see `docs/UI.md`) |
 
 A placeholder-only template is in `.env.example`.
 
@@ -985,6 +1003,8 @@ src/cohort_builder/
   synthetic_laad.py  synthetic LAAD-style claims (native vendor-shaped tables)
   synthetic_t2d.py   synthetic type 2 diabetes claims in the laad schema with counted artefacts
   cli.py, api.py     interfaces (CLI, HTTP API)
+  ui/                web workspace (Streamlit): typed API client, presentation logic, pages
+  ir_diff.py         field-level differences between two definitions
   mcp_server.py      MCP server (stdio + Streamable HTTP)
 benchmarks/          synthetic scalability benchmark for the treatment engine (see benchmarks/README.md)
 eval/                golden cases + gold IRs

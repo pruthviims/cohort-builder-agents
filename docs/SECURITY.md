@@ -161,6 +161,16 @@ How the rules are enforced:
   and no MCP tool returns patient-level data. An AI that generated an algorithm therefore cannot run it. Its HTTP mode uses one shared bearer token
   (`CB_MCP_TOKEN`) plus a host allowlist. That is suitable for a pilot only; per-user OAuth is remaining work.
 
+## Web workspace
+
+The workspace (`cohort-builder ui`, see [UI.md](UI.md)) is a client of the HTTP API with the same token.
+- **Token handling:** the token stays in the server-side Streamlit session. It never appears in pages,
+  URLs, logs or browser storage, and tests check that it is not echoed.
+- **Enforcement:** the API still checks every role, tenant, approval and execution gate. The workspace
+  only hides buttons for convenience.
+- **Network:** it listens on 127.0.0.1 by default. Exposing it needs a TLS reverse proxy.
+- **Telemetry:** Streamlit usage statistics are switched off.
+
 ## Audit log
 
 `meta.audit_event` is append-only from the application's point of view. Each record holds the actor, tenant,
