@@ -99,6 +99,9 @@ kind and a redacted error (quoted literals removed). Benchmark output contains c
 - **Logs:** the `cohort_builder.treatment` logger emits JSON with run ids, stage names, timings, row
   counts and hashes only; tests assert that record ids, codes and dates never appear. No telemetry is sent
   anywhere: logs go to the handlers the deployment configures.
+- **Control directory:** `<database file>.treatment-control/` (0700, symbolic links refused) holds only
+  `<run_id>.running` (a process id) and `<run_id>.cancel` markers; anyone who can write there can cancel
+  runs, so it must have the same owner as the database file. File names are validated run UUIDs.
 - **Spill files:** DuckDB writes temporary files with patient-level content while large runs spill. Put
   them on protected storage with `CB_DUCKDB_TEMP_DIRECTORY` (validated like archive directories) and cap
   them with `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE`.

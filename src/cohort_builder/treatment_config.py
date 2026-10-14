@@ -54,10 +54,19 @@ def _ident(v: str | None) -> str | None:
     return v
 
 
+_ADDED_OPTIONAL = {"provenance", "payer_column"}  # fields added later: when unset, the hash is unchanged
+
+
+def _prune(v: Any) -> Any:
+    if isinstance(v, dict):
+        return {k: _prune(x) for k, x in v.items() if not (k in _ADDED_OPTIONAL and x is None)}
+    if isinstance(v, list):
+        return [_prune(x) for x in v]
+    return v
+
+
 def content_hash(model: BaseModel) -> str:
-    data = model.model_dump(mode="json")
-    if data.get("provenance", "absent") is None:
-        data.pop("provenance")  # configs without a provenance block keep the hash they always had
+    data = _prune(model.model_dump(mode="json"))  # configs without the newer fields keep their old hash
     blob = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode()).hexdigest()
 
@@ -141,6 +150,11 @@ class TreatmentSource(_M):
     code_type_column: str | None = Field(default=None, description="per-row code system (e.g. CPT / HCPCS)")
     code_type_values: dict[str, str] | None = Field(default=None, description="code type value -> vocabulary_id")
     status: StatusMapping | None = None
+    payer_column: str | None = Field(
+        default=None,
+        description="payer / plan of the transaction: a reversal or adjustment whose payer differs from the "
+        "claim it references is flagged reference_payer_mismatch (it still applies)",
+    )
 
     @field_validator("name")
     @classmethod
@@ -169,6 +183,7 @@ class TreatmentSource(_M):
         "concept_column",
         "code_column",
         "code_type_column",
+        "payer_column",
     )
     @classmethod
     def _cols(cls, v: str | None) -> str | None:
@@ -183,6 +198,8 @@ class TreatmentSource(_M):
         for k in self.evidence_type_values or {}:
             if not _VALUE.match(k):
                 raise ValueError(f"{self.name}: unsupported evidence type value {k!r}")
+        if self.payer_column and not (self.status and self.status.reference_column):
+            raise ValueError(f"{self.name}: payer_column needs status.reference_column (it compares reversals)")
         if (self.concept_column is None) == (self.code_column is None):
             raise ValueError(f"{self.name}: give exactly one of concept_column or code_column")
         if self.code_column:

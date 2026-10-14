@@ -434,6 +434,20 @@ def main(argv: list[str] | None = None) -> int:
         _print({k: report[k] for k in ("eval_run_id", "summary", "thresholds", "passed", "failed_metrics")})
         return 0 if report["passed"] else 1
 
+    if a.cmd == "treatment" and a.treatment_cmd == "cancel" and settings.db_path.exists():
+        import duckdb
+
+        from .treatment_service import request_cancel_by_file
+
+        try:  # the database is locked while another process runs: ask that process through its marker file
+            probe = duckdb.connect(str(settings.db_path))
+            probe.close()
+        except duckdb.IOException:
+            try:
+                _print(request_cancel_by_file(settings.db_path, a.run_id))
+            except ValueError as exc:
+                sys.exit(f"refused: {exc}")
+            return 0
     b = _builder(settings)
     if a.cmd == "proxy":
         return _proxy(b, a)

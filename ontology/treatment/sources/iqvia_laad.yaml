@@ -20,6 +20,7 @@ sources:
       column: txn_type
       values: {PAID: paid, REJECTED: rejected, REVERSAL: reversal}
       reference_column: orig_claim_id      # a REVERSAL row cancels the paid claim it references
+    payer_column: payer_type               # a reversal billed to another payer is flagged, not ignored
   - name: medical
     table: laad.px_claims
     person_column: patient_id

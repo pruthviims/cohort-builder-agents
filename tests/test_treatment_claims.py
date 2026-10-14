@@ -147,3 +147,34 @@ def test_diff_runs_pinpoints_differences(db):
     assert d["episodes"]["only_in_a"] > 0 and d["episodes"]["examples"][0]["side"] in ("a", "b")
     assert {"episode_id", "episode_start", "episode_end"} <= set(d["episodes"]["examples"][0])
     json.dumps(d, default=str)  # serializable for reports
+
+
+def test_reversal_with_another_payer_is_flagged_but_still_applies(db):
+    observe(db, OBS)
+    db.con.execute("ALTER TABLE claims.pharmacy ADD COLUMN payer VARCHAR")
+    fills(
+        db,
+        [
+            ("p1", 8, "2020-01-01", 801, 30),
+            ("x1", 8, "2020-01-03", 801, 30, "X", "p1"),  # reversed by another payer
+            ("p2", 8, "2020-02-01", 801, 30),
+            ("x2", 8, "2020-02-02", 801, 30, "X", "p2"),  # same payer: no flag
+            ("p3", 8, "2020-03-01", 801, 30),
+            ("x3", 8, "2020-03-02", 801, 30, "X", "p3"),  # payer unknown on the reversal: nothing to compare
+        ],
+    )
+    db.con.execute(
+        "UPDATE claims.pharmacy SET payer = CASE claim_id WHEN 'x1' THEN 'MEDICAID' WHEN 'x3' THEN NULL "
+        "ELSE 'COMMERCIAL' END"
+    )
+    src = {**RX_SOURCE, "payer_column": "payer"}
+    out = TreatmentService(db).run(rules(), "a", "default", source_cfg([src]), __import__("datetime").date(2026, 1, 1))
+    fl, st = flags(db, out["run_id"]), steps(db, out["run_id"])
+    assert "reference_payer_mismatch" in fl["x1"]
+    assert "reference_payer_mismatch" not in (fl["x2"] or "") and "reference_payer_mismatch" not in (fl["x3"] or "")
+    assert st["p1"][1] == "reversed_claim"  # flagged for review, never silently dropped or re-included
+    # the same claims without payer_column: no flag, same inclusion decisions
+    plain = run(db)
+    assert "reference_payer_mismatch" not in (flags(db, plain["run_id"])["x1"] or "")
+    with pytest.raises(ValueError, match="payer_column needs"):
+        source_cfg([{**RX_SOURCE, "status": None, "payer_column": "payer"}])

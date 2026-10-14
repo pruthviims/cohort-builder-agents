@@ -455,7 +455,8 @@ out by hand (the arithmetic is in the file).
   - the drug: a standard concept column, or a code column with a vocabulary (or a per-row code-type
     column such as CPT/HCPCS)
   - the claim status column and value map, with the column that links reversals/adjustments to the
-    claim they act on
+    claim they act on, and optionally the payer column (`payer_column`): a reversal or adjustment billed
+    to another payer than its claim is flagged `reference_payer_mismatch` (it still applies; review it)
   - the **evidence type**: `dispensing`, `administration` or `prescription`, fixed or from a per-row
     value map; unlisted values are `unknown`. It is never guessed: a pharmacy claim shows dispensing, not
     ingestion, and a medical claim shows billed administration.
@@ -530,13 +531,21 @@ no symbolic links, created 0700) and `CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` (cap on
 and `completed` status are written in **one transaction**, so partial output is never visible. A failure
 leaves `failed` (or `cancelled`) with the stage, a redacted error and a **failure kind** with an
 actionable hint: `memory_limit`, `disk_limit` (spill cap reached), `disk_full`, `timeout`, `cancelled` or
-`error`. No result rows are written and staging tables are always dropped. Runs left `running` by a
+`error`. Without an explicit spill cap, DuckDB's implicit cap is the free space of the spill volume, so
+hitting it is reported as `disk_full`. No result rows are written and staging tables are always dropped. Runs left `running` by a
 crashed process become `abandoned` (`treatment cleanup`, also done before each run).
 - Each `TreatmentService` uses its own DuckDB connection, so runs can proceed in parallel threads (up to
   `CB_TREATMENT_MAX_CONCURRENT_RUNS`) and the API no longer blocks other requests during a run.
 - **Cancellation:** `POST /treatment-runs/{id}/cancel`, `treatment cancel`, or SIGINT/SIGTERM during
   `treatment run`. DuckDB only interrupts the statement running at that instant, so a stopped run's
   connections are interrupted repeatedly until it ends; between statements the run checks the request.
+  **From another process:** DuckDB admits one writing process per database file, so a second process
+  cannot open the database while a run (CLI or API server) holds it. A running run therefore keeps a
+  marker `<run_id>.running` (its process id) in `<database file>.treatment-control/` (created 0700) and
+  checks every second for `<run_id>.cancel`. `treatment cancel RUN_ID` writes that file when the database
+  is locked; markers of dead processes are ignored and removed. Before every run, `running` rows that are
+  not live in the current process are marked `abandoned` whatever their age (no other process can be
+  running them).
 - Structured JSON logs (`cohort_builder.treatment` logger): run id, stage, timings, row counts and hashes
   only - never record ids, codes, dates or patient ids.
 
@@ -589,10 +598,7 @@ groups of at least the minimum cell count).
 
 **Not implemented yet:** brand-switch matrices, line-of-therapy rules, persistence/adherence (PDC/MPR),
 an approval workflow for rule sets (review status is recorded, not enforced), day-level dose or strength
-normalization, cross-process cancellation (DuckDB admits one writing process per database file, so a
-`running` row with no live run in this process is marked abandoned instead), and payer-consistency checks
-between a claim and its reversal (the synthetic generator injects such pairs; the engine does not use the
-payer column).
+normalization, and clinical validation of the shipped rule set and LAAD mapping (both `illustrative`).
 
 ## Moving to real data
 
@@ -901,6 +907,7 @@ pip install -e ".[api,mcp,dev]"
 pytest                                    # synthetic data and a scripted fake LLM; no network, no API key
 pytest --cov                              # with coverage (CI gate: 80%)
 pytest -m slow                            # slow end-to-end tests (10k synthetic T2D patients); separate CI job
+CB_TEST_SMALL_FS=/mnt/cb-small pytest     # also the REAL disk-full tests (a small tmpfs you own, mode 0700)
 cohort-builder ontology validate          # treatment rule sets / source configs (also in CI)
 CB_TEST_POSTGRES_DSN=postgresql://user:pass@localhost:5432/postgres pytest   # also run compiled SQL on PostgreSQL   # pragma: allowlist secret
 ruff check src tests && ruff format --check src tests && mypy

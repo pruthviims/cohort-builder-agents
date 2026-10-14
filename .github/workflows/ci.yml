@@ -51,7 +51,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[api,mcp,dev]"
+      - name: small dedicated filesystem for the real disk-full tests
+        run: |
+          sudo mkdir -p /mnt/cb-small
+          sudo mount -t tmpfs -o size=32m tmpfs /mnt/cb-small
+          sudo chown "$(id -u):$(id -g)" /mnt/cb-small
+          chmod 700 /mnt/cb-small
       - name: tests (synthetic data only) with coverage
+        env:
+          CB_TEST_SMALL_FS: /mnt/cb-small
         run: pytest -q --cov --cov-report=term --cov-report=xml --cov-fail-under=80
       - uses: actions/upload-artifact@v4
         if: matrix.python == '3.12'

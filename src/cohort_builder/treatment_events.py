@@ -143,6 +143,7 @@ def source_event_sql(
         ref = f"CAST({c(st.reference_column)} AS VARCHAR)" if st.reference_column else "CAST(NULL AS VARCHAR)"
     else:
         raw_cat, ref = "'not_applicable'", "CAST(NULL AS VARCHAR)"
+    payer = f"CAST({c(src.payer_column)} AS VARCHAR)" if src.payer_column else "CAST(NULL AS VARCHAR)"
     # evidence type -------------------------------------------------------------------------------
     if src.evidence_type:
         evidence = _lit(src.evidence_type)
@@ -199,15 +200,15 @@ def source_event_sql(
 WITH base AS (
   SELECT TRY_CAST({c(src.person_column)} AS BIGINT) AS person_id, {rec} AS record_id,
          TRY_CAST({c(src.start_column)} AS DATE) AS start_date, {end_raw} AS end_raw, {ds_raw} AS ds_raw,
-         {qty} AS quantity, {raw_cat} AS status_cat, {ref} AS ref_id, {evidence} AS evidence_type,
+         {qty} AS quantity, {raw_cat} AS status_cat, {ref} AS ref_id, {payer} AS payer, {evidence} AS evidence_type,
          {code} AS source_code, {vocab_expr} AS source_vocabulary, {product} AS product_concept_id
   FROM {_table(src.table)} {t}{product_join}),
 rev AS (SELECT DISTINCT ref_id{ref_person} FROM base WHERE status_cat = 'reversal' AND ref_id IS NOT NULL),
 adj AS (SELECT DISTINCT ref_id{ref_person} FROM base WHERE status_cat = 'adjustment' AND ref_id IS NOT NULL),
-orig AS (SELECT record_id, min(person_id) AS person_id, min(start_date) AS start_date FROM base
-         WHERE record_id IS NOT NULL GROUP BY record_id),
+orig AS (SELECT record_id, min(person_id) AS person_id, min(start_date) AS start_date, min(payer) AS payer,
+                count(DISTINCT payer) AS n_payers FROM base WHERE record_id IS NOT NULL GROUP BY record_id),
 var AS (SELECT record_id, count(DISTINCT row(person_id, start_date, source_code, ds_raw, end_raw, quantity,
-                                             status_cat, ref_id)) AS variants
+                                             status_cat, ref_id, payer)) AS variants
         FROM base WHERE record_id IS NOT NULL GROUP BY record_id),
 ing AS (
   SELECT p.concept_id AS product_concept_id, i.concept_id AS ingredient_concept_id
@@ -234,6 +235,8 @@ ev AS (
            AS ref_person_mismatch,
          b.status_cat = 'reversal' AND og.start_date IS NOT NULL AND b.start_date < og.start_date
            AS reversal_before_original,
+         b.ref_id IS NOT NULL AND og.record_id IS NOT NULL AND b.payer IS NOT NULL AND og.payer IS NOT NULL
+           AND (og.n_payers > 1 OR og.payer <> b.payer) AS ref_payer_mismatch,
          coalesce(vr.variants, 1) > 1 AS conflicting_duplicate,
          CASE WHEN {ds_ok} THEN b.ds_raw END AS ds_valid
   FROM base b
@@ -281,6 +284,7 @@ SELECT {_lit(run_id)} AS run_id,
          CASE WHEN orphan_adjustment THEN 'orphan_adjustment' END,
          CASE WHEN ref_person_mismatch THEN 'reference_person_mismatch' END,
          CASE WHEN reversal_before_original THEN 'reversal_before_original' END,
+         CASE WHEN ref_payer_mismatch THEN 'reference_payer_mismatch' END,
          CASE WHEN conflicting_duplicate THEN 'conflicting_duplicate_record' END,
          CASE WHEN quantity IS NOT NULL AND quantity <= 0 THEN 'quantity_invalid' END,
          CASE WHEN ds_raw IS NULL AND product_domain = 'Drug' THEN 'days_supply_missing' END,

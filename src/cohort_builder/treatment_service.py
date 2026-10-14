@@ -11,8 +11,10 @@ Run lifecycle (no partial output is ever visible as complete):
                ONE transaction at the end
   'failed'     any error: that transaction never commits, staging is dropped, the run keeps a redacted
                error and the stage that failed (no data values)
-  'abandoned'  'running' rows older than CB_TREATMENT_STALE_RUN_MINUTES (a crashed process), cleaned up by
-               `cleanup_incomplete_runs` (also called before every run)
+  'cancelled'  stopped on request (API, CLI, signal, or a cancel file from another process); nothing published
+  'abandoned'  a 'running' row whose process died. DuckDB admits one writing process per database file, so
+               before every run all 'running' rows not live in this process are abandoned, whatever their
+               age; `treatment cleanup` does the same for rows older than CB_TREATMENT_STALE_RUN_MINUTES
 
 Patient-level rows live in results.treatment_* and are only returned through `explain_episode`, which needs
 an admin principal AND CB_ALLOW_PATIENT_LEVEL=true (audited). Summaries are aggregate and suppressed.
@@ -24,6 +26,7 @@ import errno
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -41,6 +44,7 @@ from .dataset_mapping import code_lookup_sql
 from .db import redact_error
 from .executor import suppress_count, suppress_partition, suppress_with_total
 from .metadata import MetadataStore, dumps, now
+from .safe_paths import UnsafePathError, safe_directory
 from .security import DEFAULT_TENANT, GovernanceError
 from .treatment_config import (
     EVENT_SCHEMA_VERSION,
@@ -165,6 +169,44 @@ def cancel_all_active(reason: str = "cancelled") -> int:
     return len(handles)
 
 
+# ---- cross-process cancellation ------------------------------------------------------------------------
+# DuckDB admits one writing process per database file, so another process (a CLI next to a running API
+# server or CLI run) cannot open the database to ask for a cancel. A running run therefore keeps a marker
+# file `<run_id>.running` in `<database file>.treatment-control/` (owner-only directory) and polls for
+# `<run_id>.cancel`, which `request_cancel_by_file` (CLI: `treatment cancel` when the database is locked)
+# creates. File names are validated run UUIDs; contents are a process id only.
+CANCEL_POLL_SECONDS = 1.0
+
+
+def control_dir(db_path: Path) -> Path:
+    db = Path(db_path).absolute()
+    return db.with_name(db.name + ".treatment-control")
+
+
+def _pid_alive(marker: Path) -> bool:
+    try:
+        pid = int(marker.read_text().strip())
+        os.kill(pid, 0)
+    except (ValueError, OSError):
+        return False  # unreadable marker or the process is gone (a crashed run)
+    return True
+
+
+def request_cancel_by_file(db_path: Path, run_id: str) -> dict[str, Any]:
+    """Ask a run in ANOTHER process to stop. Returns 'cancel_requested' when that run is live (its marker
+    exists), else 'not_running'. The running process records the outcome ('cancelled') in the database."""
+    rid = str(uuid.UUID(run_id))  # raises ValueError for anything that is not a run id
+    ctl = control_dir(db_path)
+    marker = ctl / f"{rid}.running"
+    if not marker.is_file() or not _pid_alive(marker):
+        return {"run_id": rid, "status": "not_running", "cancelled": False}
+    safe_directory(ctl, "treatment control directory", create=False)
+    fd = os.open(ctl / f"{rid}.cancel", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(str(os.getpid()))
+    return {"run_id": rid, "status": "cancel_requested", "cancelled": True}
+
+
 FAILURE_HINTS = {
     "memory_limit": (
         "DuckDB ran out of memory: raise CB_DUCKDB_MEMORY_LIMIT, lower CB_TREATMENT_BUCKET_EVENTS, or set "
@@ -184,7 +226,7 @@ FAILURE_HINTS = {
 }
 
 
-def classify_failure(exc: BaseException, stop_reason: str | None) -> str:
+def classify_failure(exc: BaseException, stop_reason: str | None, temp_cap_configured: bool = True) -> str:
     """Failure kind for operators (no data values): memory_limit, disk_limit, disk_full, timeout, cancelled,
     error. An interrupted statement or a stop between statements is reported as the reason the run was stopped;
     any other exception keeps its own kind even if a stop was requested meanwhile."""
@@ -192,7 +234,10 @@ def classify_failure(exc: BaseException, stop_reason: str | None) -> str:
         return stop_reason if stop_reason in ("timeout", "cancelled") else "timeout"
     text = str(exc).lower()
     if isinstance(exc, MemoryError) or isinstance(exc, duckdb.OutOfMemoryException):
-        return "disk_limit" if "max_temp_directory_size" in text else "memory_limit"
+        if "max_temp_directory_size" in text:
+            # without an explicit cap DuckDB's limit IS the free space of the spill volume: the disk is full
+            return "disk_limit" if temp_cap_configured else "disk_full"
+        return "memory_limit"
     if isinstance(exc, OSError | duckdb.IOException) and (
         "no space left" in text or "disk full" in text or getattr(exc, "errno", None) == errno.ENOSPC
     ):
@@ -419,7 +464,9 @@ class TreatmentService:
                 f"(CB_TREATMENT_MAX_CONCURRENT_RUNS={self.limits.max_concurrent_runs})"
             )
         try:
-            self.cleanup_incomplete_runs(self.limits.stale_run_minutes, actor)
+            # DuckDB admits one writing process per database file, and runs of this process are protected by
+            # the in-process registry: any other 'running' row belongs to a dead process, whatever its age
+            self.cleanup_incomplete_runs(0, actor)
             parts = self.input_fingerprint(rules, sources, ref, engine)
             fingerprint = hashlib.sha256(dumps(parts).encode()).hexdigest()
             if reuse:
@@ -469,6 +516,32 @@ class TreatmentService:
         run_uuid = uuid.uuid4()
         run_id, stage = str(run_uuid), Stage(run_uuid.hex)
         dataset = self.ontology.dataset_name
+        handle = _ActiveRun(run_id, tenant)
+        with _ACTIVE_LOCK:  # registered BEFORE its 'running' row exists, so no cleanup can abandon it
+            _ACTIVE[run_id] = handle
+        try:
+            self._insert_run_row(run_id, dataset, tenant, actor, rules, sources, ref, engine, batch, fingerprint,
+                                 fingerprint_parts)  # fmt: skip
+        except BaseException:
+            with _ACTIVE_LOCK:
+                _ACTIVE.pop(run_id, None)
+            raise
+        return self._execute(run_id, stage, handle, rules, actor, tenant, sources, ref, engine, batch, fingerprint)
+
+    def _insert_run_row(
+        self,
+        run_id: str,
+        dataset: str,
+        tenant: str,
+        actor: str,
+        rules: TreatmentRuleSet,
+        sources: TreatmentSourceConfig,
+        ref: date,
+        engine: Engine,
+        batch: int,
+        fingerprint: str,
+        fingerprint_parts: dict[str, Any],
+    ) -> None:
         self.con.execute(
             "INSERT INTO meta.treatment_run (run_id, dataset, tenant, created_by, created_at, status, event_schema, "
             "rule_set_name, rule_set_version, rule_set_hash, rule_set_json, source_config_hash, source_config_json, "
@@ -499,12 +572,25 @@ class TreatmentService:
                 dumps(fingerprint_parts),
             ],
         )
+
+    def _execute(
+        self,
+        run_id: str,
+        stage: Stage,
+        handle: _ActiveRun,
+        rules: TreatmentRuleSet,
+        actor: str,
+        tenant: str,
+        sources: TreatmentSourceConfig,
+        ref: date,
+        engine: Engine,
+        batch: int,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        dataset = self.ontology.dataset_name
         metrics = Metrics()
-        handle = _ActiveRun(run_id, tenant)
         reader = self.con.cursor()  # streaming reads run on their own connection to the same database
         handle.connections = [self.con, reader]
-        with _ACTIVE_LOCK:
-            _ACTIVE[run_id] = handle
         self._relax_insertion_order()
         started = time.monotonic()
         self._log("treatment.run.started", run_id=run_id, tenant=tenant, engine=engine, input_fingerprint=fingerprint)
@@ -516,6 +602,7 @@ class TreatmentService:
         timer = threading.Timer(self.limits.timeout_seconds, handle.stop, args=("timeout",))
         timer.daemon = True
         timer.start()
+        markers = self._start_cancel_watch(handle)
         stage_name = "events"
         in_tx = False
         try:
@@ -564,18 +651,21 @@ class TreatmentService:
                     self.con.execute("ROLLBACK")
                 except duckdb.Error:  # pragma: no cover - DuckDB already rolled back
                     pass
-            kind = classify_failure(exc, handle.reason)
+            kind = classify_failure(exc, handle.reason, bool(self.b.settings.duckdb_max_temp_directory_size))
             status = "cancelled" if kind == "cancelled" else "failed"
             self._fail(run_id, stage_name, exc, metrics, kind, status)
-            self.store.audit(
-                actor,
-                "treatment.run",
-                "treatment_run",
-                run_id,
-                status,
-                tenant,
-                {"dataset": dataset, "stage": stage_name, "failure_kind": kind},
-            )
+            try:
+                self.store.audit(
+                    actor,
+                    "treatment.run",
+                    "treatment_run",
+                    run_id,
+                    status,
+                    tenant,
+                    {"dataset": dataset, "stage": stage_name, "failure_kind": kind},
+                )
+            except duckdb.Error:  # e.g. the disk is full: the run row stays 'running' -> abandoned on next start
+                pass
             self._log(
                 "treatment.run.failed",
                 run_id=run_id,
@@ -590,6 +680,8 @@ class TreatmentService:
         finally:
             timer.cancel()
             handle.finish()
+            for m in markers:
+                m.unlink(missing_ok=True)
             with _ACTIVE_LOCK:
                 _ACTIVE.pop(run_id, None)
             self._restore_insertion_order()
@@ -615,6 +707,32 @@ class TreatmentService:
             output_hash=digest,
         )
         return self.summary(run_id, None)
+
+    def _start_cancel_watch(self, handle: _ActiveRun) -> list[Path]:
+        """Marker file + polling thread for cancel requests from other processes. Without a usable control
+        directory the run proceeds and only in-process cancellation is available (logged)."""
+        db = Path(self.b.settings.db_path)
+        rid = str(uuid.UUID(handle.run_id))
+        try:
+            ctl = safe_directory(control_dir(db), "treatment control directory")
+            running, cancel = ctl / f"{rid}.running", ctl / f"{rid}.cancel"
+            cancel.unlink(missing_ok=True)
+            fd = os.open(running, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(str(os.getpid()))
+        except (UnsafePathError, OSError) as exc:
+            self._log("treatment.cancel_watch_unavailable", run_id=rid, reason=type(exc).__name__)
+            return []
+
+        def watch() -> None:
+            while not handle.done.wait(CANCEL_POLL_SECONDS):
+                if cancel.exists():
+                    self._log("treatment.run.cancel_requested", run_id=rid, outcome="file")
+                    handle.stop("cancelled")
+                    return
+
+        threading.Thread(target=watch, name=f"cancel-watch-{rid[:8]}", daemon=True).start()
+        return [running, cancel]
 
     # ---- cancellation --------------------------------------------------------------------------------
     def cancel(self, run_id: str, actor: str, tenant: str | None = None) -> dict[str, Any]:
@@ -922,6 +1040,11 @@ class TreatmentService:
             if hex_part not in running:
                 self.con.execute(f"DROP TABLE IF EXISTS {qi(STAGE_SCHEMA)}.{qi(name)}")
                 dropped += 1
+        ctl = control_dir(Path(self.b.settings.db_path))
+        if ctl.is_dir() and not ctl.is_symlink():  # markers of runs that are not live (this process holds the db)
+            for f in ctl.glob("*.*"):
+                if f.stem.replace("-", "") not in live and f.suffix in (".running", ".cancel"):
+                    f.unlink(missing_ok=True)
         if stale or dropped:
             self._log("treatment.cleanup", abandoned_runs=len(stale), dropped_staging_tables=dropped)
         return {"abandoned_runs": len(stale), "dropped_staging_tables": dropped}

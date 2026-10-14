@@ -74,8 +74,8 @@ def db(tmp_path):
     b.con.close()
 
 
-def make_db(tmp_path) -> CohortBuilder:
-    s = dataclasses.replace(Settings(), db_path=tmp_path / "s.duckdb", local_datasets_dir=tmp_path / "ds")
+def make_db(tmp_path, **settings) -> CohortBuilder:
+    s = dataclasses.replace(Settings(), db_path=tmp_path / "s.duckdb", local_datasets_dir=tmp_path / "ds", **settings)
     b = CohortBuilder(s, backend=FakeLLM({}))
     con = b.con
     con.executemany(

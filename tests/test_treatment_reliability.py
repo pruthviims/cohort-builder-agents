@@ -18,6 +18,7 @@ import stat
 import threading
 import time
 from datetime import timedelta
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -109,6 +110,12 @@ def test_failure_classification(exc, reason, kind):
     assert kind in ts.FAILURE_HINTS
 
 
+def test_implicit_spill_cap_means_the_disk_is_full():
+    exc = duckdb.OutOfMemoryException("failed to offload data block; limit set by 'max_temp_directory_size'")
+    assert classify_failure(exc, None, temp_cap_configured=True) == "disk_limit"
+    assert classify_failure(exc, None, temp_cap_configured=False) == "disk_full"
+
+
 @pytest.mark.parametrize(
     ("where", "exc", "kind"),
     [
@@ -126,6 +133,8 @@ def test_mocked_resource_exhaustion_publishes_nothing(db, monkeypatch, where, ex
         monkeypatch.setattr(ts.TreatmentService, "_sql_episodes", boom)
     else:
         monkeypatch.setattr(ts, "output_hash", boom)  # inside the publishing transaction
+    if kind == "disk_limit":  # the cap was set by the operator (CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE)
+        db.settings = dataclasses.replace(db.settings, duckdb_max_temp_directory_size="20GB")
     with pytest.raises(TreatmentRunFailed) as info:
         go(service(db))
     err = info.value
@@ -164,6 +173,8 @@ def test_real_resource_limits_are_classified(db, monkeypatch, kind, setting, sql
 
     monkeypatch.setattr(ts.TreatmentService, "_events", heavy)
     db.con.execute(setting)
+    if kind == "disk_limit":  # an operator-configured cap (CB_DUCKDB_MAX_TEMP_DIRECTORY_SIZE)
+        db.settings = dataclasses.replace(db.settings, duckdb_max_temp_directory_size="1MB")
     try:
         with pytest.raises(TreatmentRunFailed) as info:
             go(service(db))
@@ -245,6 +256,7 @@ def test_signal_handler_cancels_active_runs():
     handle = ts._ActiveRun("r", "default")
     with ts._ACTIVE_LOCK:
         ts._ACTIVE["r"] = handle
+    before = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         with _cancel_on_signals():
             os.kill(os.getpid(), signal.SIGINT)
@@ -253,7 +265,8 @@ def test_signal_handler_cancels_active_runs():
                     break
                 time.sleep(0.01)
         assert handle.event.is_set() and handle.reason == "cancelled"
-        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler  # restored
+        # the previous handlers are restored (whatever the test runner had installed, e.g. coverage)
+        assert {sig: signal.getsignal(sig) for sig in before} == before
     finally:
         with ts._ACTIVE_LOCK:
             ts._ACTIVE.pop("r", None)
@@ -680,3 +693,189 @@ def test_bulk_insert_round_trips_awkward_values_without_optional_packages():
     assert got == sorted(rows, key=lambda r: (r[0] is None, r[0] or 0))
     with pytest.raises(ValueError):
         bulk_insert(con, "t", cols, [(1, "x", None, math.nan, True)], 10)
+
+
+# ---- cancellation from another process --------------------------------------------------------------------
+RUNNER = """
+import sys
+sys.path.insert(0, {tests!r})
+from pathlib import Path
+from cohort_builder import treatment_service as ts
+from test_treatment_reliability import CLAIMS, OBS, go, service
+from test_treatment_scale import fills, make_db, observe
+
+b = make_db(Path({tmp!r}))
+observe(b, OBS)
+fills(b, CLAIMS)
+real = ts.TreatmentService._events
+
+def slow(self, *a, **k):
+    real(self, *a, **k)
+    print("RUNNING", ts.active_runs()[0], flush=True)
+    self.con.execute("SELECT count(*) FROM range(1000000000000) t(r) WHERE r % 7 = 3").fetchone()
+
+ts.TreatmentService._events = slow
+try:
+    go(service(b))
+    print("COMPLETED", flush=True)
+except ts.TreatmentRunFailed as exc:
+    print("FAILED", exc.kind, flush=True)
+"""
+
+
+def test_cancel_from_another_process_through_the_control_directory(tmp_path, monkeypatch, capsys):
+    """A real second process holds the database (DuckDB: one writer). `treatment cancel` in this process
+    cannot open it, writes the cancel request file, and the running process stops and records 'cancelled'."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from cohort_builder.cli import main as cli
+    from cohort_builder.treatment_service import control_dir
+
+    work = tmp_path / "w"
+    work.mkdir()
+    script = tmp_path / "runner.py"
+    script.write_text(RUNNER.format(tests=str(Path(__file__).parent), tmp=str(work)))
+    proc = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline().split()
+        assert line[0] == "RUNNING", line
+        run_id = line[1]
+        db = work / "s.duckdb"
+        assert (control_dir(db) / f"{run_id}.running").is_file()
+        monkeypatch.setenv("CB_DB_PATH", str(db))
+        assert cli(["treatment", "cancel", "00000000-0000-0000-0000-000000000009"]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "not_running"
+        with pytest.raises(SystemExit, match="refused"):
+            cli(["treatment", "cancel", "../../etc/passwd"])
+        began = time.monotonic()
+        assert cli(["treatment", "cancel", run_id]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "cancel_requested"
+        out, _ = proc.communicate(timeout=60)
+        assert "FAILED cancelled" in out and time.monotonic() - began < 30
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    con = duckdb.connect(str(work / "s.duckdb"))
+    try:
+        assert con.execute("SELECT status, failure_kind FROM meta.treatment_run").fetchall() == [
+            ("cancelled", "cancelled")
+        ]
+        assert con.execute("SELECT count(*) FROM results.treatment_event").fetchone()[0] == 0
+        assert (
+            con.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'tx_stage'").fetchone()[0]
+            == 0
+        )
+    finally:
+        con.close()
+    assert list(control_dir(work / "s.duckdb").iterdir()) == []  # markers removed
+    assert stat.S_IMODE(control_dir(work / "s.duckdb").stat().st_mode) == 0o700
+
+
+def test_stale_marker_of_a_crashed_process_is_not_cancellable(tmp_path):
+    from cohort_builder.treatment_service import control_dir, request_cancel_by_file
+
+    db = tmp_path / "x.duckdb"
+    ctl = control_dir(db)
+    ctl.mkdir(mode=0o700)
+    rid = "00000000-0000-0000-0000-0000000000ab"
+    (ctl / f"{rid}.running").write_text("999999999")  # no such process
+    assert request_cancel_by_file(db, rid)["status"] == "not_running"
+    (ctl / f"{rid}.running").write_text(str(os.getpid()))
+    assert request_cancel_by_file(db, rid)["status"] == "cancel_requested"
+    assert (ctl / f"{rid}.cancel").is_file()
+
+
+def test_orphaned_running_rows_are_abandoned_before_the_next_run_whatever_their_age(db):
+    orphan = "00000000-0000-0000-0000-0000000000cd"
+    db.con.execute(
+        "INSERT INTO meta.treatment_run (run_id, tenant, status, created_at) VALUES (?, 'default', 'running', ?)",
+        [orphan, now()],  # just started, by a process that then died (e.g. the disk filled up)
+    )
+    assert go(service(db))["status"] == "completed"
+    assert TreatmentService(db).summary(orphan, None)["status"] == "abandoned"
+
+
+# ---- real disk exhaustion (needs a small dedicated filesystem) -------------------------------------------
+SMALL_FS = os.environ.get("CB_TEST_SMALL_FS")  # e.g. a 24-32 MB tmpfs owned by the test user, mode 0700
+needs_small_fs = pytest.mark.skipif(not SMALL_FS, reason="set CB_TEST_SMALL_FS to a small dedicated filesystem")
+
+
+@needs_small_fs
+def test_real_full_spill_volume_is_reported_as_disk_full(tmp_path, monkeypatch):
+    """The spill directory is on a filesystem that runs out of space (no explicit spill cap): DuckDB reports
+    its implicit cap; the run must say the disk is full, not advise raising a cap nobody set."""
+    import shutil
+
+    spill = Path(SMALL_FS) / f"spill-{os.getpid()}"
+    b = make_db(tmp_path, duckdb_temp_directory=spill)
+    try:
+        observe(b, OBS)
+        fills(b, CLAIMS)
+        real = ts.TreatmentService._events
+
+        def heavy(self, *a, **k):
+            real(self, *a, **k)
+            self.con.execute("SELECT count(DISTINCT r::VARCHAR || 'abcdefghij') FROM range(20000000) t(r)").fetchone()
+
+        monkeypatch.setattr(ts.TreatmentService, "_events", heavy)
+        b.con.execute("SET memory_limit = '64MB'")
+        with pytest.raises(TreatmentRunFailed) as info:
+            go(service(b))
+        b.con.execute("SET memory_limit = '2GB'")
+        assert info.value.kind == "disk_full", str(info.value)
+        assert TreatmentService(b).summary(info.value.run_id, None)["failure_kind"] == "disk_full"
+        assert staging(b) == 0 and results_rows(b, info.value.run_id) == 0
+    finally:
+        b.con.close()
+        shutil.rmtree(spill, ignore_errors=True)
+
+
+@needs_small_fs
+def test_real_full_database_volume_publishes_nothing_and_recovers_on_restart(monkeypatch):
+    """The database file itself is on a filesystem that fills up during a run."""
+    import shutil
+
+    from cohort_builder.config import Settings
+    from cohort_builder.orchestrator import CohortBuilder
+    from fake_llm import FakeLLM
+
+    home = Path(SMALL_FS) / f"db-{os.getpid()}"
+    home.mkdir(mode=0o700)
+    try:
+        b = make_db(home)
+        observe(b, OBS)
+        fills(b, CLAIMS)
+        real = ts.TreatmentService._events
+
+        def fill(self, *a, **k):
+            real(self, *a, **k)
+            self.con.execute(
+                "CREATE TABLE tx_stage.zz_filler AS SELECT r, md5(r::VARCHAR) || md5((r + 1)::VARCHAR) AS m "
+                "FROM range(5000000) t(r)"
+            )
+            self.con.execute("CHECKPOINT")
+
+        monkeypatch.setattr(ts.TreatmentService, "_events", fill)
+        with pytest.raises(TreatmentRunFailed) as info:
+            go(service(b))
+        assert info.value.kind == "disk_full" and info.value.stage == "events", str(info.value)
+        row = b.con.execute(
+            "SELECT status, failure_kind FROM meta.treatment_run WHERE run_id = ?", [info.value.run_id]
+        ).fetchone()
+        assert row == ("failed", "disk_full")
+        assert results_rows(b, info.value.run_id) == 0 and staging(b) == 0
+        b.con.close()
+        # a restarted process opens the database fine and nothing partial was published
+        s = dataclasses.replace(Settings(), db_path=home / "s.duckdb", local_datasets_dir=home / "ds")
+        b2 = CohortBuilder(s, backend=FakeLLM({}))
+        try:
+            assert b2.con.execute("SELECT count(*) FROM results.treatment_episode").fetchone()[0] == 0
+            assert (
+                b2.con.execute("SELECT count(*) FROM meta.treatment_run WHERE status = 'completed'").fetchone()[0] == 0
+            )
+        finally:
+            b2.con.close()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)

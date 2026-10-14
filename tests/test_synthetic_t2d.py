@@ -92,6 +92,21 @@ def reconcile(b: CohortBuilder, run_id: str, stats: dict) -> dict[str, int]:
     assert got["missing_person"] == inj.get("missing_patient_id", 0)
     assert got["orphan"] == inj.get("orphan_reversal", 0)
     assert got["cross_patient"] == inj.get("reversal_of_other_patients_claim", 0)
+    # payer consistency, recomputed independently from the raw laad rows (injected pairs plus cross-patient
+    # reversals that happen to name another payer)
+    expected_payer = b.con.execute(
+        "SELECT count(*) FROM laad.rx_claims v JOIN (SELECT claim_id, min(payer_type) AS p, "
+        "count(DISTINCT payer_type) AS n FROM laad.rx_claims GROUP BY claim_id) o "
+        "ON o.claim_id = v.orig_claim_id WHERE v.txn_type = 'REVERSAL' AND v.payer_type IS NOT NULL "
+        "AND o.p IS NOT NULL AND (o.n > 1 OR o.p <> v.payer_type)"
+    ).fetchone()[0]
+    payer = b.con.execute(
+        "SELECT count(*) FROM results.treatment_event WHERE run_id = ? "
+        "AND quality_flags LIKE '%reference_payer_mismatch%'",
+        [run_id],
+    ).fetchone()[0]
+    assert payer == expected_payer >= inj.get("reversal_payer_mismatch", 0)
+    got["payer_mismatch"] = payer
     # a future-dated claim is one event, or two for the (never future-dated) combination product
     assert got["future"] == inj.get("future_dated_claim", 0)
     return got
