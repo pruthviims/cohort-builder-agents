@@ -25,9 +25,11 @@ simultaneously overlapping episodes of different groups (quadratic in that perso
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any
 
 import duckdb
@@ -298,15 +300,25 @@ COV_NEW = [
 ]
 
 
+def _json_value(v: Any) -> Any:
+    return v.isoformat() if isinstance(v, date | datetime) else v
+
+
 def _bulk_insert(con: duckdb.DuckDBPyConnection, table: str, columns: Sequence[tuple[str, str]], rows: list) -> None:
-    """One INSERT per call: each column is passed as one typed list parameter and unnested (no per-row
-    statements; executemany runs ~2,000 rows/s in DuckDB, this ~150,000+)."""
+    """One INSERT per call: each column travels as ONE JSON array string, cast to a typed list and unnested.
+
+    Not executemany (about 2,000 rows/s in DuckDB), and not Python list parameters: DuckDB converts those
+    element by element and, when pandas is not installed, retries importing it for every element (measured:
+    20,000 values in about 2 s). The JSON form is parsed in C++ (about 300,000 rows x 5 columns per second
+    on the benchmark machine), round-trips any string exactly, and needs no optional packages. NaN and
+    infinite floats are refused (not valid JSON)."""
     if not rows:
         return
     cols = list(zip(*rows, strict=True))
-    select = ", ".join(f"unnest(?::{typ}[])" for _, typ in columns)
+    select = ", ".join(f"unnest(CAST(?::JSON AS {typ}[]))" for _, typ in columns)
     names = ", ".join(qi(n) for n, _ in columns)
-    con.execute(f"INSERT INTO {table} ({names}) SELECT {select}", [list(c) for c in cols])
+    params = [json.dumps([_json_value(v) for v in c], allow_nan=False, separators=(",", ":")) for c in cols]
+    con.execute(f"INSERT INTO {table} ({names}) SELECT {select}", params)
 
 
 def bulk_insert(con: duckdb.DuckDBPyConnection, table: str, columns: Sequence[tuple[str, str]], rows: list,

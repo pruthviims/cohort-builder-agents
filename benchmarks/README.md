@@ -98,6 +98,16 @@ and that inclusion and exclusion are identical for every event. 2,507 events dif
 `quality_flags`: the new consistency flags fire on the injected artefacts (cross-patient and early
 reversals, conflicting duplicates, invalid quantities).
 
+**Bulk writes without pandas.** The full test suite took 917–982 s per Python version in the CI-like
+virtual environments, against 492–600 s on `main`, and the 10k end-to-end test had not finished after
+8 minutes there, while it took 21 s with the system Python. The cause was DuckDB's conversion of Python
+list parameters. When pandas is not installed, it retries the pandas import for every element:
+20,000 values took about 2 s, against 0.02 s with pandas. `bulk_insert` (used by the reference engine,
+the synthetic generators and the tests) now sends each column as one JSON array that is parsed in C++.
+After the change, the 10k test took 21.5 s in the same environment without pandas. S1 and S2 were
+re-measured with unchanged hashes and times (4.15 s and 36.3 s): the SQL engine's main path does not use
+`bulk_insert`.
+
 ## Before (the pre-v2 engine, `af46a4c`)
 
 | Workload | Total | Rows/s | Peak RSS | Notes |

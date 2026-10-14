@@ -12,6 +12,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import signal
 import stat
 import threading
@@ -39,7 +40,7 @@ from cohort_builder.treatment_service import (
     classify_failure,
 )
 from test_treatment_engine import rules, source_cfg
-from test_treatment_scale import REF_DATE, RX_SOURCE, fills, make_db, observe
+from test_treatment_scale import NDC, REF_DATE, RX_SOURCE, fills, make_db, observe
 
 OBS = {p: [("2019-01-01", "2022-12-31")] for p in range(1, 30)}
 CLAIMS = [(f"c{i}", 1 + i % 7, f"2020-{1 + i % 12:02d}-{1 + (i * 7) % 27:02d}", 801 + i % 3, 30) for i in range(80)]
@@ -522,12 +523,24 @@ def test_structured_logs_carry_no_patient_data(db, caplog):
     assert events[0] == "treatment.run.started" and events[-1] == "treatment.run.completed"
     assert "treatment.run.stage" in events
     allowed = {"event", "run_id", "tenant", "engine", "input_fingerprint", "stage", "seconds", "rows", "output_hash"}
-    text = " ".join(r.getMessage() for r in caplog.records)
     for r in records:
         assert set(r) <= allowed, r
-    for claim in ("c1", "c17", "11111000101", "2020-0"):  # record ids, codes and dates never appear
-        assert claim not in text
-    assert out["run_id"] in text
+
+    def strings(v):
+        if isinstance(v, dict):
+            for x in v.values():
+                yield from strings(x)
+        elif isinstance(v, str):
+            yield v
+
+    values = [v for r in records for v in strings(r)]
+    claim_ids = {c[0] for c in CLAIMS}
+    ndcs = {NDC[c[3]] for c in CLAIMS}
+    # values are compared as whole tokens: hex identifiers may contain 'c1' by chance, never a claim id
+    assert not claim_ids & set(values)
+    assert not [v for v in values if any(code in v for code in ndcs)]
+    assert not [v for v in values if re.search(r"\d{4}-\d{2}-\d{2}", v)]  # no dates
+    assert out["run_id"] in values
 
 
 # ---- API --------------------------------------------------------------------------------------------------
@@ -641,3 +654,29 @@ def test_row_order_and_thread_count_do_not_change_output(tmp_path, seed):
         finally:
             b.con.close()
     assert len(hashes) == 1 and len(prints) == 1
+
+
+# ---- bulk writes -------------------------------------------------------------------------------------------
+def test_bulk_insert_round_trips_awkward_values_without_optional_packages():
+    """Columns travel as JSON arrays: exact for quotes, backslashes, separators, newlines, unicode and NULLs,
+    and independent of pandas/numpy being installed."""
+    import math
+    from datetime import date
+
+    from cohort_builder.treatment_engine import bulk_insert
+
+    con = duckdb.connect()
+    con.execute("SET enable_external_access = false")  # as in production
+    cols = [("i", "BIGINT"), ("s", "VARCHAR"), ("d", "DATE"), ("f", "DOUBLE"), ("b", "BOOLEAN")]
+    con.execute("CREATE TABLE t (i BIGINT, s VARCHAR, d DATE, f DOUBLE, b BOOLEAN)")
+    weird = ['a"b', "back\\slash", "comma,semi;", "new\nline", "tab\tcr\r", "ünï©ødé ✓", "", "=1+1", None]
+    rows = [
+        (k, weird[k % len(weird)], None if k % 5 == 0 else date(2020, 1, 1) + timedelta(days=k), k / 3, k % 2 == 0)
+        for k in range(2_000)
+    ]
+    rows.append((None, None, None, None, None))
+    bulk_insert(con, "t", cols, rows, 333)
+    got = con.execute("SELECT * FROM t ORDER BY i NULLS LAST").fetchall()
+    assert got == sorted(rows, key=lambda r: (r[0] is None, r[0] or 0))
+    with pytest.raises(ValueError):
+        bulk_insert(con, "t", cols, [(1, "x", None, math.nan, True)], 10)
