@@ -107,8 +107,25 @@ def anthropic_backend() -> Backend:
     return call
 
 
+def forced_tool_choice_rejected(exc: BaseException) -> bool:
+    """The API's 400 for models that do not accept tool_choice "tool"/"any" (for example with thinking on)."""
+    text = str(exc)
+    return "tool_choice" in text and "not supported" in text
+
+
+def auto_tool_variant(system: str, tool_choice: dict) -> tuple[str, dict]:
+    """Same request with tool_choice "auto" and the obligation to call the tool stated in the system prompt."""
+    if tool_choice.get("type") == "tool":
+        rule = f"Respond only by calling the `{tool_choice['name']}` tool exactly once; never reply in plain text."
+    else:
+        rule = "Respond only by calling one of the provided tools; never reply in plain text."
+    return f"{system}\n\n{rule}", {"type": "auto"}
+
+
 class LLMClient:
     _warned = False
+    # models that rejected a forced tool_choice; later requests to them use the "auto" variant directly
+    _auto_tool_models: set[str] = set()
 
     def __init__(self, settings: Settings, store: MetadataStore, backend: Backend | None = None):
         self.settings = settings
@@ -146,6 +163,10 @@ class LLMClient:
         run_id: str | None = None,
         step_id: str | None = None,
     ) -> dict:
+        forced = tool_choice.get("type") in ("tool", "any")
+        if forced and self.settings.model in LLMClient._auto_tool_models:
+            system, tool_choice = auto_tool_variant(system, tool_choice)
+            forced = False
         request: dict[str, Any] = {
             "model": self.settings.model,
             "max_tokens": self.settings.max_tokens,
@@ -160,6 +181,13 @@ class LLMClient:
         request_hash = sha(request)
         mode = self.settings.llm_mode
         response = self.store.cache_get(request_hash) if mode in ("cached", "replay") else None
+        if response is None and forced and mode in ("cached", "replay"):
+            # a run recorded after the forced choice was rejected holds the "auto" variant
+            alt_system, alt_choice = auto_tool_variant(system, tool_choice)
+            alt = {**request, "system": alt_system, "tool_choice": alt_choice}
+            response = self.store.cache_get(sha(alt))
+            if response is not None:
+                request, request_hash = alt, sha(alt)
         cache_hit = response is not None
         if response is None:
             if mode == "replay":
@@ -169,6 +197,22 @@ class LLMClient:
             except LLMError:
                 raise
             except Exception as exc:  # network, auth, rate limit, bad request
+                if forced and forced_tool_choice_rejected(exc):
+                    log.warning(
+                        "model %s does not accept a forced tool_choice; using tool_choice auto with the tool "
+                        "required by the system prompt",
+                        self.settings.model,
+                    )
+                    LLMClient._auto_tool_models.add(self.settings.model)
+                    return self.create(
+                        prompt=prompt,
+                        system=request["system"],
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        run_id=run_id,
+                        step_id=step_id,
+                    )
                 raise LLMError(f"LLM call failed ({prompt.name}): {type(exc).__name__}: {exc}") from exc
             self.store.cache_put(request_hash, self.settings.model, response)
         usage = response.get("usage", {})
@@ -216,7 +260,14 @@ class LLMClient:
             )
             block = next((b for b in resp["content"] if b.get("type") == "tool_use"), None)
             if block is None:
-                raise LLMError(f"{prompt.name}: model did not call {tool_name}")
+                # only possible when tool_choice fell back to "auto": ask once more for the tool call
+                if attempt == max_repairs or not resp["content"]:
+                    raise LLMError(f"{prompt.name}: model did not call {tool_name}")
+                messages = messages + [
+                    {"role": "assistant", "content": resp["content"]},
+                    {"role": "user", "content": f"Call the `{tool_name}` tool now with your answer."},
+                ]
+                continue
             try:
                 return schema.model_validate(block["input"])
             except ValidationError as exc:
