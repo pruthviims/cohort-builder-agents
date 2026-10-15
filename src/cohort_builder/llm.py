@@ -8,7 +8,10 @@ responses are allowed, which reproduces a past run exactly.
 from __future__ import annotations
 
 import copy
+import functools
+import inspect
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +23,7 @@ from .config import Settings
 from .metadata import MetadataStore, sha
 
 T = TypeVar("T", bound=BaseModel)
+log = logging.getLogger(__name__)
 Backend = Callable[[dict], dict]
 
 
@@ -69,6 +73,18 @@ def inline_schema(model: type[BaseModel]) -> dict:
     return resolve(schema)
 
 
+@functools.lru_cache(maxsize=1)
+def sdk_accepts_temperature() -> bool:
+    """Whether the installed Anthropic SDK still takes `temperature` (removed from messages.create in newer
+    releases, which raise TypeError for it)."""
+    try:
+        from anthropic.resources.messages import Messages
+
+        return "temperature" in inspect.signature(Messages.create).parameters
+    except (ImportError, AttributeError, TypeError, ValueError):  # pragma: no cover - unusual SDK layouts
+        return True
+
+
 def anthropic_backend() -> Backend:
     import os
 
@@ -87,14 +103,31 @@ def anthropic_backend() -> Backend:
             "model": resp.model,
         }
 
+    call.is_anthropic_sdk = True  # type: ignore[attr-defined]
     return call
 
 
 class LLMClient:
+    _warned = False
+
     def __init__(self, settings: Settings, store: MetadataStore, backend: Backend | None = None):
         self.settings = settings
         self.store = store
         self._backend = backend
+        # replay passes the live client's backend on: it must build the same requests (same hashes)
+        self._custom_backend = backend is not None and not getattr(backend, "is_anthropic_sdk", False)
+
+    def effective_temperature(self) -> float | None:
+        """The temperature actually sent (and recorded). With the real Anthropic SDK, a configured temperature
+        is omitted when the installed SDK no longer accepts it, instead of failing every call; the run then
+        records temperature None. Injected backends (tests, replay) always receive the configured value."""
+        t = self.settings.temperature
+        if t is None or self._custom_backend or sdk_accepts_temperature():
+            return t
+        if not LLMClient._warned:
+            LLMClient._warned = True
+            log.warning("the installed anthropic SDK does not accept 'temperature': it is omitted from requests")
+        return None
 
     @property
     def backend(self) -> Backend:
@@ -121,8 +154,9 @@ class LLMClient:
             "tools": tools,
             "tool_choice": tool_choice,
         }
-        if self.settings.temperature is not None:
-            request["temperature"] = self.settings.temperature
+        temperature = self.effective_temperature()
+        if temperature is not None:
+            request["temperature"] = temperature
         request_hash = sha(request)
         mode = self.settings.llm_mode
         response = self.store.cache_get(request_hash) if mode in ("cached", "replay") else None
@@ -142,7 +176,7 @@ class LLMClient:
             run_id=run_id,
             step_id=step_id,
             model=self.settings.model,
-            temperature=self.settings.temperature,
+            temperature=temperature,
             prompt_name=prompt.name,
             prompt_version=prompt.version,
             prompt_hash=prompt.hash,
